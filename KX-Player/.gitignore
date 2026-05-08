@@ -1,0 +1,9 @@
+dist/
+dist-electron/
+dist_electron/
+node_modules/
+*.exe
+*.blockmap
+*.yml
+.env
+.env.local

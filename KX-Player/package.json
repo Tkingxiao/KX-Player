@@ -1,0 +1,50 @@
+{
+  "name": "kx-music-player",
+  "version": "1.0.0",
+  "description": "KX音乐播放器 - 本地桌面音乐播放器",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "electron:build": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/noto-sans-sc": "^5.2.9",
+    "chokidar": "^5.0.0",
+    "fast-glob": "^3.3.3",
+    "music-metadata": "^11.0.2"
+  },
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^26.0.0",
+    "vite": "^5.4.18",
+    "vite-plugin-electron": "^0.29.0",
+    "vite-plugin-electron-renderer": "^0.14.6"
+  },
+  "build": {
+    "appId": "com.kxplayer.music",
+    "productName": "KX音乐播放器",
+    "directories": {
+      "output": "dist_electron"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "public/favicon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "KX音乐播放器",
+      "uninstallDisplayName": "KX音乐播放器"
+    }
+  }
+}
