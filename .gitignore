@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-electron/
+dist_electron/
+
+# Electron build artifacts
+*.exe
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.blockmap
+*.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
