@@ -1,12 +1,22 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron'
+﻿import { app, BrowserWindow, ipcMain, dialog, clipboard, shell } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
-import os from 'node:os'
-import { execFile } from 'node:child_process'
+import fsp from 'node:fs/promises'
+import { execFile, spawn } from 'node:child_process'
 import { scanFoldersWithProgress, startWatching, stopWatching } from './fileScanner'
+import { loadLibrarySnapshot, loadTrackMetadataIndex, saveLibrarySnapshot } from './libraryDb'
 
 // Shared MIME type mapping for image files
 const IMG_MIME: Record<string, string> = { jpg: 'jpeg', jpeg: 'jpeg', png: 'png', bmp: 'bmp', webp: 'webp', gif: 'gif' }
+
+// Log file helper
+function writeLog(msg: string) {
+  try {
+    const logPath = path.join(getUserDataDir(), 'kx-player-log.txt')
+    const ts = new Date().toISOString()
+    fs.appendFileSync(logPath, `[${ts}] ${msg}\n`, 'utf-8')
+  } catch { /* ignore */ }
+}
 
 // Disable CRL/OCSP fetching to prevent SSL handshake errors and speed up startup
 app.commandLine.appendSwitch('disable-crashpad')
@@ -22,6 +32,37 @@ function getUserDataDir(): string {
 
 function getSettingsPath(): string {
   return path.join(getUserDataDir(), 'kx-player-settings.json')
+}
+
+function getCachePath(): string {
+  return path.join(getUserDataDir(), 'kx-player-cache.json')
+}
+
+function getLibraryDbPath(): string {
+  return path.join(getUserDataDir(), 'kx-player-library.sqlite')
+}
+
+function getBgImagePath(): string {
+  // Keep background image in userData so it survives version upgrades
+  return path.join(getUserDataDir(), 'kx-player-bg.png')
+}
+
+function getDsdTempDir(): string {
+  const dir = path.join(getUserDataDir(), 'dsd-temp')
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+function cleanupDsdTemp() {
+  try {
+    const dir = getDsdTempDir()
+    if (fs.existsSync(dir)) {
+      const files = fs.readdirSync(dir)
+      for (const f of files) {
+        try { fs.unlinkSync(path.join(dir, f)) } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
 }
 
 function createWindow() {
@@ -115,7 +156,8 @@ ipcMain.handle('dialog:openAudioFiles', async () => {
 
 ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: string[]) => {
   const sender = event.sender
-  return await scanFoldersWithProgress(folderPaths,
+  const metadataIndex = await loadTrackMetadataIndex(getLibraryDbPath())
+  const result = await scanFoldersWithProgress(folderPaths, metadataIndex,
     (completed, total) => {
       if (!sender.isDestroyed()) {
         sender.send('scanner:progress', { completed, total, stage: '解析元数据...' })
@@ -127,6 +169,34 @@ ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: str
       }
     }
   )
+  // Auto-save cache after scan (fire and forget to avoid blocking UI)
+  ;(async () => {
+    try {
+      await saveLibrarySnapshot(getLibraryDbPath(), {
+        folderPaths,
+        artists: result.artists,
+        folderTree: result.folderTree,
+        allTracks: result.allTracks,
+        fileCount: result.fileCount,
+        scannedAt: Date.now(),
+      })
+
+      const cachePath = getCachePath()
+      const dir = path.dirname(cachePath)
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+      const cache = { folderPaths, scanResult: result }
+      await fsp.writeFile(cachePath, JSON.stringify(cache), 'utf-8')
+    } catch { /* ignore */ }
+  })()
+  return result
+})
+
+ipcMain.handle('library:load', async () => {
+  try {
+    return await loadLibrarySnapshot(getLibraryDbPath())
+  } catch {
+    return null
+  }
 })
 
 ipcMain.handle('scanner:startWatching', async (_event, folderPaths: string[]) => {
@@ -275,6 +345,190 @@ ipcMain.handle('settings:save', async (_event, settings: unknown) => {
   }
 })
 
+ipcMain.on('settings:syncSave', (_event, settings: unknown) => {
+  try {
+    const settingsPath = getSettingsPath()
+    const dir = path.dirname(settingsPath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf-8')
+  } catch { /* ignore */ }
+})
+
+ipcMain.handle('cache:load', async () => {
+  try {
+    const cachePath = getCachePath()
+    if (fs.existsSync(cachePath)) {
+      const data = fs.readFileSync(cachePath, 'utf-8')
+      return JSON.parse(data)
+    }
+  } catch { /* ignore */ }
+  return null
+})
+
+ipcMain.handle('cache:save', async (_event, cache: unknown) => {
+  try {
+    const cachePath = getCachePath()
+    const dir = path.dirname(cachePath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+    fs.writeFileSync(cachePath, JSON.stringify(cache), 'utf-8')
+    return true
+  } catch {
+    return false
+  }
+})
+
+ipcMain.handle('bgImage:load', async () => {
+  try {
+    const bgPath = getBgImagePath()
+    if (fs.existsSync(bgPath)) {
+      const buffer = await fs.promises.readFile(bgPath)
+      const ext = path.extname(bgPath).toLowerCase().replace('.', '')
+      const mime = IMG_MIME[ext] || ext
+      return { dataUrl: `data:image/${mime};base64,${buffer.toString('base64')}`, path: bgPath }
+    }
+  } catch { /* ignore */ }
+  return null
+})
+
+ipcMain.handle('bgImage:save', async (_event, dataUrl: string) => {
+  try {
+    const bgPath = getBgImagePath()
+    const dir = path.dirname(bgPath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+    const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '')
+    const buffer = Buffer.from(base64, 'base64')
+    fs.writeFileSync(bgPath, buffer)
+    return true
+  } catch {
+    return false
+  }
+})
+
+ipcMain.handle('bgImage:remove', async () => {
+  try {
+    const bgPath = getBgImagePath()
+    if (fs.existsSync(bgPath)) {
+      fs.unlinkSync(bgPath)
+    }
+    return true
+  } catch {
+    return false
+  }
+})
+
+ipcMain.handle('clipboard:writeText', async (_event, text: string) => {
+  try {
+    clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+})
+
+ipcMain.handle('shell:showItemInFolder', async (_event, filePath: string) => {
+  try {
+    shell.showItemInFolder(path.normalize(filePath))
+    return true
+  } catch {
+    return false
+  }
+})
+
+// ffmpeg.exe path helper 鈥?returns path to bundled ffmpeg.exe
+function getFfmpegExe(): string {
+  const isDev = process.env.VITE_DEV_SERVER_URL ? true : false
+  if (isDev) {
+    // In dev, look for ffmpeg.exe in project root
+    const devPath = path.join(__dirname, '../ffmpeg.exe')
+    if (fs.existsSync(devPath)) return devPath
+  }
+  // Production: extraResources places it at resources/ffmpeg/ffmpeg.exe
+  const prodPath = path.join(process.resourcesPath, 'ffmpeg', 'ffmpeg.exe')
+  if (fs.existsSync(prodPath)) return prodPath
+  // Fallback: same directory as exe
+  const exeDir = path.dirname(app.getPath('exe'))
+  const fallback = path.join(exeDir, 'ffmpeg.exe')
+  if (fs.existsSync(fallback)) return fallback
+  return ''
+}
+
+// Run ffmpeg command via execFile
+ipcMain.handle('ffmpeg:exec', async (_event, args: string[]) => {
+  const exe = getFfmpegExe()
+  if (!exe) return { code: -1, error: 'ffmpeg.exe 未找到' }
+  return new Promise((resolve) => {
+    const child = execFile(exe, args, { timeout: 600000, maxBuffer: 100 * 1024 * 1024 }, (error, stdout, stderr) => {
+      resolve({ code: error ? error.code ?? 1 : 0, stdout, stderr })
+    })
+    // Send progress updates via IPC events
+    child.on('exit', () => { /* handled by callback */ })
+  })
+})
+
+
+ipcMain.handle('dsd:decodePcm', async (_event, filePath: string) => {
+  const exe = getFfmpegExe()
+  if (!exe) return { ok: false, error: 'ffmpeg.exe 未找到' }
+
+  return new Promise((resolve) => {
+    const child = spawn(exe, [
+      '-v', 'error',
+      '-i', filePath,
+      '-f', 's16le',
+      '-acodec', 'pcm_s16le',
+      '-ar', '44100',
+      '-ac', '2',
+      '-',
+    ], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+    let settled = false
+
+    const finish = (payload: unknown) => {
+      if (settled) return
+      settled = true
+      resolve(payload)
+    }
+
+    child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(Buffer.from(chunk)))
+    child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)))
+    child.on('error', (error) => finish({ ok: false, error: error.message }))
+    child.on('close', (code) => {
+      if (code !== 0) {
+        const stderr = Buffer.concat(stderrChunks).toString('utf-8').trim()
+        finish({ ok: false, error: stderr || `ffmpeg exited with code ${code}` })
+        return
+      }
+      const pcmBuffer = Buffer.concat(stdoutChunks)
+      finish({ ok: true, sampleRate: 44100, channels: 2, bitsPerSample: 16, pcmBase64: pcmBuffer.toString('base64') })
+    })
+
+    setTimeout(() => {
+      try { child.kill() } catch { }
+      finish({ ok: false, error: 'DSD decode timeout' })
+    }, 600000)
+  })
+})
+
+// Save converted audio file to disk
+ipcMain.handle('tools:saveFile', async (_event, filePath: string, base64Data: string) => {
+  try {
+    const buffer = Buffer.from(base64Data, 'base64')
+    fs.writeFileSync(filePath, buffer)
+    return true
+  } catch (e: any) {
+    writeLog(`[tools:saveFile] error: ${e.message}`)
+    return false
+  }
+})
+
 ipcMain.handle('window:minimize', () => { mainWindow?.minimize() })
 ipcMain.handle('window:maximize', () => {
   if (mainWindow?.isMaximized()) mainWindow.unmaximize()
@@ -283,12 +537,48 @@ ipcMain.handle('window:maximize', () => {
 
 let forceCloseFlag = false
 
+function syncSaveSettingsToFile(settings: unknown) {
+  try {
+    const settingsPath = getSettingsPath()
+    const dir = path.dirname(settingsPath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf-8')
+  } catch { /* ignore */ }
+}
+
+ipcMain.handle('settings:syncSave', async (_event, settings: unknown) => {
+  syncSaveSettingsToFile(settings)
+})
+
+async function ensureSettingsSaved() {
+  // Try to load existing settings from file - if it exists and is recent, trust it
+  try {
+    const settingsPath = getSettingsPath()
+    if (fs.existsSync(settingsPath)) {
+      const stat = fs.statSync(settingsPath)
+      const age = Date.now() - stat.mtimeMs
+      if (age < 10000) return // saved within last 10s, trust it
+    }
+  } catch { /* ignore */ }
+}
+
 ipcMain.handle('window:close', () => {
   if (!mainWindow) return
   mainWindow.webContents.send('window:beforeClose')
   setTimeout(() => {
     if (!forceCloseFlag) {
       forceCloseFlag = true
+      // Sync save settings before closing to ensure data is persisted
+      try {
+        const settingsPath = getSettingsPath()
+        // Read current settings and write synchronously
+        if (fs.existsSync(settingsPath)) {
+          const data = fs.readFileSync(settingsPath, 'utf-8')
+          fs.writeFileSync(settingsPath, data, 'utf-8')
+        }
+      } catch { /* ignore */ }
       mainWindow?.close()
     }
   }, 300)
@@ -301,99 +591,14 @@ ipcMain.handle('window:forceClose', () => {
 
 ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
 
+ipcMain.handle('dsd:getTempPath', () => getDsdTempDir())
+
 app.on('before-quit', () => {
+  cleanupDsdTemp()
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('window:beforeClose')
   }
 })
 
-function findFfmpeg(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile('ffmpeg', ['-version'], (err) => {
-      if (err) {
-        const ffPath = path.join(process.resourcesPath || path.dirname(app.getPath('exe')), 'ffmpeg.exe')
-        if (fs.existsSync(ffPath)) { resolve(ffPath); return; }
-        reject(new Error('未找到ffmpeg，请安装ffmpeg或将ffmpeg.exe放在应用目录'))
-      } else {
-        resolve('ffmpeg')
-      }
-    })
-  })
-}
+// --- ffmpeg WASM runs entirely in renderer, no system ffmpeg needed ---
 
-ipcMain.handle('tools:extractAudio', async (_event, filePath: string, targetFormat?: string) => {
-  try {
-    const ffmpeg = await findFfmpeg()
-    const dir = path.dirname(filePath)
-    const baseName = path.basename(filePath, path.extname(filePath))
-    const fmt = targetFormat || 'mp3'
-    const outPath = path.join(dir, baseName + '.' + fmt)
-    const codecMap: Record<string, string[]> = {
-      mp3: ['-vn', '-acodec', 'libmp3lame', '-q:a', '2'],
-      flac: ['-vn', '-acodec', 'flac'],
-      wav: ['-vn', '-acodec', 'pcm_s16le'],
-      ogg: ['-vn', '-acodec', 'libvorbis', '-q:a', '4'],
-      aac: ['-vn', '-acodec', 'aac', '-b:a', '192k'],
-    }
-    const args = codecMap[fmt] || ['-vn', '-acodec', 'libmp3lame', '-q:a', '2']
-    return new Promise((resolve, reject) => {
-      execFile(ffmpeg, ['-i', filePath, ...args, '-y', outPath], (err) => {
-        if (err) reject(new Error(err.message))
-        else resolve(outPath)
-      })
-    })
-  } catch (e: any) {
-    throw new Error(e.message)
-  }
-})
-
-ipcMain.handle('tools:convertAudio', async (_event, filePath: string, targetFormat: string) => {
-  try {
-    const ffmpeg = await findFfmpeg()
-    const dir = path.dirname(filePath)
-    const baseName = path.basename(filePath, path.extname(filePath))
-    const outPath = path.join(dir, baseName + '.' + targetFormat)
-    const codecMap: Record<string, string[]> = {
-      mp3: ['-acodec', 'libmp3lame', '-q:a', '2'],
-      flac: ['-acodec', 'flac'],
-      wav: ['-acodec', 'pcm_s16le'],
-      ogg: ['-acodec', 'libvorbis', '-q:a', '4'],
-      m4a: ['-acodec', 'aac', '-b:a', '192k'],
-      aac: ['-acodec', 'aac', '-b:a', '192k'],
-    }
-    const args = codecMap[targetFormat] || ['-acodec', 'copy']
-    return new Promise((resolve, reject) => {
-      execFile(ffmpeg, ['-i', filePath, ...args, '-y', outPath], (err) => {
-        if (err) reject(new Error(err.message))
-        else resolve(outPath)
-      })
-    })
-  } catch (e: any) {
-    throw new Error(e.message)
-  }
-})
-
-ipcMain.handle('media:decodeDSD', async (_event, filePath: string) => {
-  try {
-    const cachedDir = path.join(os.tmpdir(), 'kxplayer-dsd-cache')
-    if (!fs.existsSync(cachedDir)) fs.mkdirSync(cachedDir, { recursive: true })
-    const hash = filePath.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0).toString(16)
-    const outPath = path.join(cachedDir, hash + '.wav')
-    if (fs.existsSync(outPath)) return outPath
-    const ffmpeg = await findFfmpeg()
-    return new Promise((resolve, reject) => {
-      execFile(ffmpeg, [
-        '-i', filePath,
-        '-acodec', 'pcm_s16le',
-        '-ar', '44100',
-        '-ac', '2',
-        '-y', outPath
-      ], (err) => {
-        if (err) reject(new Error(err.message))
-        else resolve(outPath)
-      })
-    })
-  } catch (e: any) {
-    throw new Error(e.message)
-  }
-})

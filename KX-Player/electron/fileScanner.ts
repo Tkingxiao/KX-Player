@@ -11,7 +11,159 @@ const VIDEO_EXTS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.w
 const ALL_EXTS = new Set([...AUDIO_EXTS, ...VIDEO_EXTS])
 
 const SCAN_TIMEOUT_MS = 30000
+const LARGE_FILE_SCAN_TIMEOUT_MS = 120000 // 2 minutes for large files
 const CHOKIDAR_DELAY = 1000
+
+const COVER_FILE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'])
+const MAX_COVER_BYTES = 15 * 1024 * 1024
+const COVER_NAME_HINTS = ['cover', 'folder', 'front', 'albumart', 'album', 'art', 'jacket', 'ジャケット']
+const NON_COVER_HINTS = ['ui', '说明', 'screenshot', 'screen', 'manual', 'readme', 'player', 'capture', 'shot', 'ss', 'banner', 'icon']
+
+function normalizeImageMime(format: string): string {
+  let f = format.toLowerCase().trim()
+  if (f === 'jpg') f = 'jpeg'
+  if (!f.startsWith('image/')) f = `image/${f}`
+  return f
+}
+
+function coverToBase64(filePath: string): string | null {
+  try {
+    const data = fs.readFileSync(filePath)
+    if (!data.length || data.length > MAX_COVER_BYTES) return null
+    const ext = path.extname(filePath).slice(1).toLowerCase()
+    return `data:image/${ext === 'jpg' ? 'jpeg' : ext};base64,${data.toString('base64')}`
+  } catch {
+    return null
+  }
+}
+
+function getImageDimensions(filePath: string): { width: number; height: number } | null {
+  try {
+    const fd = fs.openSync(filePath, 'r')
+    try {
+      const head = Buffer.alloc(32)
+      fs.readSync(fd, head, 0, 32, 0)
+      const ext = path.extname(filePath).toLowerCase()
+      if (ext === '.png') {
+        if (head.toString('ascii', 1, 4) === 'PNG') {
+          return { width: head.readUInt32BE(16), height: head.readUInt32BE(20) }
+        }
+      } else if (ext === '.jpg' || ext === '.jpeg') {
+        let i = 2
+        while (i < 65536) {
+          const buf = Buffer.alloc(16)
+          fs.readSync(fd, buf, 0, 16, i)
+          if (buf[0] !== 0xFF) { i++; continue }
+          const marker = buf[1]
+          if (marker === 0xD9 || marker === 0xD8) { i += 2; continue }
+          const len = buf.readUInt16BE(2)
+          if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
+            return { height: buf.readUInt16BE(5), width: buf.readUInt16BE(7) }
+          }
+          i += 2 + len
+          if (len < 2) break
+        }
+      } else if (ext === '.webp') {
+        if (head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WEBP') {
+          const chunk = head.toString('ascii', 12, 16)
+          if (chunk === 'VP8 ') {
+            return { width: head.readUInt16LE(26) & 0x3fff, height: head.readUInt16LE(28) & 0x3fff }
+          } else if (chunk === 'VP8L') {
+            const bits = head.readUInt32LE(21)
+            return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 }
+          } else if (chunk === 'VP8X') {
+            return { width: head.readUInt24BE(24) + 1, height: head.readUInt24BE(27) + 1 }
+          }
+        }
+      } else if (ext === '.bmp') {
+        return { width: head.readUInt32LE(18), height: Math.abs(head.readInt32LE(22)) }
+      } else if (ext === '.gif') {
+        return { width: head.readUInt16LE(6), height: head.readUInt16LE(8) }
+      }
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
+function scoreCoverCandidate(filePath: string, depth: number): number {
+  const name = path.basename(filePath).toLowerCase()
+  const ext = path.extname(filePath).toLowerCase()
+  const stat = fs.statSync(filePath)
+  const sizeKB = stat.size / 1024
+
+  // Strongly exclude known non-cover images
+  for (const hint of NON_COVER_HINTS) {
+    if (name.includes(hint)) return -1000
+  }
+
+  let score = 0
+
+  // Prefer standard cover file names
+  for (const hint of COVER_NAME_HINTS) {
+    if (name.includes(hint)) score += 100
+  }
+
+  // Prefer common image formats
+  if (ext === '.jpg' || ext === '.jpeg') score += 10
+  if (ext === '.png') score += 5
+
+  // Prefer files in the same directory (less depth)
+  score -= depth * 30
+
+  // Prefer typical cover dimensions (DLsite cover is 560x420 ~ 4:3)
+  const dims = getImageDimensions(filePath)
+  if (dims) {
+    const ratio = dims.width / dims.height
+    // DLsite / DLsite-like cover ratio ~ 1.33
+    if (ratio >= 1.2 && ratio <= 1.5) score += 60
+    // Square-ish covers
+    else if (ratio >= 0.9 && ratio <= 1.1) score += 40
+    // Penalize very wide or very tall images (screenshots, banners)
+    else if (ratio > 2.5 || ratio < 0.4) score -= 50
+
+    // Prefer moderate dimensions (covers are usually 400-1200 px on the long side)
+    const longSide = Math.max(dims.width, dims.height)
+    if (longSide >= 400 && longSide <= 1200) score += 20
+    else if (longSide > 1600) score -= 20
+  } else {
+    // Fallback size heuristic
+    if (sizeKB >= 30 && sizeKB <= 600) score += 10
+    else if (sizeKB > 1000) score -= 10
+  }
+
+  return score
+}
+
+function findExternalCover(dirPath: string, maxDepth = 1): string | null {
+  let bestPath: string | null = null
+  let bestScore = -Infinity
+
+  function scan(currentDir: string, depth: number) {
+    if (depth > maxDepth) return
+    let entries: fs.Dirent[] = []
+    try { entries = fs.readdirSync(currentDir, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        scan(path.join(currentDir, entry.name), depth + 1)
+        continue
+      }
+      const ext = path.extname(entry.name).toLowerCase()
+      if (!COVER_FILE_EXTS.has(ext)) continue
+      const filePath = path.join(currentDir, entry.name)
+      const score = scoreCoverCandidate(filePath, depth)
+      if (score > bestScore) {
+        bestScore = score
+        bestPath = filePath
+      }
+    }
+  }
+
+  scan(dirPath, 0)
+  if (!bestPath) return null
+  return coverToBase64(bestPath)
+}
 
 interface ScannedTrack {
   id: string
@@ -29,11 +181,13 @@ interface ScannedTrack {
   fileSize: number
   metaTitle: string | null
   metaArtist: string | null
+  albumCoverData?: string | null
 }
 
 interface ScannedAlbum {
   name: string
   artist: string
+  dirPath: string | null
   coverPath: string | null
   coverData: string | null
   tracks: ScannedTrack[]
@@ -81,30 +235,84 @@ async function discoverFiles(folderPaths: string[]): Promise<string[]> {
   })
 }
 
+function throttleProgress(callback: (completed: number, total: number) => void, total: number) {
+  let lastReported = -1
+  let timer: NodeJS.Timeout | null = null
+  return (completed: number) => {
+    if (completed === total || completed - lastReported >= Math.max(1, Math.floor(total * 0.02)) || lastReported < 0) {
+      if (timer) { clearTimeout(timer); timer = null }
+      lastReported = completed
+      callback(completed, total)
+    } else if (!timer) {
+      timer = setTimeout(() => {
+        timer = null
+        lastReported = completed
+        callback(completed, total)
+      }, 120)
+    }
+  }
+}
+
 async function enrichWithWorkers(
   files: string[],
+  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number }> = new Map(),
   onProgress?: (completed: number, total: number) => void
 ): Promise<Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null }>> {
   const results = new Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null }>()
-  const normalFiles = [...files]
+  const normalFiles: string[] = []
   const total = files.length
   let completed = 0
+  const reportProgress = onProgress ? throttleProgress(onProgress, total) : () => {}
+
+  for (const filePath of files) {
+    const stat = getFileStat(filePath)
+    const cached = existingMeta.get(filePath.replace(/\\/g, '/'))
+    if (stat && cached && cached.fileMtime === stat.mtime && cached.fileSize === stat.size) {
+      results.set(filePath, {
+        duration: cached.duration,
+        coverData: cached.coverData,
+        title: cached.title,
+        artist: cached.artist,
+      })
+      completed += 1
+      reportProgress(completed)
+    } else {
+      normalFiles.push(filePath)
+    }
+  }
 
   if (normalFiles.length === 0) {
+    reportProgress(total)
     return results
   }
 
-  const cpuCount = Math.max(1, os.cpus().length - 1)
+  const MAX_WORKERS = 4
+  const cpuCount = Math.min(MAX_WORKERS, Math.max(1, os.cpus().length - 1))
   const chunkSize = Math.ceil(normalFiles.length / cpuCount)
   const chunks: string[][] = []
   for (let i = 0; i < normalFiles.length; i += chunkSize) {
     chunks.push(normalFiles.slice(i, i + chunkSize))
   }
 
+  // Use larger timeout if any chunk contains large files (>1GB)
+  const LARGE_FILE_SIZE = 1024 * 1024 * 1024
+  function hasLargeFiles(chunk: string[]): boolean {
+    return chunk.some(f => {
+      try { return fs.statSync(f).size > LARGE_FILE_SIZE } catch { return false }
+    })
+  }
+
   const workerPromises = chunks.map((chunk) => {
     return new Promise<void>((resolve) => {
       try {
-        const workerPath = path.join(__dirname, 'workers', 'metadata-worker.js')
+        // Try multiple possible worker paths
+        let workerPath = path.join(__dirname, 'workers', 'metadata-worker.js')
+        if (!fs.existsSync(workerPath)) {
+          workerPath = path.join(__dirname, '..', 'dist-electron', 'workers', 'metadata-worker.js')
+        }
+        if (!fs.existsSync(workerPath)) {
+          workerPath = path.join(process.cwd(), 'dist-electron', 'workers', 'metadata-worker.js')
+        }
         if (!fs.existsSync(workerPath)) {
           for (const f of chunk) {
             results.set(f, { duration: 0, coverData: null, title: null, artist: null })
@@ -115,8 +323,9 @@ async function enrichWithWorkers(
           return
         }
 
+        const chunkTimeout = hasLargeFiles(chunk) ? LARGE_FILE_SCAN_TIMEOUT_MS : SCAN_TIMEOUT_MS
         const worker = new Worker(workerPath, {
-          workerData: { files: chunk, timeoutMs: SCAN_TIMEOUT_MS },
+          workerData: { files: chunk, timeoutMs: chunkTimeout },
         })
 
         let hasResponded = false
@@ -133,11 +342,11 @@ async function enrichWithWorkers(
               })
             }
             completed += chunk.length
-            onProgress?.(completed, total)
+            reportProgress(completed)
             resolve()
           } else if (msg.type === 'progress') {
             completed += 1
-            onProgress?.(completed, total)
+            reportProgress(completed)
           }
         })
 
@@ -147,46 +356,46 @@ async function enrichWithWorkers(
               results.set(f, { duration: 0, coverData: null, title: null, artist: null })
             }
             completed += chunk.length
-            onProgress?.(completed, total)
+            reportProgress(completed)
           }
           resolve()
         })
 
-        worker.on('exit', (code) => {
-          if (!hasResponded && code !== 0) {
-            for (const f of chunk) {
-              results.set(f, { duration: 0, coverData: null, title: null, artist: null })
-            }
-            completed += chunk.length
-            onProgress?.(completed, total)
+      worker.on('exit', (code) => {
+        if (!hasResponded && code !== 0) {
+          for (const f of chunk) {
+            results.set(f, { duration: 0, coverData: null, title: null, artist: null })
           }
-          resolve()
-        })
-
-        setTimeout(() => {
-          if (!hasResponded) {
-            worker.terminate()
-            for (const f of chunk) {
-              results.set(f, { duration: 0, coverData: null, title: null, artist: null })
-            }
-            completed += chunk.length
-            onProgress?.(completed, total)
-            resolve()
-          }
-        }, SCAN_TIMEOUT_MS)
-      } catch {
-        for (const f of chunk) {
-          results.set(f, { duration: 0, coverData: null, title: null, artist: null })
+          completed += chunk.length
+          reportProgress(completed)
         }
-        completed += chunk.length
-        onProgress?.(completed, total)
         resolve()
+      })
+
+      setTimeout(() => {
+        if (!hasResponded) {
+          worker.terminate()
+          for (const f of chunk) {
+            results.set(f, { duration: 0, coverData: null, title: null, artist: null })
+          }
+          completed += chunk.length
+          reportProgress(completed)
+          resolve()
+        }
+      }, chunkTimeout)
+    } catch {
+      for (const f of chunk) {
+        results.set(f, { duration: 0, coverData: null, title: null, artist: null })
       }
-    })
+      completed += chunk.length
+      reportProgress(completed)
+      resolve()
+    }
   })
+})
 
   await Promise.all(workerPromises)
-  onProgress?.(total, total)
+  reportProgress(total)
   return results
 }
 
@@ -246,9 +455,13 @@ function groupTracksByFolder(
 
     const artist = artistMap.get(artistName)!
     if (!artist.albums.has(albumName)) {
+      const albumDirPath = parts.length >= 1
+        ? path.join(matchedRoot, parts[0])
+        : matchedRoot
       artist.albums.set(albumName, {
         name: albumName,
         artist: artistName,
+        dirPath: albumDirPath,
         coverPath: null,
         coverData: null,
         tracks: [],
@@ -278,12 +491,17 @@ function groupTracksByFolder(
 
   for (const [, artist] of artistMap) {
     for (const [, album] of artist.albums) {
-      const firstTrack = album.tracks[0]
-      if (firstTrack) {
-        const metaResult = metaResults.get(firstTrack.path)
+      // Prefer embedded cover from any track in the album
+      for (const track of album.tracks) {
+        const metaResult = metaResults.get(track.path)
         if (metaResult?.coverData) {
           album.coverData = metaResult.coverData
+          break
         }
+      }
+      // Fallback to external cover files in album directory
+      if (!album.coverData && album.dirPath) {
+        album.coverData = findExternalCover(album.dirPath)
       }
     }
   }
@@ -372,26 +590,36 @@ function buildFolderTree(
     }
   }
 
-  // Find the first track with cover using sorted order (recursive).
-  function findFirstCoverSorted(rootNode: FolderNode): string | null {
+  // Find cover for a folder: external cover files first, then embedded track covers, then children.
+  function findFolderCover(rootNode: FolderNode): string | null {
+    const external = findExternalCover(rootNode.path.replace(/\//g, path.sep))
+    if (external) return external
     for (const t of rootNode.tracks) {
       const meta = metaResults.get(t.path)
       if (meta?.coverData) return meta.coverData
     }
     for (const c of rootNode.children) {
-      const r = findFirstCoverSorted(c)
+      const r = findFolderCover(c)
       if (r) return r
     }
     return null
   }
+  function computeNodeStats(node: FolderNode): void {
+    node.children.sort((a, b) => a.name.localeCompare(b.name))
+    node.tracks.sort((a, b) => a.name.localeCompare(b.name))
+    let trackCount = node.tracks.length
+    for (const child of node.children) {
+      computeNodeStats(child)
+      trackCount += child.trackCount
+    }
+    node.trackCount = trackCount
+    node.coverData = findFolderCover(node)
+  }
+
   for (const [, node] of nodeMap) {
     node.children.sort((a, b) => a.name.localeCompare(b.name))
     node.tracks.sort((a, b) => a.name.localeCompare(b.name))
     node.trackCount = node.tracks.length
-    for (const child of node.children) {
-      node.trackCount += child.trackCount
-    }
-    node.coverData = findFirstCoverSorted(node)
   }
 
   roots.sort((a, b) => a.name.localeCompare(b.name))
@@ -422,30 +650,38 @@ function buildFolderTree(
   }
 
   // Assign covers to roots as well
-  for (const r of roots) {
-    r.coverData = findFirstCoverSorted(r)
-  }
+  for (const r of roots) computeNodeStats(r)
   return roots
 }
 
 export async function scanFoldersWithProgress(
   folderPaths: string[],
+  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number }> = new Map(),
   onProgress?: (completed: number, total: number) => void,
   onStage?: (stage: string) => void
-): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; fileCount: number }> {
+): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number }> {
   onStage?.('发现文件...')
   const files = await discoverFiles(folderPaths)
   const totalFiles = files.length
   onProgress?.(0, totalFiles)
-  onStage?.(`解析元数据... (${totalFiles} 文件)`)
+  onStage?.(`解析元数据... (${totalFiles} 个文件)`)
 
-  const metaResults = await enrichWithWorkers(files, onProgress)
+  const metaResults = await enrichWithWorkers(files, existingMeta, onProgress)
 
   onStage?.('整理结构...')
   const artists = groupTracksByFolder(files, metaResults, folderPaths)
   const folderTree = buildFolderTree(files, metaResults, folderPaths)
+  const allTracks: ScannedTrack[] = []
+  for (const artist of artists) {
+    for (const album of artist.albums) {
+      for (const track of album.tracks) {
+        track.albumCoverData = album.coverData || track.coverData || null
+        allTracks.push(track)
+      }
+    }
+  }
 
-  return { artists, folderTree, fileCount: totalFiles }
+  return { artists, folderTree, allTracks, fileCount: totalFiles }
 }
 
 export async function startWatching(

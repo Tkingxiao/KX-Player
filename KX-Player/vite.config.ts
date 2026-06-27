@@ -11,7 +11,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             rollupOptions: {
-              external: ['electron'],
+              external: ['electron', 'sql.js'],
             },
           },
         },
@@ -37,7 +37,10 @@ export default defineConfig({
             outDir: 'dist-electron/workers',
             rollupOptions: {
               external: ['electron'],
-              output: { entryFileNames: 'metadata-worker.js' },
+              output: {
+                format: 'cjs',
+                entryFileNames: 'metadata-worker.js',
+              },
             },
           },
         },
