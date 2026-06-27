@@ -36,3 +36,8 @@ npm-debug.log*
 # Environment
 .env
 .env.local
+
+#vscode 2022 build cache
+.vs
+CLAUDE.md
+CLAUDE.md
