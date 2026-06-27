@@ -1,6 +1,6 @@
 {
   "name": "kx-music-player",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "KX音乐播放器 - 本地桌面音乐播放器",
   "main": "dist-electron/main.js",
   "scripts": {
@@ -13,7 +13,9 @@
     "@fontsource/noto-sans-sc": "^5.2.9",
     "chokidar": "^5.0.0",
     "fast-glob": "^3.3.3",
-    "music-metadata": "^11.0.2"
+    "iconv-lite": "^0.7.2",
+    "music-metadata": "^11.0.2",
+    "sql.js": "^1.14.1"
   },
   "devDependencies": {
     "electron": "^28.3.3",
@@ -32,6 +34,22 @@
       "dist/**/*",
       "dist-electron/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "ffmpeg.exe",
+        "to": "ffmpeg/ffmpeg.exe",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "node_modules/sql.js/dist",
+        "to": "sqljs",
+        "filter": [
+          "sql-wasm.wasm"
+        ]
+      }
+    ],
     "win": {
       "target": [
         "nsis"
@@ -44,7 +62,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "KX音乐播放器",
-      "uninstallDisplayName": "KX音乐播放器"
+      "uninstallDisplayName": "KX音乐播放器",
+      "include": "build/uninstall.nsh"
     }
   }
 }
