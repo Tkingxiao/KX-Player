@@ -18,6 +18,9 @@ export interface TrackRecord {
   fileSize: number
   metaTitle: string | null
   metaArtist: string | null
+  genre: string | null
+  bitrate: number | null
+  sampleRate: number | null
   albumCoverData?: string | null
 }
 
@@ -145,6 +148,9 @@ function initializeSchema(database: SqlJsDatabase) {
       file_size INTEGER NOT NULL,
       meta_title TEXT,
       meta_artist TEXT,
+      genre TEXT,
+      bitrate INTEGER,
+      sample_rate INTEGER,
       album_cover_data TEXT,
       FOREIGN KEY (artist_id) REFERENCES artists(artist_id),
       FOREIGN KEY (album_id) REFERENCES albums(album_id)
@@ -152,6 +158,12 @@ function initializeSchema(database: SqlJsDatabase) {
     CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
     CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
     CREATE INDEX IF NOT EXISTS idx_tracks_path ON tracks(path);
+
+    -- Add columns to existing databases; each ALTER TABLE is wrapped in try-catch
+    -- because sql.js exec() throws on any failing statement.
+    try { database.exec('ALTER TABLE tracks ADD COLUMN genre TEXT') } catch { /* column may already exist */ }
+    try { database.exec('ALTER TABLE tracks ADD COLUMN bitrate INTEGER') } catch { /* column may already exist */ }
+    try { database.exec('ALTER TABLE tracks ADD COLUMN sample_rate INTEGER') } catch { /* column may already exist */ }
 
     CREATE TABLE IF NOT EXISTS folder_nodes (
       path TEXT PRIMARY KEY,
@@ -212,8 +224,9 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
     const insertTrack = database.prepare(`
       INSERT INTO tracks (
         id, artist_id, album_id, name, path, duration, artist, album, format, is_video,
-        cover_path, cover_data, lyrics_path, file_mtime, file_size, meta_title, meta_artist, album_cover_data
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        cover_path, cover_data, lyrics_path, file_mtime, file_size, meta_title, meta_artist,
+        genre, bitrate, sample_rate, album_cover_data
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const insertFolder = database.prepare(`INSERT INTO folder_nodes (path, name, parent_path, track_count, cover_data) VALUES (?, ?, ?, ?, ?)`)
     const insertFolderTrack = database.prepare(`INSERT INTO folder_tracks (folder_path, track_id) VALUES (?, ?)`)
@@ -257,6 +270,9 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
             track.fileSize,
             track.metaTitle,
             track.metaArtist,
+            track.genre ?? null,
+            track.bitrate ?? null,
+            track.sampleRate ?? null,
             album.coverData ?? null,
           ])
         }
@@ -323,7 +339,8 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
     SELECT
       t.id, t.name, t.path, t.duration, t.artist, t.album, t.format, t.is_video,
       t.cover_path, t.cover_data, t.lyrics_path, t.file_mtime, t.file_size,
-      t.meta_title, t.meta_artist, t.album_cover_data, t.album_id, t.artist_id
+      t.meta_title, t.meta_artist, t.genre, t.bitrate, t.sample_rate,
+      t.album_cover_data, t.album_id, t.artist_id
     FROM tracks t
     ORDER BY t.artist COLLATE NOCASE, t.album COLLATE NOCASE, t.name COLLATE NOCASE
   `)
@@ -343,6 +360,9 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
     fileSize: Number(row.file_size) || 0,
     metaTitle: row.meta_title ? String(row.meta_title) : null,
     metaArtist: row.meta_artist ? String(row.meta_artist) : null,
+    genre: row.genre ? String(row.genre) : null,
+    bitrate: row.bitrate ? Number(row.bitrate) : null,
+    sampleRate: row.sample_rate ? Number(row.sample_rate) : null,
     albumCoverData: row.album_cover_data ? String(row.album_cover_data) : null,
     albumId: Number(row.album_id),
     artistId: Number(row.artist_id),
@@ -392,6 +412,9 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
       fileSize: row.fileSize,
       metaTitle: row.metaTitle,
       metaArtist: row.metaArtist,
+      genre: row.genre,
+      bitrate: row.bitrate,
+      sampleRate: row.sampleRate,
       albumCoverData: row.albumCoverData,
     }
     if (!tracksByAlbum.has(row.albumId)) tracksByAlbum.set(row.albumId, [])
@@ -492,13 +515,17 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
   artist: string | null
   fileMtime: number
   fileSize: number
+  genre: string | null
+  bitrate: number | null
+  sampleRate: number | null
 }>> {
   const sql = await ensureSql()
   if (!fs.existsSync(filePath)) return new Map()
   const database = openDatabase(filePath, sql)
 
   const stmt = database.prepare(`
-    SELECT path, duration, cover_data, meta_title, meta_artist, file_mtime, file_size
+    SELECT path, duration, cover_data, meta_title, meta_artist, file_mtime, file_size,
+           genre, bitrate, sample_rate
     FROM tracks
   `)
 
@@ -510,6 +537,9 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
     artist: row.meta_artist ? String(row.meta_artist) : null,
     fileMtime: Number(row.file_mtime) || 0,
     fileSize: Number(row.file_size) || 0,
+    genre: row.genre ? String(row.genre) : null,
+    bitrate: row.bitrate ? Number(row.bitrate) : null,
+    sampleRate: row.sample_rate ? Number(row.sample_rate) : null,
   }))
 
   const index = new Map<string, {
@@ -519,6 +549,9 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
     artist: string | null
     fileMtime: number
     fileSize: number
+    genre: string | null
+    bitrate: number | null
+    sampleRate: number | null
   }>()
 
   for (const row of rows) index.set(row.path, row)
