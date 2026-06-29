@@ -109,13 +109,13 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createWindow()
+  createTray() // Create system tray icon at startup
 
   // Intercept window close to hide to tray instead (catches Alt+F4, taskbar close, etc.)
   mainWindow?.on('close', (event) => {
     if (!forceCloseFlag) {
       event.preventDefault()
       mainWindow?.hide()
-      if (!tray) createTray()
     }
   })
 
@@ -562,7 +562,10 @@ function createTray() {
     { type: 'separator' },
     {
       label: '退出',
-      click: () => { app.quit() },
+      click: () => {
+        forceCloseFlag = true
+        app.quit()
+      },
     },
   ])
   tray.setContextMenu(contextMenu)
@@ -608,7 +611,6 @@ ipcMain.handle('window:close', () => {
   if (!mainWindow) return
   // Hide to system tray instead of closing
   mainWindow.hide()
-  if (!tray) createTray()
 })
 
 ipcMain.handle('window:forceClose', () => {
