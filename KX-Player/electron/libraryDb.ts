@@ -233,8 +233,9 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
 
     const folderParentMap = new Map<string, string | null>()
     const queue = [...snapshot.folderTree]
-    while (queue.length > 0) {
-      const node = queue.shift()!
+    let qi = 0
+    while (qi < queue.length) {
+      const node = queue[qi++]
       const normalizedNodePath = normalizePath(node.path)
       for (const child of node.children) {
         folderParentMap.set(normalizePath(child.path), normalizedNodePath)
@@ -280,8 +281,9 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
     }
 
     const folderStack = [...snapshot.folderTree]
-    while (folderStack.length > 0) {
-      const node = folderStack.shift()!
+    let fi = 0
+    while (fi < folderStack.length) {
+      const node = folderStack[fi++]
       const normalizedNodePath = normalizePath(node.path)
       insertFolder.run([
         normalizedNodePath,

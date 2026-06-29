@@ -731,8 +731,10 @@ export async function startWatching(
     let timer: NodeJS.Timeout | null = null
 
     const scheduleChange = () => {
+      if (!onChangeCallback) return
       if (timer) clearTimeout(timer)
       timer = setTimeout(() => {
+        timer = null
         onChangeCallback?.()
       }, CHOKIDAR_DELAY)
     }

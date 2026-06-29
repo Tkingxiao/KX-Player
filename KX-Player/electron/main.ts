@@ -1,4 +1,4 @@
-﻿import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -18,7 +18,7 @@ function writeLog(msg: string) {
   } catch { /* ignore */ }
 }
 
-// Disable CRL/OCSP fetching to prevent SSL handshake errors and speed up startup
+// Disable crashpad and crash reporting to speed up startup
 app.commandLine.appendSwitch('disable-crashpad')
 app.commandLine.appendSwitch('no-report-upload')
 app.commandLine.appendSwitch('disable-default-apps')
@@ -293,7 +293,7 @@ ipcMain.handle('file:exists', async (_event, filePath: string) => {
 
 ipcMain.handle('file:readTextFile', async (_event, filePath: string) => {
   try {
-    const buffer = fs.readFileSync(filePath)
+    const buffer = await fsp.readFile(filePath)
     try {
       const utf8 = new TextDecoder('utf-8', { fatal: true }).decode(buffer)
       return utf8
@@ -451,7 +451,7 @@ ipcMain.handle('shell:showItemInFolder', async (_event, filePath: string) => {
 
 // ffmpeg.exe path helper 鈥?returns path to bundled ffmpeg.exe
 function getFfmpegExe(): string {
-  const isDev = process.env.VITE_DEV_SERVER_URL ? true : false
+  const isDev = !!process.env.VITE_DEV_SERVER_URL
   if (isDev) {
     // In dev, look for ffmpeg.exe in project root
     const devPath = path.join(__dirname, '../ffmpeg.exe')
@@ -580,32 +580,7 @@ function createTray() {
   })
 }
 
-function syncSaveSettingsToFile(settings: unknown) {
-  try {
-    const settingsPath = getSettingsPath()
-    const dir = path.dirname(settingsPath)
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true })
-    }
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf-8')
-  } catch { /* ignore */ }
-}
-
-ipcMain.handle('settings:syncSave', async (_event, settings: unknown) => {
-  syncSaveSettingsToFile(settings)
-})
-
-async function ensureSettingsSaved() {
-  // Try to load existing settings from file - if it exists and is recent, trust it
-  try {
-    const settingsPath = getSettingsPath()
-    if (fs.existsSync(settingsPath)) {
-      const stat = fs.statSync(settingsPath)
-      const age = Date.now() - stat.mtimeMs
-      if (age < 10000) return // saved within last 10s, trust it
-    }
-  } catch { /* ignore */ }
-}
+// Note: settings:syncSave is handled by ipcMain.on above (line 357)
 
 ipcMain.handle('window:close', () => {
   if (!mainWindow) return
