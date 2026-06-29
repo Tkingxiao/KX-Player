@@ -181,6 +181,9 @@ interface ScannedTrack {
   fileSize: number
   metaTitle: string | null
   metaArtist: string | null
+  genre: string | null
+  bitrate: number | null
+  sampleRate: number | null
   albumCoverData?: string | null
 }
 
@@ -255,10 +258,10 @@ function throttleProgress(callback: (completed: number, total: number) => void, 
 
 async function enrichWithWorkers(
   files: string[],
-  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number }> = new Map(),
+  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number; genre: string | null; bitrate: number | null; sampleRate: number | null }> = new Map(),
   onProgress?: (completed: number, total: number) => void
-): Promise<Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null }>> {
-  const results = new Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null }>()
+): Promise<Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>> {
+  const results = new Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>()
   const normalFiles: string[] = []
   const total = files.length
   let completed = 0
@@ -273,6 +276,9 @@ async function enrichWithWorkers(
         coverData: cached.coverData,
         title: cached.title,
         artist: cached.artist,
+        genre: cached.genre,
+        bitrate: cached.bitrate,
+        sampleRate: cached.sampleRate,
       })
       completed += 1
       reportProgress(completed)
@@ -339,6 +345,9 @@ async function enrichWithWorkers(
                 coverData: r.coverB64 || null,
                 title: r.title || null,
                 artist: r.artist || null,
+                genre: r.genre || null,
+                bitrate: r.bitrate || null,
+                sampleRate: r.sampleRate || null,
               })
             }
             completed += chunk.length
@@ -353,7 +362,7 @@ async function enrichWithWorkers(
         worker.on('error', () => {
           if (!hasResponded) {
             for (const f of chunk) {
-              results.set(f, { duration: 0, coverData: null, title: null, artist: null })
+              results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
             }
             completed += chunk.length
             reportProgress(completed)
@@ -364,7 +373,7 @@ async function enrichWithWorkers(
       worker.on('exit', (code) => {
         if (!hasResponded && code !== 0) {
           for (const f of chunk) {
-            results.set(f, { duration: 0, coverData: null, title: null, artist: null })
+            results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
           }
           completed += chunk.length
           reportProgress(completed)
@@ -376,7 +385,7 @@ async function enrichWithWorkers(
         if (!hasResponded) {
           worker.terminate()
           for (const f of chunk) {
-            results.set(f, { duration: 0, coverData: null, title: null, artist: null })
+            results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
           }
           completed += chunk.length
           reportProgress(completed)
@@ -385,7 +394,7 @@ async function enrichWithWorkers(
       }, chunkTimeout)
     } catch {
       for (const f of chunk) {
-        results.set(f, { duration: 0, coverData: null, title: null, artist: null })
+        results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
       }
       completed += chunk.length
       reportProgress(completed)
@@ -410,7 +419,7 @@ function getFileStat(filePath: string): { mtime: number; size: number } | null {
 
 function groupTracksByFolder(
   files: string[],
-  metaResults: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null }>,
+  metaResults: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>,
   rootPaths: string[]
 ): ScannedArtist[] {
   const artistMap = new Map<string, { path: string; albums: Map<string, ScannedAlbum> }>()
@@ -486,6 +495,9 @@ function groupTracksByFolder(
       fileSize: st.size,
       metaTitle: meta.title,
       metaArtist: meta.artist,
+      genre: meta.genre || null,
+      bitrate: meta.bitrate || null,
+      sampleRate: meta.sampleRate || null,
     })
   }
 
@@ -515,7 +527,7 @@ function groupTracksByFolder(
 
 function buildFolderTree(
   files: string[],
-  metaResults: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null }>,
+  metaResults: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>,
   rootPaths: string[]
 ): FolderNode[] {
   const nodeMap = new Map<string, FolderNode>()
@@ -569,6 +581,9 @@ function buildFolderTree(
       fileSize: st.size,
       metaTitle: meta.title,
       metaArtist: meta.artist,
+      genre: meta.genre || null,
+      bitrate: meta.bitrate || null,
+      sampleRate: meta.sampleRate || null,
     })
 
     let isRoot = true
