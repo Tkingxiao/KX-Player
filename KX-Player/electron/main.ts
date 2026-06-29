@@ -1,4 +1,4 @@
-﻿import { app, BrowserWindow, ipcMain, dialog, clipboard, shell } from 'electron'
+﻿import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -109,6 +109,15 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createWindow()
+
+  // Intercept window close to hide to tray instead (catches Alt+F4, taskbar close, etc.)
+  mainWindow?.on('close', (event) => {
+    if (!forceCloseFlag) {
+      event.preventDefault()
+      mainWindow?.hide()
+      if (!tray) createTray()
+    }
+  })
 
   // Bypass certificate verification for dev server to avoid SSL handshake errors
   mainWindow?.webContents.session.setCertificateVerifyProc((request, callback) => {
@@ -536,6 +545,37 @@ ipcMain.handle('window:maximize', () => {
 })
 
 let forceCloseFlag = false
+let tray: Tray | null = null
+
+function createTray() {
+  if (tray) return
+  // Use favicon as tray icon
+  const iconPath = path.join(__dirname, '../public/favicon.ico')
+  if (!fs.existsSync(iconPath)) return
+  tray = new Tray(iconPath)
+  tray.setToolTip('KX 音乐播放器')
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: '显示窗口',
+      click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus() } },
+    },
+    { type: 'separator' },
+    {
+      label: '退出',
+      click: () => { app.quit() },
+    },
+  ])
+  tray.setContextMenu(contextMenu)
+  tray.on('click', () => {
+    if (!mainWindow) return
+    if (mainWindow.isVisible()) {
+      mainWindow.focus()
+    } else {
+      mainWindow.show()
+      mainWindow.focus()
+    }
+  })
+}
 
 function syncSaveSettingsToFile(settings: unknown) {
   try {
@@ -566,27 +606,23 @@ async function ensureSettingsSaved() {
 
 ipcMain.handle('window:close', () => {
   if (!mainWindow) return
-  mainWindow.webContents.send('window:beforeClose')
-  setTimeout(() => {
-    if (!forceCloseFlag) {
-      forceCloseFlag = true
-      // Sync save settings before closing to ensure data is persisted
-      try {
-        const settingsPath = getSettingsPath()
-        // Read current settings and write synchronously
-        if (fs.existsSync(settingsPath)) {
-          const data = fs.readFileSync(settingsPath, 'utf-8')
-          fs.writeFileSync(settingsPath, data, 'utf-8')
-        }
-      } catch { /* ignore */ }
-      mainWindow?.close()
-    }
-  }, 300)
+  // Hide to system tray instead of closing
+  mainWindow.hide()
+  if (!tray) createTray()
 })
 
 ipcMain.handle('window:forceClose', () => {
+  if (!mainWindow) return
   forceCloseFlag = true
-  mainWindow?.close()
+  mainWindow.webContents.send('window:beforeClose')
+  try {
+    const settingsPath = getSettingsPath()
+    if (fs.existsSync(settingsPath)) {
+      const data = fs.readFileSync(settingsPath, 'utf-8')
+      fs.writeFileSync(settingsPath, data, 'utf-8')
+    }
+  } catch { /* ignore */ }
+  mainWindow.close()
 })
 
 ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)

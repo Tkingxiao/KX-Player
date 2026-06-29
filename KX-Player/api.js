@@ -30,6 +30,7 @@ export const api={
   onUnmaximized:cb=>{if(e.onMaximizeChange)e.onMaximizeChange(m=>{if(!m)cb()})},
   onScanProgress:cb=>e.onScanProgress&&e.onScanProgress(cb),
   onScannerProgress:cb=>e.onScannerProgress&&e.onScannerProgress(cb),
+  onScannerStage:cb=>e.onScannerStage&&e.onScannerStage(cb),
   removeScanProgressListener:()=>e.removeScanProgressListener&&e.removeScanProgressListener(),
   onBeforeClose:cb=>{if(e.onBeforeClose)e.onBeforeClose(cb)},
   toolsSaveFile:(f,b)=>e.toolsSaveFile?e.toolsSaveFile(f,b):Promise.resolve(false),

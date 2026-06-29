@@ -29,8 +29,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onScannerProgress: (callback: (data: any) => void) => {
     ipcRenderer.on('scanner:progress', (_event, data) => callback(data))
   },
+  onScannerStage: (callback: (data: string) => void) => {
+    ipcRenderer.on('scanner:stage', (_event, data) => callback(data))
+  },
   removeScanProgressListener: () => {
     ipcRenderer.removeAllListeners('scanner:progress')
+    ipcRenderer.removeAllListeners('scanner:stage')
   },
   onBeforeClose: (callback: () => void) => {
     ipcRenderer.on('window:beforeClose', () => callback())

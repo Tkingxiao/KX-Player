@@ -295,33 +295,39 @@ async function loadS() {
       try { const cached = await idbGet('cache', 'bgImage'); if (cached) S.bgData = cached } catch (e) { /* ignore */ }
     }
 
-    // Load cached scan results or scan
-    if (Array.isArray(s.folderPaths) && s.folderPaths.length > 0) {
+    // Store folder paths (library data is loaded separately for faster startup)
+    if (Array.isArray(s.folderPaths)) {
       fp = s.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
-      const library = await api.loadLibrary()
-      const cache = library ? null : await api.loadCache()
-      let useCache = false
-      if (library && Array.isArray(library.folderPaths)) {
-        const libraryPaths = library.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
-        if (JSON.stringify([...fp].sort()) === JSON.stringify([...libraryPaths].sort())) {
-          applyScanResult(library)
-          useCache = true
-        }
-      } else if (cache && Array.isArray(cache.folderPaths)) {
-        const cachePaths = cache.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
-        if (JSON.stringify([...fp].sort()) === JSON.stringify([...cachePaths].sort()) && cache.scanResult) {
-          applyScanResult(cache.scanResult)
-          useCache = true
-        }
-      }
-      if (!useCache) {
-        const result = await api.scanFoldersWithProgress(fp)
-        applyScanResult(result)
-      }
-      const allIds = new Set(S.all.map(t => t.id))
-      cleanupStale(allIds)
-      await restartWatching()
     }
+  } catch (e) { /* ignore */ }
+}
+
+async function loadLibraryData() {
+  try {
+    if (!fp.length) return
+    const library = await api.loadLibrary()
+    const cache = library ? null : await api.loadCache()
+    let useCache = false
+    if (library && Array.isArray(library.folderPaths)) {
+      const libraryPaths = library.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
+      if (JSON.stringify([...fp].sort()) === JSON.stringify([...libraryPaths].sort())) {
+        applyScanResult(library)
+        useCache = true
+      }
+    } else if (cache && Array.isArray(cache.folderPaths)) {
+      const cachePaths = cache.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
+      if (JSON.stringify([...fp].sort()) === JSON.stringify([...cachePaths].sort()) && cache.scanResult) {
+        applyScanResult(cache.scanResult)
+        useCache = true
+      }
+    }
+    if (!useCache) {
+      const result = await api.scanFoldersWithProgress(fp)
+      applyScanResult(result)
+    }
+    const allIds = new Set(S.all.map(t => t.id))
+    cleanupStale(allIds)
+    await restartWatching()
   } catch (e) { /* ignore */ }
 }
 
@@ -1421,6 +1427,7 @@ async function rescan() {
   const tid = addT('\u91cd\u65b0\u626b\u63cf...')
   api.removeScanProgressListener()
   api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
+  api.onScannerStage((stage) => { const e = document.getElementById(tid + '-status'); if (e) e.textContent = stage })
   try {
     const currentTrackId = pl.length > 0 && S.tI >= 0 ? pl[S.tI]?.id : null
     const r = await api.scanFoldersWithProgress(fp)
@@ -2667,7 +2674,10 @@ if (api.onUnmaximized) api.onUnmaximized(() => { const mi = $('max-icon'); if (m
 // === Init ===
 async function init() {
   try {
+    // Phase 1: Load settings (fast) and apply theme immediately
     await loadS(); apTh(); apThBg(); updSUI()
+    // Phase 2: Load library/scan data (may be slower, but theme is already visible)
+    await loadLibraryData()
     // Save state on exit
     api.onBeforeClose(() => { clearTimeout(saveTimer); saveS() })
     window.addEventListener('beforeunload', () => { clearTimeout(saveTimer); saveS() })

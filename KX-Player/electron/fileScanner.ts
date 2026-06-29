@@ -13,6 +13,7 @@ const ALL_EXTS = new Set([...AUDIO_EXTS, ...VIDEO_EXTS])
 const SCAN_TIMEOUT_MS = 30000
 const LARGE_FILE_SCAN_TIMEOUT_MS = 120000 // 2 minutes for large files
 const CHOKIDAR_DELAY = 1000
+const YIELD_INTERVAL = 500 // yield to event loop every N iterations to keep main process responsive
 
 const COVER_FILE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'])
 const MAX_COVER_BYTES = 15 * 1024 * 1024
@@ -218,6 +219,12 @@ function hashPath(p: string): string {
   return crypto.createHash('md5').update(p).digest('hex').slice(0, 12)
 }
 
+// Yield to the event loop periodically so the main process can handle other IPC messages
+// and send progress updates during long synchronous scanning loops.
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
+}
+
 function normalizeName(filename: string): string {
   let name = path.basename(filename, path.extname(filename))
   name = name.replace(/^[\d]+[\s.\-_]+/, '').replace(/[_\-]/g, ' ').trim()
@@ -267,7 +274,8 @@ async function enrichWithWorkers(
   let completed = 0
   const reportProgress = onProgress ? throttleProgress(onProgress, total) : () => {}
 
-  for (const filePath of files) {
+  for (const [i, filePath] of files.entries()) {
+    if (i > 0 && i % YIELD_INTERVAL === 0) await yieldToEventLoop()
     const stat = getFileStat(filePath)
     const cached = existingMeta.get(filePath.replace(/\\/g, '/'))
     if (stat && cached && cached.fileMtime === stat.mtime && cached.fileSize === stat.size) {
@@ -417,14 +425,15 @@ function getFileStat(filePath: string): { mtime: number; size: number } | null {
   }
 }
 
-function groupTracksByFolder(
+async function groupTracksByFolder(
   files: string[],
   metaResults: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>,
   rootPaths: string[]
-): ScannedArtist[] {
+): Promise<ScannedArtist[]> {
   const artistMap = new Map<string, { path: string; albums: Map<string, ScannedAlbum> }>()
 
-  for (const fp of files) {
+  for (const [fi, fp] of files.entries()) {
+    if (fi > 0 && fi % YIELD_INTERVAL === 0) await yieldToEventLoop()
     const meta = metaResults.get(fp)
     if (!meta) continue
     const st = getFileStat(fp)
@@ -525,11 +534,11 @@ function groupTracksByFolder(
   }))
 }
 
-function buildFolderTree(
+async function buildFolderTree(
   files: string[],
   metaResults: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>,
   rootPaths: string[]
-): FolderNode[] {
+): Promise<FolderNode[]> {
   const nodeMap = new Map<string, FolderNode>()
   const cleanRoots = rootPaths.map(rp => rp.replace(/\\/g, '/').replace(/\/+$/, ''))
   const roots: FolderNode[] = []
@@ -541,7 +550,8 @@ function buildFolderTree(
     return node
   }
 
-  for (const fp of files) {
+  for (const [fi, fp] of files.entries()) {
+    if (fi > 0 && fi % YIELD_INTERVAL === 0) await yieldToEventLoop()
     const meta = metaResults.get(fp)
     if (!meta) continue
     const st = getFileStat(fp)
@@ -671,7 +681,7 @@ function buildFolderTree(
 
 export async function scanFoldersWithProgress(
   folderPaths: string[],
-  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number }> = new Map(),
+  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number; genre: string | null; bitrate: number | null; sampleRate: number | null }> = new Map(),
   onProgress?: (completed: number, total: number) => void,
   onStage?: (stage: string) => void
 ): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number }> {
@@ -684,14 +694,17 @@ export async function scanFoldersWithProgress(
   const metaResults = await enrichWithWorkers(files, existingMeta, onProgress)
 
   onStage?.('整理结构...')
-  const artists = groupTracksByFolder(files, metaResults, folderPaths)
-  const folderTree = buildFolderTree(files, metaResults, folderPaths)
+  const artists = await groupTracksByFolder(files, metaResults, folderPaths)
+  const folderTree = await buildFolderTree(files, metaResults, folderPaths)
   const allTracks: ScannedTrack[] = []
+  let ti = 0
   for (const artist of artists) {
     for (const album of artist.albums) {
       for (const track of album.tracks) {
         track.albumCoverData = album.coverData || track.coverData || null
         allTracks.push(track)
+        ti++
+        if (ti % YIELD_INTERVAL === 0) await yieldToEventLoop()
       }
     }
   }
