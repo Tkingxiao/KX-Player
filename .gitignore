@@ -16,6 +16,7 @@ dist_electron/
 *.yml
 
 # IDE
+.reasonix/
 .vscode/
 .idea/
 *.swp
@@ -41,3 +42,8 @@ npm-debug.log*
 .vs
 CLAUDE.md
 CLAUDE.md
+AGENTS.md
+
+# Error
+error.md
+plan.md

@@ -75,7 +75,7 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); heig
 
 #content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 #content.locked { overflow: hidden; }
-#content-toolbar { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 16px 24px 0; gap: 12px; background: var(--bg); }
+#content-toolbar { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 16px 24px 0; gap: 12px; background: transparent; }
 #breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 15px; color: var(--list-text, var(--text)); flex-wrap: wrap; flex: 1; min-width: 0; font-weight: 500; }
 .breadcrumb-item { background: none; border: none; color: var(--list-text, var(--text)); cursor: pointer; font-size: 15px; font-family: var(--font); padding: 2px 4px; border-radius: 4px; transition: opacity 0.15s; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .breadcrumb-item:hover { opacity: 0.7; color: var(--list-text, var(--text)); }

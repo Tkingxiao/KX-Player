@@ -44,7 +44,12 @@ function tryFixEncoding(text: string): string {
   return text
 }
 
-function extractBasicInfo(filePath: string): { path: string; duration: number; coverB64: null; title: string | null; artist: string | null } {
+interface WorkerResultItem {
+  path: string; duration: number; coverB64: string | null; title: string | null; artist: string | null;
+  genre: string | null; bitrate: number | null; sampleRate: number | null;
+}
+
+function extractBasicInfo(filePath: string): WorkerResultItem {
   const base = path.basename(filePath, path.extname(filePath))
   return {
     path: filePath,
@@ -52,12 +57,13 @@ function extractBasicInfo(filePath: string): { path: string; duration: number; c
     coverB64: null,
     title: base,
     artist: null,
+    genre: null,
+    bitrate: null,
+    sampleRate: null,
   }
 }
 
-async function parseFile(filePath: string): Promise<{
-  path: string; duration: number; coverB64: string | null; title: string | null; artist: string | null
-} | null> {
+async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
   try {
     if (!fs.existsSync(filePath)) {
       return extractBasicInfo(filePath)
@@ -92,12 +98,18 @@ async function parseFile(filePath: string): Promise<{
 
     const rawTitle = meta.common.title || path.basename(filePath, path.extname(filePath))
     const rawArtist = meta.common.artist || null
+    const genre = meta.common.genre && meta.common.genre.length > 0 ? meta.common.genre.join(', ') : null
+    const bitrate = meta.format.bitrate ? Math.round(meta.format.bitrate) : null
+    const sampleRate = meta.format.sampleRate || null
     return {
       path: filePath,
       duration: meta.format.duration ? Math.round(meta.format.duration) : 0,
       coverB64,
       title: tryFixEncoding(rawTitle),
       artist: tryFixEncoding(rawArtist),
+      genre,
+      bitrate,
+      sampleRate,
     }
   } catch (err) {
     console.error(`Error parsing ${filePath}:`, err)
@@ -105,7 +117,7 @@ async function parseFile(filePath: string): Promise<{
   }
 }
 
-async function processBatch(files: string[], timeoutMs: number): Promise<WorkerResult[]> {
+async function processBatch(files: string[], timeoutMs: number): Promise<WorkerResultItem[]> {
   const results: WorkerResult[] = []
   let lastReported = 0
   let reportTimer: NodeJS.Timeout | null = null
@@ -140,6 +152,9 @@ async function processBatch(files: string[], timeoutMs: number): Promise<WorkerR
         coverB64: null,
         title: path.basename(filePath, path.extname(filePath)),
         artist: null,
+        genre: null,
+        bitrate: null,
+        sampleRate: null,
       })
     }
     reportProgress(i + 1)
