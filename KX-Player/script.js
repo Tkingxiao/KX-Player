@@ -1,4 +1,4 @@
-﻿import { api } from './api.js'
+import { api } from './api.js'
 
 const VIDEO_EXTS = new Set(['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'])
 
@@ -21,6 +21,8 @@ const S = {
 }
 
 let fp = [], audio = new Audio(), lrc = [], pl = [], nI = 0
+let _lastLrcActiveIdx = -1
+let _idCounter = 0
 let stopWatchingFs = null
 let lyricsManualScrollUntil = 0
 let dsdState = {
@@ -37,11 +39,38 @@ let dsdState = {
 }
 
 function $(sel) { return document.querySelector(/^[#.]/.test(sel) ? sel : '#' + sel) }
+// Cache frequently accessed DOM elements for performance
+const _progressFill = $('progress-fill')
+const _progressHandle = $('progress-handle')
+const _progressCurrent = $('progress-current')
+const _progressDuration = $('progress-duration')
 function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') }
 function pathJoin(a, b) { return a.replace(/[/\\]+$/, '') + '\\' + b }
+function isChildPath(child, parent) {
+  const np = parent.replace(/\\/g, '/').replace(/\/+$/, '')
+  const nc = child.replace(/\\/g, '/')
+  return nc.startsWith(np + '/')
+}
+function arrayMatchSorted(a, b) {
+  if (a.length !== b.length) return false
+  const sa = [...a].sort(), sb = [...b].sort()
+  for (let i = 0; i < sa.length; i++) { if (sa[i] !== sb[i]) return false }
+  return true
+}
 function hashPath(p) { let h = 0; for (let i = 0; i < p.length; i++) { h = ((h << 5) - h) + p.charCodeAt(i); h |= 0 } return 'dsd' + Math.abs(h).toString(36) }
 function fmtTime(t) { if (!t || !isFinite(t)) return '00:00'; const m = Math.floor(t / 60), s = Math.floor(t % 60); return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') }
 function isVideoFile(t) { return t && t.isVideo === true }
+
+// Pre-computed set of default-favorite track IDs for O(1) lookup during rendering
+let _defaultFavIds = null
+function getDefaultFavIdSet() {
+  if (_defaultFavIds) return _defaultFavIds
+  const fav = S.favs.find(f => f.isDefault)
+  _defaultFavIds = fav ? new Set(fav.trackIds) : new Set()
+  return _defaultFavIds
+}
+function isDefaultFavTrack(tid) { return getDefaultFavIdSet().has(tid) }
+function invalidateFavCache() { _defaultFavIds = null }
 
 // === Sync Playing State ===
 function syncPlayingState() {
@@ -139,11 +168,17 @@ function showConfirm(title, message) {
     $('confirm-title').textContent = title
     $('confirm-message').textContent = message
     $('confirm-modal').classList.remove('hidden')
-    const cleanup = () => { $('confirm-modal').classList.add('hidden') }
-    const okHandler = () => { cleanup(); $('confirm-ok-btn').removeEventListener('click', okHandler); $('confirm-cancel-btn').removeEventListener('click', cancelHandler); resolve(true) }
-    const cancelHandler = () => { cleanup(); $('confirm-ok-btn').removeEventListener('click', okHandler); $('confirm-cancel-btn').removeEventListener('click', cancelHandler); resolve(false) }
-    $('confirm-ok-btn').addEventListener('click', okHandler)
-    $('confirm-cancel-btn').addEventListener('click', cancelHandler)
+    const okBtn = $('confirm-ok-btn')
+    const cancelBtn = $('confirm-cancel-btn')
+    const cleanup = () => {
+      $('confirm-modal').classList.add('hidden')
+      okBtn.removeEventListener('click', okHandler)
+      cancelBtn.removeEventListener('click', cancelHandler)
+    }
+    const okHandler = () => { cleanup(); resolve(true) }
+    const cancelHandler = () => { cleanup(); resolve(false) }
+    okBtn.addEventListener('click', okHandler)
+    cancelBtn.addEventListener('click', cancelHandler)
   })
 }
 
@@ -235,7 +270,7 @@ async function restartWatching() {
 
 // === Settings ===
 let saveTimer = null
-function schedSave() { saveS() }
+function schedSave() { clearTimeout(saveTimer); saveTimer = setTimeout(saveS, 300) }
 async function saveS() {
   try {
     const data = JSON.parse(JSON.stringify({
@@ -310,13 +345,13 @@ async function loadLibraryData() {
     let useCache = false
     if (library && Array.isArray(library.folderPaths)) {
       const libraryPaths = library.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
-      if (JSON.stringify([...fp].sort()) === JSON.stringify([...libraryPaths].sort())) {
+      if (arrayMatchSorted(fp, libraryPaths)) {
         applyScanResult(library)
         useCache = true
       }
     } else if (cache && Array.isArray(cache.folderPaths)) {
       const cachePaths = cache.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
-      if (JSON.stringify([...fp].sort()) === JSON.stringify([...cachePaths].sort()) && cache.scanResult) {
+      if (arrayMatchSorted(fp, cachePaths) && cache.scanResult) {
         applyScanResult(cache.scanResult)
         useCache = true
       }
@@ -368,18 +403,19 @@ function apTh() {
     root.style.setProperty('--modal-overlay', 'rgba(0,0,0,0.35)')
   }
   // Sidebar opacity
+  const sidebarEl = $('sidebar'), titlebarEl = $('titlebar'), playerBarEl = $('player-bar')
   const sidebarAlpha = (S.sidebarOpacity ?? 100) / 100
   const sbBg = isDark ? `rgba(16,16,22,${sidebarAlpha})` : `rgba(245,245,247,${sidebarAlpha})`
-  $('sidebar').style.background = sbBg
-  $('sidebar').style.borderRight = `1.5px solid ${isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)'}`
+  sidebarEl.style.background = sbBg
+  sidebarEl.style.borderRight = `1.5px solid ${isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)'}`
   // Titlebar opacity
   const titlebarAlpha = (S.titlebarOpacity ?? 100) / 100
   const tbBg = isDark ? `rgba(16,16,22,${titlebarAlpha})` : `rgba(255,255,255,${titlebarAlpha})`
-  $('titlebar').style.background = tbBg
+  titlebarEl.style.background = tbBg
   // Player bar opacity
   const playerAlpha = (S.playerOpacity ?? 100) / 100
   const pbBg = isDark ? `rgba(20,20,28,${playerAlpha})` : `rgba(255,255,255,${playerAlpha})`
-  $('player-bar').style.background = pbBg
+  playerBarEl.style.background = pbBg
 }
 
 function apThBg() {
@@ -714,11 +750,16 @@ function cpSyncFromState() {
   if (cpCtx) cpDraw()
 }
 function updSUI() {
-  $('theme-dark').classList.toggle('active', S.theme === 'dark'); $('theme-light').classList.toggle('active', S.theme === 'light')
-  $('sidebar-opacity').value = S.sidebarOpacity ?? 100; $('sidebar-opacity-val').textContent = (S.sidebarOpacity ?? 100) + '%'
-  $('titlebar-opacity').value = S.titlebarOpacity ?? 100; $('titlebar-opacity-val').textContent = (S.titlebarOpacity ?? 100) + '%'
-  $('player-opacity').value = S.playerOpacity ?? 100; $('player-opacity-val').textContent = (S.playerOpacity ?? 100) + '%'
-  if (S.bgData) { $('bg-preview').style.backgroundImage = `url(${S.bgData})`; $('bg-preview-wrap').classList.remove('hidden'); $('btn-bg-upload').classList.add('hidden') } else { $('bg-preview-wrap').classList.add('hidden'); $('btn-bg-upload').classList.remove('hidden') }
+  const themeDarkEl = $('theme-dark'), themeLightEl = $('theme-light')
+  const sbOpacityEl = $('sidebar-opacity'), sbOpacityValEl = $('sidebar-opacity-val')
+  const tbOpacityEl = $('titlebar-opacity'), tbOpacityValEl = $('titlebar-opacity-val')
+  const plOpacityEl = $('player-opacity'), plOpacityValEl = $('player-opacity-val')
+  const bgPreviewEl = $('bg-preview'), bgPreviewWrapEl = $('bg-preview-wrap'), btnBgUploadEl = $('btn-bg-upload')
+  themeDarkEl.classList.toggle('active', S.theme === 'dark'); themeLightEl.classList.toggle('active', S.theme === 'light')
+  sbOpacityEl.value = S.sidebarOpacity ?? 100; sbOpacityValEl.textContent = (S.sidebarOpacity ?? 100) + '%'
+  tbOpacityEl.value = S.titlebarOpacity ?? 100; tbOpacityValEl.textContent = (S.titlebarOpacity ?? 100) + '%'
+  plOpacityEl.value = S.playerOpacity ?? 100; plOpacityValEl.textContent = (S.playerOpacity ?? 100) + '%'
+  if (S.bgData) { bgPreviewEl.style.backgroundImage = `url(${S.bgData})`; bgPreviewWrapEl.classList.remove('hidden'); btnBgUploadEl.classList.add('hidden') } else { bgPreviewWrapEl.classList.add('hidden'); btnBgUploadEl.classList.remove('hidden') }
   document.querySelectorAll('.cp-preset').forEach(b => b.classList.toggle('active', b.dataset.clr === S.clr))
 }
 
@@ -746,6 +787,7 @@ async function loadT(idx) {
 
 async function loadLrcForTrack(t) {
   lrc = []
+  _lastLrcActiveIdx = -1
   try {
     const sep = t.path.includes('\\') ? '\\' : '/'
     const lastSep = t.path.lastIndexOf(sep)
@@ -811,16 +853,18 @@ function playT(idx, keepView) {
 
 function updPUI(t, skipLrc) {
   const cd = t.coverData || t.albumCoverData
-  $('player-title').textContent = t.name
+  const titleEl = $('player-title'), artistEl = $('player-artist')
+  const coverEl = $('player-cover'), coverImgEl = $('player-cover-img')
+  titleEl.textContent = t.name
   const artist = t.metaArtist || t.artist || '\u4f5a\u540d'
   const isVid = isVideoFile(t)
-  $('player-artist').textContent = artist + (isVid ? ' \u00b7 \u89c6\u9891-\u4ec5\u97f3\u9891\u6a21\u5f0f' : '')
+  artistEl.textContent = artist + (isVid ? ' \u00b7 \u89c6\u9891-\u4ec5\u97f3\u9891\u6a21\u5f0f' : '')
   if (cd) {
-    $('player-cover-img').src = cd; $('player-cover-img').style.display = ''
-    $('player-cover').querySelector('.cover-placeholder').style.display = 'none'
+    coverImgEl.src = cd; coverImgEl.style.display = ''
+    coverEl.querySelector('.cover-placeholder').style.display = 'none'
   } else {
-    $('player-cover-img').style.display = 'none'; $('player-cover').querySelector('.cover-placeholder').style.display = ''
-    const ph = $('player-cover').querySelector('.cover-placeholder svg')
+    coverImgEl.style.display = 'none'; coverEl.querySelector('.cover-placeholder').style.display = ''
+    const ph = coverEl.querySelector('.cover-placeholder svg')
     if (ph) {
       if (isVid) {
         ph.outerHTML = '<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="18" rx="2"/><polygon points="10,8 16,12 10,16"/></svg>'
@@ -845,7 +889,11 @@ function hEnd() {
 
 function nxt() {
   if (pl.length === 0) return
-  if (S.mode === 1) { const r = Math.floor(Math.random() * pl.length); playT(r, true); return }
+  if (S.mode === 1) {
+    if (pl.length === 1) { playT(0, true); return }
+    let r; do { r = Math.floor(Math.random() * pl.length) } while (r === S.tI)
+    playT(r, true); return
+  }
   playT((S.tI + 1) % pl.length, true)
 }
 function prv() { if (pl.length === 0) return; playT(S.tI <= 0 ? pl.length - 1 : S.tI - 1, true) }
@@ -855,29 +903,33 @@ function updPlayBtn() { $('icon-play').style.display = S.playing ? 'none' : ''; 
 
 // === Render ===
 function renderAll() {
+  invalidateFavCache()
   renderSB(); renderContent()
   renderPanel(); updPlayBtn(); syncAllListsPlaying(); schedSave()
 }
 
 function renderSB() {
-  $('folder-list').innerHTML = ''
+  const folderListEl = $('folder-list')
+  const favListEl = $('fav-list')
+  const plListEl = $('playlist-list')
+  // Build folder HTML in one pass instead of multiple insertAdjacentHTML
+  let folderHtml = ''
   if (fp.length && S.folderTree.length) {
-    // Only show folders that exist in the scanned tree
     const treeRootPaths = new Set(S.folderTree.map(n => n.path.replace(/\\/g, '/')))
     for (const p of fp) {
       const np = p.replace(/\\/g, '/')
       if (!treeRootPaths.has(np)) continue
       const top = p.replace(/\\/g, '/').replace(/\/$/, '').split('/').pop() || p
       const isActive = S.activeFp === p
-      $('folder-list').insertAdjacentHTML('beforeend',
-        `<button class="folder-item${isActive ? ' active' : ''}" data-fp="${esc(p)}"><svg class="folder-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span class="folder-name">${esc(top)}</span></button>`)
+      folderHtml += `<button class="folder-item${isActive ? ' active' : ''}" data-fp="${esc(p)}"><svg class="folder-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span class="folder-name">${esc(top)}</span></button>`
     }
   }
-  $('fav-list').innerHTML = S.favs.map(f => `<button class="fav-sidebar-item${S.aF === f.id ? ' active' : ''}" data-fvid="${f.id}" title="${f.isDefault ? '\u9ed8\u8ba4\u6536\u85cf\u5939' : '\u53cc\u51fb\u91cd\u547d\u540d'}"><span class="fav-sidebar-name">${esc(f.name)}</span><span class="fav-sidebar-count">${f.trackIds.length}</span></button>`).join('')
-  $('playlist-list').innerHTML = S.pls.map(p => `<button class="playlist-sidebar-item${S.aPl === p.id ? ' active' : ''}" data-plid="${p.id}" title="\u53cc\u51fb\u91cd\u547d\u540d"><span class="pl-sidebar-name">${esc(p.name)}</span><span class="pl-sidebar-count">${p.trackIds.length}</span></button>`).join('')
-  const favSection = $('fav-list').closest('.nav-section')
+  folderListEl.innerHTML = folderHtml
+  favListEl.innerHTML = S.favs.map(f => `<button class="fav-sidebar-item${S.aF === f.id ? ' active' : ''}" data-fvid="${f.id}" title="${f.isDefault ? '\u9ed8\u8ba4\u6536\u85cf\u5939' : '\u53cc\u51fb\u91cd\u547d\u540d'}"><span class="fav-sidebar-name">${esc(f.name)}</span><span class="fav-sidebar-count">${f.trackIds.length}</span></button>`).join('')
+  plListEl.innerHTML = S.pls.map(p => `<button class="playlist-sidebar-item${S.aPl === p.id ? ' active' : ''}" data-plid="${p.id}" title="\u53cc\u51fb\u91cd\u547d\u540d"><span class="pl-sidebar-name">${esc(p.name)}</span><span class="pl-sidebar-count">${p.trackIds.length}</span></button>`).join('')
+  const favSection = favListEl.closest('.nav-section')
   if (favSection) favSection.classList.toggle('empty', S.favs.length === 0)
-  const plSection = $('playlist-list').closest('.nav-section')
+  const plSection = plListEl.closest('.nav-section')
   if (plSection) plSection.classList.toggle('empty', S.pls.length === 0)
   const navs = document.querySelectorAll('#sidebar-nav .nav-item')
   navs.forEach(n => {
@@ -968,7 +1020,8 @@ function tableH(tracks) {
     const isPlaying = S.playingTid && t.id === S.playingTid
     const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
     const isVid = isVideoFile(t)
-    return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${S.favs.some(f => f.isDefault && f.trackIds.includes(t.id)) ? ' liked' : ''}" data-tid="${t.id}">${S.favs.some(f => f.isDefault && f.trackIds.includes(t.id)) ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
+    const liked = isDefaultFavTrack(t.id)
+    return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
   }).join('')
   return `<div class="song-table">${checks}${items}</div>`
 }
@@ -977,7 +1030,8 @@ function _trackRowHTML(t, i, cols) {
   const isPlaying = S.playingTid && t.id === S.playingTid
   const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
   const isVid = isVideoFile(t)
-  return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${S.favs.some(f => f.isDefault && f.trackIds.includes(t.id)) ? ' liked' : ''}" data-tid="${t.id}">${S.favs.some(f => f.isDefault && f.trackIds.includes(t.id)) ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
+  const liked = isDefaultFavTrack(t.id)
+  return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
 }
 
 function tableVT(containerId, tracks, onClick) {
@@ -1015,15 +1069,17 @@ function findNodeByPath(tree, path) {
 
 function renderFolderNode(node) {
   const bc = $('breadcrumb')
-  bc.innerHTML = ''
+  // Build breadcrumb HTML in one pass
+  let bcHtml = ''
   if (S.folderStack.length > 0) {
-    bc.innerHTML = `<button class="btn-breadcrumb-back" id="btn-folder-back"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align:middle;margin-right:3px"><polyline points="15,18 9,12 15,6"/></svg>返回</button><span class="breadcrumb-sep">|</span>`
+    bcHtml = `<button class="btn-breadcrumb-back" id="btn-folder-back"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align:middle;margin-right:3px"><polyline points="15,18 9,12 15,6"/></svg>返回</button><span class="breadcrumb-sep">|</span>`
   }
-  bc.innerHTML += `<button class="breadcrumb-item" data-fp-root="">\u5168\u90e8\u97f3\u4e50</button>`
+  bcHtml += `<button class="breadcrumb-item" data-fp-root="">\u5168\u90e8\u97f3\u4e50</button>`
   for (let i = 0; i < S.folderStack.length; i++) {
     const fp_i = S.folderStack[i]; const fn = findNodeByPath(S.folderTree, fp_i); const nm = fn ? fn.name : fp_i.split(/[\\/]/).pop()
-    bc.innerHTML += `<span class="breadcrumb-sep">/</span><button class="breadcrumb-item${i === S.folderStack.length - 1 ? ' current' : ''}" data-fp="${esc(fp_i)}">${esc(nm)}</button>`
+    bcHtml += `<span class="breadcrumb-sep">/</span><button class="breadcrumb-item${i === S.folderStack.length - 1 ? ' current' : ''}" data-fp="${esc(fp_i)}">${esc(nm)}</button>`
   }
+  bc.innerHTML = bcHtml
   const meta = S._folderMeta || {}
   const validChildren = node.children.filter(c => meta[c.path]?.hasMusic)
   let html = ''
@@ -1046,7 +1102,8 @@ function renderFolderNode(node) {
       const isPlaying = S.playingTid && t.id === S.playingTid
       const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
       const isVid = isVideoFile(t)
-      return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}"><div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${S.favs.some(f => f.isDefault && f.trackIds.includes(t.id)) ? ' liked' : ''}" data-tid="${t.id}">${S.favs.some(f => f.isDefault && f.trackIds.includes(t.id)) ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
+      const liked = isDefaultFavTrack(t.id)
+      return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}"><div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
     }, (tid, keepView) => { const idx = pl.findIndex(t => t.id === tid); if (idx >= 0) playT(idx, keepView) })
   }
 }
@@ -1055,7 +1112,7 @@ function navigateFolder(path) {
   const node = findNodeByPath(S.folderTree, path)
   if (!node) return
   S.activeFp = node.path
-  S.folderStack.push(node.path)
+  if (S.folderStack[S.folderStack.length - 1] !== node.path) S.folderStack.push(node.path)
   S.view = 'all'; renderAll(); schedSave()
 }
 
@@ -1244,9 +1301,9 @@ function startDsdProgressLoop() {
       S.cTime = getPlaybackCurrentTime()
       if (!_progressDragging) {
         const p = S.dur ? (S.cTime / S.dur) * 100 : 0
-        $('progress-fill').style.width = p + '%'
-        $('progress-handle').style.left = p + '%'
-        $('progress-current').textContent = fmtTime(S.cTime)
+        _progressFill.style.width = p + '%'
+        _progressHandle.style.left = p + '%'
+        _progressCurrent.textContent = fmtTime(S.cTime)
       }
     }
     dsdState.raf = requestAnimationFrame(tick)
@@ -1304,7 +1361,7 @@ async function playDsdTrack(track, seekTime = 0) {
 
   source.start(0, Math.max(0, Math.min(seekTime, buffer.duration - 0.01)))
   S.dur = buffer.duration
-  $('progress-duration').textContent = fmtTime(S.dur)
+  _progressDuration.textContent = fmtTime(S.dur)
   S.cTime = seekTime
   S.tI = pl.findIndex(item => item.id === track.id)
   S.playingTid = track.id
@@ -1360,12 +1417,12 @@ function openLyricsForTrack(tid) {
 }
 
 // === Favorites/Playlists ===
-function mkP(n) { n = n || '\u65b0\u5217\u8868'; const id = 'pl-' + Date.now(); S.pls.push({ id, name: n, trackIds: [], coverData: null }); schedSave(); renderAll(); requestAnimationFrame(() => startRename('pl', id)) }
+function mkP(n) { n = n || '\u65b0\u5217\u8868'; const id = 'pl-' + Date.now() + '-' + (++_idCounter); S.pls.push({ id, name: n, trackIds: [], coverData: null }); schedSave(); renderAll(); requestAnimationFrame(() => startRename('pl', id)) }
 async function rmP(id) { const p = S.pls.find(x => x.id === id); if (!p) return; const ok = await showConfirm('删除播放列表', `确定删除播放列表“${p.name}”吗？`); if (!ok) return; S.pls = S.pls.filter(x => x.id !== id); if (S.aPl === id) { S.aPl = null; S.view = 'all' } schedSave(); renderAll() }
 function rnP(id) { startRename('pl', id) }
 function a2P(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p || p.trackIds.includes(tid)) return; p.trackIds.push(tid); if (!p.coverData) { const t = S.all.find(x => x.id === tid); if (t) p.coverData = t.coverData || t.albumCoverData } schedSave(); renderAll() }
 function rFP(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p) return; p.trackIds = p.trackIds.filter(id => id !== tid); if (!p.trackIds.length) p.coverData = null; if (S.playingTid === tid) { S.playingTid = null; S.view = 'all'; S.aF = null; S.aPl = null; audio.pause(); S.playing = false; lrc = [] } schedSave(); renderAll() }
-function mkF(n) { n = n || '\u65b0\u6536\u85cf\u5939'; const id = 'fav-' + Date.now(); S.favs.push({ id, name: n, trackIds: [], isDefault: false }); schedSave(); renderAll(); requestAnimationFrame(() => startRename('fav', id)) }
+function mkF(n) { n = n || '\u65b0\u6536\u85cf\u5939'; const id = 'fav-' + Date.now() + '-' + (++_idCounter); S.favs.push({ id, name: n, trackIds: [], isDefault: false }); schedSave(); renderAll(); requestAnimationFrame(() => startRename('fav', id)) }
 async function rmF(id) { const f = S.favs.find(x => x.id === id); if (!f) return; const ok = await showConfirm('删除收藏夹', `确定删除收藏夹“${f.name}”吗？`); if (!ok) return; S.favs = S.favs.filter(x => x.id !== id); if (S.aF === id) { S.aF = null; S.view = 'all' } schedSave(); renderAll() }
 function rnF(id) { startRename('fav', id) }
 function a2F(fid, tid) { const f = S.favs.find(x => x.id === fid); if (!f || f.trackIds.includes(tid)) return; f.trackIds.push(tid); schedSave(); renderAll() }
@@ -1375,8 +1432,8 @@ function startRename(type, id) {
   const isFav = type === 'fav', list = isFav ? S.favs : S.pls, item = list.find(x => x.id === id)
   if (!item || (isFav && item.isDefault)) return
   let el = null, isSidebar = false
-  if (isFav) { el = document.querySelector(`.fav-sidebar-item[data-fvid="${id}"] .fav-sidebar-name`); if (el) isSidebar = true; if (!el) el = document.querySelector(`.pl-content-name[data-fvid="${id}"]`) }
-  else { el = document.querySelector(`.playlist-sidebar-item[data-plid="${id}"] .pl-sidebar-name`); if (el) isSidebar = true; if (!el) el = document.querySelector(`.pl-content-name[data-plid="${id}"]`) }
+  if (isFav) { el = document.querySelector(`.fav-sidebar-item[data-fvid="${CSS.escape(id)}"] .fav-sidebar-name`); if (el) isSidebar = true; if (!el) el = document.querySelector(`.pl-content-name[data-fvid="${CSS.escape(id)}"]`) }
+  else { el = document.querySelector(`.playlist-sidebar-item[data-plid="${CSS.escape(id)}"] .pl-sidebar-name`); if (el) isSidebar = true; if (!el) el = document.querySelector(`.pl-content-name[data-plid="${CSS.escape(id)}"]`) }
   if (!el) return
   const origHTML = el.innerHTML, w = Math.max(80, el.offsetWidth || 120)
   const inp = document.createElement('input'); inp.className = 'rename-input'; inp.value = item.name; inp.style.width = w + 'px'
@@ -1459,13 +1516,7 @@ function renderPanel() {
   const b = $('panel-body')
   if (!pl.length) { b.innerHTML = '<div class="panel-empty">\u64ad\u653e\u5217\u8868\u4e3a\u7a7a</div>'; $('panel-count').textContent = '0 \u9996'; return }
   $('panel-count').textContent = pl.length + ' \u9996'
-  if (pl.length > 500) {
-    requestAnimationFrame(() => {
-      b.innerHTML = pl.map((t, i) => `<div class="panel-track${i === nI ? ' playing' : ''}" data-pidx="${i}"><span class="pt-idx">${i + 1}</span><div class="pt-info"><div class="pt-title">${esc(t.name)}</div><div class="pt-artist">${esc(t.metaArtist || t.artist)}</div></div></div>`).join('')
-    })
-  } else {
-    b.innerHTML = pl.map((t, i) => `<div class="panel-track${i === nI ? ' playing' : ''}" data-pidx="${i}"><span class="pt-idx">${i + 1}</span><div class="pt-info"><div class="pt-title">${esc(t.name)}</div><div class="pt-artist">${esc(t.metaArtist || t.artist)}</div></div></div>`).join('')
-  }
+  b.innerHTML = pl.map((t, i) => `<div class="panel-track${i === nI ? ' playing' : ''}" data-pidx="${i}"><span class="pt-idx">${i + 1}</span><div class="pt-info"><div class="pt-title">${esc(t.name)}</div><div class="pt-artist">${esc(t.metaArtist || t.artist)}</div></div></div>`).join('')
 }
 
 function playAll(tracks) { if (!tracks || !tracks.length) return; pl = tracks; syncPlayingState(); if (S.view !== 'lyrics') S.prevView = S.view; S.view = 'lyrics'; activeLrcTab = 'lyrics'; playT(0); renderPanel() }
@@ -1607,7 +1658,8 @@ function showPlPicker(tid, baseX, baseY, baseH) {
   ps.onclick = function (ev) { const b = ev.target.closest('button'); if (b && b.dataset.plid) { a2P(b.dataset.plid, tid); ps.classList.add('hidden'); hC() } }
 }
 
-function hC() { $('ctx-menu').classList.add('hidden'); $('ctx-playlist-sub').classList.add('hidden') }
+const _ctxMenu = $('ctx-menu'), _ctxPlaylistSub = $('ctx-playlist-sub')
+function hC() { _ctxMenu.classList.add('hidden'); _ctxPlaylistSub.classList.add('hidden') }
 
 // === Tools ===
 const toolsState = { extractFiles: [], convertFiles: [], convertFmt: 'mp3', extractFmt: 'mp3', extractRunning: false, convertRunning: false }
@@ -1761,8 +1813,9 @@ function setupToolsEvents() {
       e.preventDefault(); dz.classList.remove('drag-over')
       const section = dz.id.includes('extract') ? 'extract' : 'convert'
       const arr = section === 'extract' ? toolsState.extractFiles : toolsState.convertFiles
+      const existingPaths = new Set(arr.map(x => typeof x === 'string' ? x : x.path))
       for (const f of e.dataTransfer.files) {
-        const fp = f.path || f.name; if (!arr.find(x => (typeof x === 'string' ? x : x.path) === fp)) arr.push(fp)
+        const fp = f.path || f.name; if (!existingPaths.has(fp)) { arr.push(fp); existingPaths.add(fp) }
       }
       const id = section === 'extract' ? 'tools-extract-files' : 'tools-convert-files'
       const actionsId = section === 'extract' ? 'extract-actions' : 'convert-actions'
@@ -1778,7 +1831,8 @@ async function handleToolDropzoneClick(section) {
   const files = await api.openAudioFiles()
   if (!files || !files.length) return
   const arr = section === 'extract' ? toolsState.extractFiles : toolsState.convertFiles
-  for (const f of files) { if (!arr.find(x => (typeof x === 'string' ? x : x.path) === f)) arr.push(f) }
+  const existingPaths = new Set(arr.map(x => typeof x === 'string' ? x : x.path))
+  for (const f of files) { if (!existingPaths.has(f)) { arr.push(f); existingPaths.add(f) } }
   const id = section === 'extract' ? 'tools-extract-files' : 'tools-convert-files'
   const actionsId = section === 'extract' ? 'extract-actions' : 'convert-actions'
   renderToolFileList(id, arr, section)
@@ -1988,7 +2042,7 @@ function showFolderCtx(e, folderPath) {
       const ok = await showConfirm('移除文件夹', `确定从扫描列表移除文件夹“${folderName}”吗？`)
       if (!ok) return
       fp = fp.filter(p => p !== folderPath)
-      S.folderTree = S.folderTree.filter(n => n.path !== folderPath && !n.path.startsWith(folderPath + '/'))
+      S.folderTree = S.folderTree.filter(n => n.path !== folderPath && !isChildPath(n.path, folderPath))
       S._folderMeta = buildFolderMeta(S.folderTree)
       await rescan()
       schedSave()
@@ -2249,7 +2303,7 @@ let _progressDragging = false
     fill.style.width = (ratio * 100) + '%'
     handle.style.left = (ratio * 100) + '%'
     const duration = getPlaybackDuration()
-    if (duration) $('progress-current').textContent = fmtTime(ratio * duration)
+    if (duration) _progressCurrent.textContent = fmtTime(ratio * duration)
   }
 
   bar.addEventListener('mousedown', e => {
@@ -2296,7 +2350,8 @@ $('search-input').addEventListener('keydown', e => {
     if (!S.prevView) { S.prevView = S.view; S._prevAF = S.aF; S._prevAPl = S.aPl }
     S.view = 'all'; S.aF = null; S.aPl = null; S.folderStack = []
     if (S.tI >= 0 && pl[S.tI]) S.playingTid = pl[S.tI].id
-    pl = S.all.filter(t => (t.name || '').toLowerCase().includes(S.q.toLowerCase()) || (t.artist || '').toLowerCase().includes(S.q.toLowerCase()))
+    const lq = S.q.toLowerCase()
+    pl = S.all.filter(t => (t.name || '').toLowerCase().includes(lq) || (t.artist || '').toLowerCase().includes(lq))
     syncPlayingState()
     renderAll(); schedSave()
   }
@@ -2314,8 +2369,8 @@ audio.addEventListener('timeupdate', () => {
   if (!S.playing) return; S.cTime = audio.currentTime
   if (_progressDragging) return
   const p = S.dur ? (S.cTime / S.dur) * 100 : 0
-  $('progress-fill').style.width = p + '%'; $('progress-handle').style.left = p + '%'
-  $('progress-current').textContent = fmtTime(S.cTime)
+  _progressFill.style.width = p + '%'; _progressHandle.style.left = p + '%'
+  _progressCurrent.textContent = fmtTime(S.cTime)
   // Update lyrics highlight and auto-scroll
   if (lrc && lrc.length && S.view === 'lyrics' && activeLrcTab === 'lyrics') {
     const scroll = $('lyrics-lines-scroll')
@@ -2324,7 +2379,12 @@ audio.addEventListener('timeupdate', () => {
     for (let i = lrc.length - 1; i >= 0; i--) {
       if (S.cTime >= lrc[i].time) { activeIdx = i; break }
     }
-    lines.forEach((l, i) => l.classList.toggle('active', i === activeIdx))
+    // Only toggle old and new active line instead of iterating all
+    if (activeIdx !== _lastLrcActiveIdx) {
+      if (_lastLrcActiveIdx >= 0 && _lastLrcActiveIdx < lines.length) lines[_lastLrcActiveIdx].classList.remove('active')
+      if (activeIdx >= 0 && activeIdx < lines.length) lines[activeIdx].classList.add('active')
+      _lastLrcActiveIdx = activeIdx
+    }
     if (activeIdx >= 0 && scroll && !isLyricsManualScrolling()) {
       requestAnimationFrame(() => {
         const activeLine = scroll.querySelector(`.lc-line[data-lidx="${activeIdx}"]`)
@@ -2346,7 +2406,7 @@ audio.addEventListener('timeupdate', () => {
     }
   }
 })
-audio.addEventListener('loadedmetadata', () => { S.dur = audio.duration; $('progress-duration').textContent = fmtTime(S.dur) })
+audio.addEventListener('loadedmetadata', () => { S.dur = audio.duration; _progressDuration.textContent = fmtTime(S.dur) })
 audio.addEventListener('ended', () => { if (!dsdState.active) hEnd() })
 audio.addEventListener('error', () => { if (!dsdState.active) { S.playing = false; updPlayBtn() } })
 
@@ -2472,14 +2532,18 @@ imgPreview.addEventListener('wheel', e => {
 
 function openImgEditor() {
   if (!S.bgData) return
-  $('img-edit-img').src = S.bgData
+  const imgEditEl = $('img-edit-img'), previewEl = $('img-editor-preview')
+  const opacityEl = $('img-opacity'), opacityValEl = $('img-opacity-val')
+  const blurEl = $('img-blur'), blurValEl = $('img-blur-val')
+  const zoomEl = $('img-zoom'), zoomValEl = $('img-zoom-val')
+  imgEditEl.src = S.bgData
   const vw = window.innerWidth, vh = window.innerHeight
-  $('img-editor-preview').style.height = Math.round(320 * vh / vw) + 'px'
+  previewEl.style.height = Math.round(320 * vh / vw) + 'px'
   S._imgEditState = S._imgEditState || {}
-  $('img-opacity').value = S.ovl; $('img-opacity-val').textContent = S.ovl + '%'
-  $('img-blur').value = S.bgBlur || 0; $('img-blur-val').textContent = (S.bgBlur || 0) + 'px'
+  opacityEl.value = S.ovl; opacityValEl.textContent = S.ovl + '%'
+  blurEl.value = S.bgBlur || 0; blurValEl.textContent = (S.bgBlur || 0) + 'px'
   $('img-editor-modal').classList.remove('hidden')
-  $('img-edit-img').onload = () => {
+  imgEditEl.onload = () => {
     if (!S._imgEditState.zoomPct) {
       autoFitImg()
     } else {
@@ -2487,7 +2551,7 @@ function openImgEditor() {
     }
   }
   if (S._imgEditState.zoomPct) {
-    $('img-zoom').value = S._imgEditState.zoomPct; $('img-zoom-val').textContent = S._imgEditState.zoomPct + '%'
+    zoomEl.value = S._imgEditState.zoomPct; zoomValEl.textContent = S._imgEditState.zoomPct + '%'
     // Restore offset: stored as viewport px, convert back to preview px
     const natW = S._imgEditState.natW || 1, natH = S._imgEditState.natH || 1
     const vFill = Math.max(vw / natW, vh / natH)
@@ -2501,7 +2565,7 @@ function openImgEditor() {
     imgDrag.posY = (S._imgEditState.posY || 0) * ratio
   } else if (S._imgEditState.zoom) {
     S._imgEditState.zoomPct = S._imgEditState.zoom; delete S._imgEditState.zoom
-    $('img-zoom').value = S._imgEditState.zoomPct; $('img-zoom-val').textContent = S._imgEditState.zoomPct + '%'
+    zoomEl.value = S._imgEditState.zoomPct; zoomValEl.textContent = S._imgEditState.zoomPct + '%'
     const natW = S._imgEditState.natW || 1, natH = S._imgEditState.natH || 1
     const z = S._imgEditState.zoomPct / 100
     const previewPh = Math.round(320 * vh / vw)
@@ -2528,36 +2592,40 @@ function autoFitImg() {
 
 function applyImgTransform() {
   const img = $('img-edit-img'), preview = $('img-editor-preview')
+  if (!img || !preview) return
   const pw = preview.clientWidth, ph = preview.clientHeight
   if (!pw || !ph) return
   const natW = img.naturalWidth || img.width, natH = img.naturalHeight || img.height
   if (!natW || !natH) return
   const vw = window.innerWidth, vh = window.innerHeight
-  const z = parseInt($('img-zoom').value) / 100
+  const zoomEl = $('img-zoom'), opacityEl = $('img-opacity'), blurEl = $('img-blur')
+  const z = parseInt(zoomEl.value) / 100
   // Preview: scale is relative to filling the preview box, proportionally
   const previewFill = Math.max(pw / natW, ph / natH)
   const viewportFill = Math.max(vw / natW, vh / natH)
   const previewScale = previewFill * z
   const imgW = natW * previewScale, imgH = natH * previewScale
-  const opacity = parseInt($('img-opacity').value) / 100
-  const blur = parseInt($('img-blur').value)
+  const opacity = parseInt(opacityEl.value) / 100
+  const blur = parseInt(blurEl.value)
   img.style.width = imgW + 'px'; img.style.height = imgH + 'px'
   img.style.left = ((pw - imgW) / 2 + imgDrag.posX) + 'px'
   img.style.top = ((ph - imgH) / 2 + imgDrag.posY) + 'px'
   img.style.opacity = opacity; img.style.filter = blur > 0 ? `blur(${blur}px)` : ''
   const oxPct = pw ? Math.round((-imgDrag.posX * 2 / pw) * 100) : 0
   const oyPct = ph ? Math.round((-imgDrag.posY * 2 / ph) * 100) : 0
-  $('img-offset-text').textContent = `X: ${oxPct}% / Y: ${oyPct}%`
+  const offsetText = $('img-offset-text')
+  if (offsetText) offsetText.textContent = `X: ${oxPct}% / Y: ${oyPct}%`
 }
 
 function commitImgChanges() {
-  S.ovl = parseInt($('img-opacity').value)
-  S.bgBlur = parseInt($('img-blur').value)
+  const opacityEl = $('img-opacity'), blurEl = $('img-blur'), zoomEl = $('img-zoom')
+  S.ovl = parseInt(opacityEl.value)
+  S.bgBlur = parseInt(blurEl.value)
   S._imgEditState = S._imgEditState || {}
   const img = $('img-edit-img')
   const natW = img.naturalWidth || 1, natH = img.naturalHeight || 1
   const vw = window.innerWidth, vh = window.innerHeight
-  const z = parseInt($('img-zoom').value) / 100
+  const z = parseInt(zoomEl.value) / 100
   const preview = $('img-editor-preview')
   const pw = preview.clientWidth, ph = preview.clientHeight
   const pFill = Math.max(pw / natW, ph / natH)
@@ -2565,7 +2633,7 @@ function commitImgChanges() {
   const previewImgW = natW * pFill * z
   const mainImgW = natW * vFill * z
   const ratio = mainImgW / previewImgW
-  S._imgEditState.zoomPct = parseInt($('img-zoom').value)
+  S._imgEditState.zoomPct = parseInt(zoomEl.value)
   S._imgEditState.natW = natW
   S._imgEditState.natH = natH
   S._imgEditState.posX = imgDrag.posX * ratio
@@ -2576,8 +2644,13 @@ function commitImgChanges() {
 
 function collectAllTracks(node) {
   let all = []
-  for (const c of node.children) { all = all.concat(collectAllTracks(c)) }
-  return all.concat(node.tracks)
+  for (const c of node.children) { collectAllTracksInto(c, all) }
+  for (const t of node.tracks) all.push(t)
+  return all
+}
+function collectAllTracksInto(node, out) {
+  for (const c of node.children) collectAllTracksInto(c, out)
+  for (const t of node.tracks) out.push(t)
 }
 
 function hasMusicRecursive(node) {
@@ -2662,10 +2735,8 @@ $('btn-max').addEventListener('click', () => api.maximize())
 $('btn-close').addEventListener('click', () => api.close())
 
 // Sel mode toggle fix
-try {
-  const selToggle = document.querySelector('.sel-mode-toggle')
-  if (selToggle) selToggle.addEventListener('click', () => { S.selMode = !S.selMode; renderAll(); schedSave() })
-} catch (e) { /* ignore */ }
+const selToggle = document.querySelector('.sel-mode-toggle')
+if (selToggle) selToggle.addEventListener('click', () => { S.selMode = !S.selMode; renderAll(); schedSave() })
 
 // Window controls events from main
 if (api.onMaximized) api.onMaximized(() => { const mi = $('max-icon'); if (mi) mi.innerHTML = '<rect x="5" y="5" width="14" height="14" rx="2"/>'; if (S.bgData) apThBg() })
@@ -2678,9 +2749,11 @@ async function init() {
     await loadS(); apTh(); apThBg(); updSUI()
     // Phase 2: Load library/scan data (may be slower, but theme is already visible)
     await loadLibraryData()
-    // Save state on exit
-    api.onBeforeClose(() => { clearTimeout(saveTimer); saveS() })
-    window.addEventListener('beforeunload', () => { clearTimeout(saveTimer); saveS() })
+    // Save state on exit (guard against double-save from both IPC and beforeunload)
+    let _savingOnExit = false
+    const saveOnExit = () => { if (_savingOnExit) return; _savingOnExit = true; clearTimeout(saveTimer); saveS() }
+    api.onBeforeClose(saveOnExit)
+    window.addEventListener('beforeunload', saveOnExit)
     let _resizeRAF = null
     let _resizeFlushTimer = null
     window.addEventListener('resize', () => {
@@ -2711,9 +2784,9 @@ async function init() {
               await playDsdTrack(t, S.cTime || 0)
             } else {
               S.dur = t.duration || 0
-              $('progress-duration').textContent = fmtTime(S.dur)
+              _progressDuration.textContent = fmtTime(S.dur)
               S.cTime = S.cTime || 0
-              $('progress-current').textContent = fmtTime(S.cTime)
+              _progressCurrent.textContent = fmtTime(S.cTime)
               dsdState.pausedAt = S.cTime || 0
             }
           } else {
