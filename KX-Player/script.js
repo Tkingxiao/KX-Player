@@ -23,6 +23,8 @@ const S = {
 let fp = [], audio = new Audio(), lrc = [], pl = [], nI = 0
 let _lastLrcActiveIdx = -1
 let _idCounter = 0
+let _scanRunning = false
+let _loadTGeneration = 0
 let stopWatchingFs = null
 let lyricsManualScrollUntil = 0
 let dsdState = {
@@ -44,7 +46,7 @@ const _progressFill = $('progress-fill')
 const _progressHandle = $('progress-handle')
 const _progressCurrent = $('progress-current')
 const _progressDuration = $('progress-duration')
-function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') }
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/`/g, '&#96;').replace(/\$/g, '&#36;') }
 function pathJoin(a, b) { return a.replace(/[/\\]+$/, '') + '\\' + b }
 function isChildPath(child, parent) {
   const np = parent.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -57,7 +59,15 @@ function arrayMatchSorted(a, b) {
   for (let i = 0; i < sa.length; i++) { if (sa[i] !== sb[i]) return false }
   return true
 }
-function hashPath(p) { let h = 0; for (let i = 0; i < p.length; i++) { h = ((h << 5) - h) + p.charCodeAt(i); h |= 0 } return 'dsd' + Math.abs(h).toString(36) }
+function hashPath(p) {
+  // Double hash to reduce collision risk for large libraries
+  let h1 = 0, h2 = 0
+  for (let i = 0; i < p.length; i++) {
+    h1 = ((h1 << 5) - h1) + p.charCodeAt(i); h1 |= 0
+    h2 = ((h2 << 7) - h2) + p.charCodeAt(i); h2 |= 0
+  }
+  return 'dsd' + Math.abs(h1).toString(36) + Math.abs(h2).toString(36)
+}
 function fmtTime(t) { if (!t || !isFinite(t)) return '00:00'; const m = Math.floor(t / 60), s = Math.floor(t % 60); return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') }
 function isVideoFile(t) { return t && t.isVideo === true }
 
@@ -100,7 +110,11 @@ function _startResizeThrottle() {
 function virtualList(containerId, items, rowHeight, renderItem, onClick) {
   const c = $(containerId)
   if (!c) return
+  // Remove previous listeners and observer to prevent accumulation
   if (c._vlRO) { c._vlRO.disconnect(); c._vlRO = null }
+  if (c._vlScrollFn) { c.removeEventListener('scroll', c._vlScrollFn) }
+  if (c._vlClickFn) { c.removeEventListener('click', c._vlClickFn) }
+  if (c._vlDblClickFn) { c.removeEventListener('dblclick', c._vlDblClickFn) }
   c.innerHTML = ''
   if (!items.length) { c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u6682\u65e0\u5185\u5bb9</h3></div>'; return }
   const totalH = items.length * rowHeight
@@ -119,7 +133,9 @@ function virtualList(containerId, items, rowHeight, renderItem, onClick) {
     view.innerHTML = html
   }
   c._vlRender = render; c._vlItems = items; render()
-  c.addEventListener('scroll', render, { passive: true })
+  const scrollFn = () => render()
+  c._vlScrollFn = scrollFn
+  c.addEventListener('scroll', scrollFn, { passive: true })
   let resizeTimer
   const ro = new ResizeObserver(() => {
     if (_resizeActive) return
@@ -128,14 +144,17 @@ function virtualList(containerId, items, rowHeight, renderItem, onClick) {
   })
   ro.observe(c); c._vlRO = ro
   if (onClick) {
-    c.addEventListener('click', e => {
+    const clickFn = e => {
       const playBtn = e.target.closest('.idx-play-btn')
       if (playBtn) { const row = e.target.closest('.song-row'); if (row && row.dataset.tid) onClick(row.dataset.tid, true) }
-    })
-    c.addEventListener('dblclick', e => {
+    }
+    const dblClickFn = e => {
       const row = e.target.closest('.song-row')
       if (row && row.dataset.tid) onClick(row.dataset.tid, true)
-    })
+    }
+    c._vlClickFn = clickFn; c._vlDblClickFn = dblClickFn
+    c.addEventListener('click', clickFn)
+    c.addEventListener('dblclick', dblClickFn)
   }
 }
 function invalidateVL(containerId) { const c = $(containerId); if (c && c._vlRender) c._vlRender() }
@@ -766,6 +785,7 @@ function updSUI() {
 // === Audio ===
 async function loadT(idx) {
   if (idx < 0 || idx >= pl.length) return
+  const gen = ++_loadTGeneration
   nI = idx
   const t = pl[idx]
   stopDsdPlayback(false)
@@ -774,14 +794,18 @@ async function loadT(idx) {
     audio.removeAttribute('src')
     audio.load()
     await loadLrcForTrack(t)
+    if (gen !== _loadTGeneration) return
     await playDsdTrack(t, 0)
+    if (gen !== _loadTGeneration) return
     S.tI = idx; S.playing = true
     return
   }
   audio.src = 'file:///' + t.path.replace(/\\/g, '/')
   await loadLrcForTrack(t)
+  if (gen !== _loadTGeneration) return
   if (S.devId && audio.setSinkId) try { await audio.setSinkId(S.devId) } catch (e) { /* ignore */ }
   await audio.play().catch(() => { /* ignore */ })
+  if (gen !== _loadTGeneration) return
   S.tI = idx; S.playing = true
 }
 
@@ -1325,6 +1349,7 @@ async function playDsdTrack(track, seekTime = 0) {
   const sampleRate = decoded.sampleRate || 44100
   const frames = Math.floor(pcmView.length / channels)
   const context = new AudioContext({ sampleRate })
+  if (context.state === 'suspended') context.resume()
   const gainNode = context.createGain()
   const buffer = context.createBuffer(channels, frames, sampleRate)
 
@@ -1420,13 +1445,18 @@ function openLyricsForTrack(tid) {
 function mkP(n) { n = n || '\u65b0\u5217\u8868'; const id = 'pl-' + Date.now() + '-' + (++_idCounter); S.pls.push({ id, name: n, trackIds: [], coverData: null }); schedSave(); renderAll(); requestAnimationFrame(() => startRename('pl', id)) }
 async function rmP(id) { const p = S.pls.find(x => x.id === id); if (!p) return; const ok = await showConfirm('删除播放列表', `确定删除播放列表“${p.name}”吗？`); if (!ok) return; S.pls = S.pls.filter(x => x.id !== id); if (S.aPl === id) { S.aPl = null; S.view = 'all' } schedSave(); renderAll() }
 function rnP(id) { startRename('pl', id) }
+function _resetPlayingIfRemoved(tid) {
+  if (S.playingTid !== tid) return
+  S.playingTid = null; S.view = 'all'; S.aF = null; S.aPl = null
+  audio.pause(); S.playing = false; lrc = []
+}
 function a2P(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p || p.trackIds.includes(tid)) return; p.trackIds.push(tid); if (!p.coverData) { const t = S.all.find(x => x.id === tid); if (t) p.coverData = t.coverData || t.albumCoverData } schedSave(); renderAll() }
-function rFP(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p) return; p.trackIds = p.trackIds.filter(id => id !== tid); if (!p.trackIds.length) p.coverData = null; if (S.playingTid === tid) { S.playingTid = null; S.view = 'all'; S.aF = null; S.aPl = null; audio.pause(); S.playing = false; lrc = [] } schedSave(); renderAll() }
+function rFP(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p) return; p.trackIds = p.trackIds.filter(id => id !== tid); if (!p.trackIds.length) p.coverData = null; _resetPlayingIfRemoved(tid); schedSave(); renderAll() }
 function mkF(n) { n = n || '\u65b0\u6536\u85cf\u5939'; const id = 'fav-' + Date.now() + '-' + (++_idCounter); S.favs.push({ id, name: n, trackIds: [], isDefault: false }); schedSave(); renderAll(); requestAnimationFrame(() => startRename('fav', id)) }
 async function rmF(id) { const f = S.favs.find(x => x.id === id); if (!f) return; const ok = await showConfirm('删除收藏夹', `确定删除收藏夹“${f.name}”吗？`); if (!ok) return; S.favs = S.favs.filter(x => x.id !== id); if (S.aF === id) { S.aF = null; S.view = 'all' } schedSave(); renderAll() }
 function rnF(id) { startRename('fav', id) }
 function a2F(fid, tid) { const f = S.favs.find(x => x.id === fid); if (!f || f.trackIds.includes(tid)) return; f.trackIds.push(tid); schedSave(); renderAll() }
-function rFF(fid, tid) { const f = S.favs.find(x => x.id === fid); if (!f) return; f.trackIds = f.trackIds.filter(id => id !== tid); if (S.playingTid === tid) { S.playingTid = null; S.view = 'all'; S.aF = null; S.aPl = null; audio.pause(); S.playing = false; lrc = [] } schedSave(); renderAll() }
+function rFF(fid, tid) { const f = S.favs.find(x => x.id === fid); if (!f) return; f.trackIds = f.trackIds.filter(id => id !== tid); _resetPlayingIfRemoved(tid); schedSave(); renderAll() }
 
 function startRename(type, id) {
   const isFav = type === 'fav', list = isFav ? S.favs : S.pls, item = list.find(x => x.id === id)
@@ -1454,6 +1484,8 @@ function renderFContent(fav, tks) {
 
 // === Scan ===
 async function importFolder() {
+  if (_scanRunning) return
+  _scanRunning = true
   try {
     const result = await api.openFolder(); if (!result || !result.length) return
     const normalized = result.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
@@ -1471,9 +1503,11 @@ async function importFolder() {
     await restartWatching()
     renderAll()
   } catch (e) { alert('\u5bfc\u5165\u5931\u8d25: ' + e.message) }
+  finally { _scanRunning = false }
 }
 
 async function rescan() {
+  if (_scanRunning) return
   if (!fp.length) {
     S.af = []; S.all = []; S.folderTree = []; S.folderStack = []; S._folderMeta = null
     pl = []; S.playingTid = null; S.tI = -1; audio.pause()
@@ -1509,6 +1543,7 @@ async function rescan() {
     rmT(tid)
     renderAll()
   } catch (e) { updT(tid, '\u5931\u8d25', 0, e.message) }
+  finally { _scanRunning = false }
 }
 
 // === Panel ===
@@ -1839,33 +1874,25 @@ async function handleToolDropzoneClick(section) {
   if (arr.length > 0) $(actionsId).classList.remove('hidden')
 }
 
-async function startExtractBatch(files) {
-  if (toolsState.extractRunning) return
-  toolsState.extractRunning = true
-  const fmt = toolsState.extractFmt || 'mp3'
-  const overall = $('extract-overall'); overall.classList.remove('hidden')
-  const overallText = $('extract-overall-text'); const overallFill = $('extract-overall-fill')
+async function runFfmpegBatch(files, section, fmt, codecMap) {
+  const runningKey = section === 'extract' ? 'extractRunning' : 'convertRunning'
+  if (toolsState[runningKey]) return
+  toolsState[runningKey] = true
+  const overall = $(`${section}-overall`); overall.classList.remove('hidden')
+  const overallText = $(`${section}-overall-text`); const overallFill = $(`${section}-overall-fill`)
   overallText.textContent = `\u603b\u8fdb\u5ea6: 0/${files.length}`
   overallFill.style.width = '0%'
 
   const entries = files.map(f => typeof f === 'string' ? { path: f, _status: 'pending', _pct: 0 } : f)
-
-  const codecMap = {
-    mp3: ['-vn', '-acodec', 'libmp3lame', '-q:a', '2'],
-    flac: ['-vn', '-acodec', 'flac'],
-    wav: ['-vn', '-acodec', 'pcm_s16le'],
-    ogg: ['-vn', '-acodec', 'libvorbis', '-q:a', '4'],
-    aac: ['-vn', '-acodec', 'aac', '-b:a', '192k'],
-  }
+  const fileListId = `tools-${section}-files`
 
   for (let i = 0; i < entries.length; i++) {
     const f = entries[i]
     const fpath = f.path
     f._status = 'running'; f._pct = 10
-    renderToolFileList('tools-extract-files', entries, 'extract')
+    renderToolFileList(fileListId, entries, section)
     overallText.textContent = `\u603b\u8fdb\u5ea6: \u7b2c${i + 1}/\u5171${entries.length} \u4e2a \u5904\u7406\u4e2d...`
-    const basePct = (i / entries.length) * 100
-    overallFill.style.width = (basePct + 5) + '%'
+    overallFill.style.width = ((i / entries.length) * 100 + 5) + '%'
 
     const baseName = fpath.replace(/\.[^.]+$/, '')
     const outPath = baseName + '.' + fmt
@@ -1879,61 +1906,22 @@ async function startExtractBatch(files) {
       f._status = 'error'; f._pct = undefined
       f._errorMsg = e.message || '\u672a\u77e5\u9519\u8bef'
     }
-    renderToolFileList('tools-extract-files', entries, 'extract')
+    renderToolFileList(fileListId, entries, section)
     overallFill.style.width = (((i + 1) / entries.length) * 100) + '%'
   }
   const doneCount = entries.filter(f => f._status === 'done').length
   overallText.textContent = `\u5b8c\u6210: ${doneCount}/${entries.length} \u6210\u529f`
-  toolsState.extractRunning = false
+  toolsState[runningKey] = false
+}
+
+async function startExtractBatch(files) {
+  const codecMap = { mp3: ['-vn', '-acodec', 'libmp3lame', '-q:a', '2'], flac: ['-vn', '-acodec', 'flac'], wav: ['-vn', '-acodec', 'pcm_s16le'], ogg: ['-vn', '-acodec', 'libvorbis', '-q:a', '4'], aac: ['-vn', '-acodec', 'aac', '-b:a', '192k'] }
+  await runFfmpegBatch(files, 'extract', toolsState.extractFmt || 'mp3', codecMap)
 }
 
 async function startConvertBatch(files) {
-  if (toolsState.convertRunning) return
-  toolsState.convertRunning = true
-  const fmt = toolsState.convertFmt || 'mp3'
-  const overall = $('convert-overall'); overall.classList.remove('hidden')
-  const overallText = $('convert-overall-text'); const overallFill = $('convert-overall-fill')
-  overallText.textContent = `\u603b\u8fdb\u5ea6: 0/${files.length}`
-  overallFill.style.width = '0%'
-
-  const entries = files.map(f => typeof f === 'string' ? { path: f, _status: 'pending', _pct: 0 } : f)
-
-  const codecMap = {
-    mp3: ['-acodec', 'libmp3lame', '-q:a', '2'],
-    flac: ['-acodec', 'flac'],
-    wav: ['-acodec', 'pcm_s16le'],
-    ogg: ['-acodec', 'libvorbis', '-q:a', '4'],
-    m4a: ['-acodec', 'aac', '-b:a', '192k'],
-    aac: ['-acodec', 'aac', '-b:a', '192k'],
-  }
-
-  for (let i = 0; i < entries.length; i++) {
-    const f = entries[i]
-    const fpath = f.path
-    f._status = 'running'; f._pct = 10
-    renderToolFileList('tools-convert-files', entries, 'convert')
-    overallText.textContent = `\u603b\u8fdb\u5ea6: \u7b2c${i + 1}/\u5171${entries.length} \u4e2a \u5904\u7406\u4e2d...`
-    const basePct = (i / entries.length) * 100
-    overallFill.style.width = (basePct + 5) + '%'
-
-    const baseName = fpath.replace(/\.[^.]+$/, '')
-    const outPath = baseName + '.' + fmt
-    const args = ['-i', fpath, ...(codecMap[fmt] || codecMap.mp3), '-y', outPath]
-
-    try {
-      const result = await api.ffmpegExec(args)
-      if (result.code !== 0) throw new Error(result.stderr?.split('\n').slice(-3).join(' ') || 'ffmpeg \u9000\u51fa\u7801: ' + result.code)
-      f._status = 'done'; f._pct = 100
-    } catch (e) {
-      f._status = 'error'; f._pct = undefined
-      f._errorMsg = e.message || '\u672a\u77e5\u9519\u8bef'
-    }
-    renderToolFileList('tools-convert-files', entries, 'convert')
-    overallFill.style.width = (((i + 1) / entries.length) * 100) + '%'
-  }
-  const doneCount = entries.filter(f => f._status === 'done').length
-  overallText.textContent = `\u5b8c\u6210: ${doneCount}/${entries.length} \u6210\u529f`
-  toolsState.convertRunning = false
+  const codecMap = { mp3: ['-acodec', 'libmp3lame', '-q:a', '2'], flac: ['-acodec', 'flac'], wav: ['-acodec', 'pcm_s16le'], ogg: ['-acodec', 'libvorbis', '-q:a', '4'], m4a: ['-acodec', 'aac', '-b:a', '192k'], aac: ['-acodec', 'aac', '-b:a', '192k'] }
+  await runFfmpegBatch(files, 'convert', toolsState.convertFmt || 'mp3', codecMap)
 }
 
 // === Events ===
@@ -2423,37 +2411,27 @@ $('btn-theme').addEventListener('click', () => { $('settings-modal').classList.r
 let themeDebounceTimer
 $('theme-dark').addEventListener('click', () => { clearTimeout(themeDebounceTimer); themeDebounceTimer = setTimeout(() => { S.theme = 'dark'; updSUI(); apTh(); schedSave() }, 50) })
 $('theme-light').addEventListener('click', () => { clearTimeout(themeDebounceTimer); themeDebounceTimer = setTimeout(() => { S.theme = 'light'; updSUI(); apTh(); schedSave() }, 50) })
-let sidebarOpacityTimer
+let _sidebarOpacityTimer, _titlebarOpacityTimer, _playerOpacityTimer
 $('sidebar-opacity').addEventListener('input', e => {
   S.sidebarOpacity = parseInt(e.target.value)
   $('sidebar-opacity-val').textContent = S.sidebarOpacity + '%'
-  const isDark = S.theme === 'dark'
-  const sidebarAlpha = S.sidebarOpacity / 100
-  const sbBg = isDark ? `rgba(16,16,22,${sidebarAlpha})` : `rgba(245,245,247,${sidebarAlpha})`
-  $('sidebar').style.background = sbBg
-  $('sidebar').style.borderRight = `1.5px solid ${isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)'}`
-  clearTimeout(sidebarOpacityTimer)
-  sidebarOpacityTimer = setTimeout(schedSave, 200)
+  apTh()
+  clearTimeout(_sidebarOpacityTimer)
+  _sidebarOpacityTimer = setTimeout(schedSave, 200)
 })
 $('titlebar-opacity').addEventListener('input', e => {
   S.titlebarOpacity = parseInt(e.target.value)
   $('titlebar-opacity-val').textContent = S.titlebarOpacity + '%'
-  const isDark = S.theme === 'dark'
-  const titlebarAlpha = S.titlebarOpacity / 100
-  const tbBg = isDark ? `rgba(16,16,22,${titlebarAlpha})` : `rgba(255,255,255,${titlebarAlpha})`
-  $('titlebar').style.background = tbBg
-  clearTimeout(window._titlebarSaveTimer)
-  window._titlebarSaveTimer = setTimeout(schedSave, 200)
+  apTh()
+  clearTimeout(_titlebarOpacityTimer)
+  _titlebarOpacityTimer = setTimeout(schedSave, 200)
 })
 $('player-opacity').addEventListener('input', e => {
   S.playerOpacity = parseInt(e.target.value)
   $('player-opacity-val').textContent = S.playerOpacity + '%'
-  const isDark = S.theme === 'dark'
-  const playerAlpha = S.playerOpacity / 100
-  const pbBg = isDark ? `rgba(20,20,28,${playerAlpha})` : `rgba(255,255,255,${playerAlpha})`
-  $('player-bar').style.background = pbBg
-  clearTimeout(window._playerSaveTimer)
-  window._playerSaveTimer = setTimeout(schedSave, 200)
+  apTh()
+  clearTimeout(_playerOpacityTimer)
+  _playerOpacityTimer = setTimeout(schedSave, 200)
 })
 // === Color Picker Canvas ===
 
@@ -2751,7 +2729,7 @@ async function init() {
     await loadLibraryData()
     // Save state on exit (guard against double-save from both IPC and beforeunload)
     let _savingOnExit = false
-    const saveOnExit = () => { if (_savingOnExit) return; _savingOnExit = true; clearTimeout(saveTimer); saveS() }
+    const saveOnExit = async () => { if (_savingOnExit) return; _savingOnExit = true; clearTimeout(saveTimer); await saveS() }
     api.onBeforeClose(saveOnExit)
     window.addEventListener('beforeunload', saveOnExit)
     let _resizeRAF = null

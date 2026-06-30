@@ -358,7 +358,9 @@ async function enrichWithWorkers(
                 sampleRate: r.sampleRate || null,
               })
             }
-            completed += chunk.length
+            // Only count files not already counted by progress messages
+            const progressCount = msg.results?.length || 0
+            completed += Math.max(0, chunk.length - progressCount)
             reportProgress(completed)
             resolve()
           } else if (msg.type === 'progress') {
