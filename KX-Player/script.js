@@ -429,20 +429,20 @@ function apTh() {
   const sidebarEl = $('sidebar'), titlebarEl = $('titlebar'), playerBarEl = $('player-bar')
   const sidebarAlpha = (S.sidebarOpacity ?? 100) / 100
   const sbBg = isDark ? `rgba(16,16,22,${sidebarAlpha})` : `rgba(245,245,247,${sidebarAlpha})`
-  sidebarEl.style.background = sbBg
+  sidebarEl.style.backgroundColor = sbBg
   sidebarEl.style.borderRight = `1.5px solid ${isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.08)'}`
   // Titlebar opacity
   const titlebarAlpha = (S.titlebarOpacity ?? 100) / 100
   const tbBg = isDark ? `rgba(16,16,22,${titlebarAlpha})` : `rgba(255,255,255,${titlebarAlpha})`
-  titlebarEl.style.background = tbBg
+  titlebarEl.style.backgroundColor = tbBg
   // Player bar opacity
   const playerAlpha = (S.playerOpacity ?? 100) / 100
   const pbBg = isDark ? `rgba(20,20,28,${playerAlpha})` : `rgba(255,255,255,${playerAlpha})`
-  playerBarEl.style.background = pbBg
+  playerBarEl.style.backgroundColor = pbBg
 }
 
 function apThBg() {
-  if (!S.bgData) { $('bg-img').src = ''; $('bg-layer').style.opacity = 1; $('bg-layer').style.filter = ''; return }
+  if (!S.bgData) { $('bg-img').removeAttribute('src'); $('bg-layer').style.opacity = 1; $('bg-layer').style.filter = ''; return }
   const bgEl = $('bg-layer'), bgImg = $('bg-img')
   bgImg.src = S.bgData
   bgEl.style.opacity = S.ovl / 100
@@ -799,7 +799,7 @@ async function loadT(idx) {
     audio.load()
     await loadLrcForTrack(t)
     if (gen !== _loadTGeneration) return
-    await playDsdTrack(t, 0)
+    await playDsdTrack(t, 0).catch(e => { console.error('DSD playback failed:', e); const tid = addT('DSD 播放失败'); updT(tid, '错误', 0, e.message); rmT(tid) })
     if (gen !== _loadTGeneration) return
     S.tI = idx; S.playing = true
     return
@@ -1189,7 +1189,6 @@ function renderLrcContent() {
     scroll.addEventListener('wheel', () => markLyricsManualScroll(), { passive: true })
     scroll.addEventListener('touchstart', () => markLyricsManualScroll(), { passive: true })
     scroll.addEventListener('pointerdown', () => markLyricsManualScroll(), { passive: true })
-    scroll.addEventListener('scroll', () => markLyricsManualScroll(1200), { passive: true })
   }
   if (scroll && lines.length > 0) {
     const activeLine = scroll.querySelector('.lc-line.active') || lines[0]
@@ -1497,18 +1496,21 @@ async function importFolder() {
     for (const p of normalized) { if (!fp.includes(p)) fp.push(p) }
     const tid = addT('\u6b63\u5728\u626b\u63cf\u97f3\u4e50\u6587\u4ef6...')
     api.removeScanProgressListener()
-    api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
+    let removeProgress = null
+    removeProgress = api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
     const r = await api.scanFoldersWithProgress(fp)
     const at = applyScanResult(r)
     const allIds = new Set(at.map(t => t.id))
     cleanupStale(allIds)
     S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = []; S.activeFp = null
     pl = at
+    // Check if currently playing track still exists in new scan results
+    if (S.playingTid && !allIds.has(S.playingTid)) { S.playingTid = null; S.playing = false; audio.pause(); lrc = [] }
     if (r.fileCount > 0) { updT(tid, '\u5b8c\u6210\u2714', 100, `\u5171 ${r.fileCount || at.length} \u9996\u97f3\u4e50`); rmT(tid) } else { updT(tid, '\u672a\u627e\u5230\u97f3\u4e50', 0, '\u8bf7\u68c0\u67e5\u6587\u4ef6\u5939\u5185\u5bb9'); setTimeout(() => rmT(tid), 5000) }
     await restartWatching()
     renderAll()
   } catch (e) { alert('\u5bfc\u5165\u5931\u8d25: ' + e.message) }
-  finally { _scanRunning = false }
+  finally { _scanRunning = false; removeProgress?.() }
 }
 
 async function rescan() {
@@ -1948,15 +1950,15 @@ $('content-area').addEventListener('click', e => {
   }
   const t = e.target.closest('.song-row'); if (t && t.dataset.tid) { /* single click does nothing, use dblclick or play button */ return }
   if (e.target.closest('[data-pa]')) {
-    const [ai, al_] = e.target.closest('[data-pa]').dataset.pa.split(':').map(Number)
+    const el = e.target.closest('[data-pa]'); const [ai, al_] = el.dataset.pa.split(':').map(Number)
     if (!isNaN(ai)) { const a = S.af[ai]; if (al_ !== undefined && !isNaN(al_)) { if (a) playAll(a.albums[al_]?.tracks || []); return } const tks = a ? [].concat(...a.albums.map(al => al.tracks)) : []; playAll(tks) }
     return
   }
-  if (e.target.closest('[data-ppl]')) { const pid = e.target.closest('[data-ppl]').dataset.ppl; const p = S.pls.find(x => x.id === pid); if (p) { const tks = p.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean); playAll(tks) } return }
-  if (e.target.closest('[data-pfav]')) { const fid = e.target.closest('[data-pfav]').dataset.pfav; const f = S.favs.find(x => x.id === fid); if (f) { const tks = f.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean); playAll(tks) } return }
+  if (e.target.closest('[data-ppl]')) { const el = e.target.closest('[data-ppl]'); const pid = el.dataset.ppl; const p = S.pls.find(x => x.id === pid); if (p) { const tks = p.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean); playAll(tks) } return }
+  if (e.target.closest('[data-pfav]')) { const el = e.target.closest('[data-pfav]'); const fid = el.dataset.pfav; const f = S.favs.find(x => x.id === fid); if (f) { const tks = f.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean); playAll(tks) } return }
   if (e.target.closest('[data-pall]')) { playAll(S.all); return }
   if (e.target.closest('[data-pfolder]')) {
-    const fpPath = e.target.closest('[data-pfolder]').dataset.pfolder; const n = findNodeByPath(S.folderTree, fpPath)
+    const el = e.target.closest('[data-pfolder]'); const fpPath = el.dataset.pfolder; const n = findNodeByPath(S.folderTree, fpPath)
     if (n) { const all = collectAllTracks(n); if (all.length) { pl = all; playT(0); renderPanel() } }
     return
   }
@@ -1996,7 +1998,7 @@ $('content-area').addEventListener('click', e => {
     activeLrcTab = tab
     document.querySelectorAll('.lyrics-tab-btn').forEach(b => b.classList.remove('active'))
     e.target.closest('.lyrics-tab-btn').classList.add('active')
-    $('lyrics-lines-scroll').classList.toggle('hidden', tab !== 'lyrics')
+    const ls = $('lyrics-lines-scroll'); if (ls) ls.classList.toggle('hidden', tab !== 'lyrics')
     const mp = $('lyrics-meta-panel'); if (mp) mp.classList.toggle('hidden', tab !== 'meta')
     return
   }
