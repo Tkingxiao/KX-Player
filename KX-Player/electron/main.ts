@@ -338,7 +338,7 @@ ipcMain.handle('settings:load', async () => {
   try {
     const settingsPath = getSettingsPath()
     if (fs.existsSync(settingsPath)) {
-      const data = fs.readFileSync(settingsPath, 'utf-8')
+      const data = await fsp.readFile(settingsPath, 'utf-8')
       return JSON.parse(data)
     }
   } catch { /* ignore */ }
@@ -374,7 +374,7 @@ ipcMain.handle('cache:load', async () => {
   try {
     const cachePath = getCachePath()
     if (fs.existsSync(cachePath)) {
-      const data = fs.readFileSync(cachePath, 'utf-8')
+      const data = await fsp.readFile(cachePath, 'utf-8')
       return JSON.parse(data)
     }
   } catch { /* ignore */ }
@@ -480,8 +480,6 @@ ipcMain.handle('ffmpeg:exec', async (_event, args: string[]) => {
     const child = execFile(exe, args, { timeout: 600000, maxBuffer: 100 * 1024 * 1024 }, (error, stdout, stderr) => {
       resolve({ code: error ? error.code ?? 1 : 0, stdout, stderr })
     })
-    // Send progress updates via IPC events
-    child.on('exit', () => { /* handled by callback */ })
   })
 })
 
@@ -595,17 +593,13 @@ ipcMain.handle('window:close', () => {
   mainWindow.hide()
 })
 
-ipcMain.handle('window:forceClose', () => {
+ipcMain.handle('window:forceClose', async () => {
   if (!mainWindow) return
   forceCloseFlag = true
-  mainWindow.webContents.send('window:beforeClose')
+  // Give renderer time to save state before closing
   try {
-    const settingsPath = getSettingsPath()
-    if (fs.existsSync(settingsPath)) {
-      const data = fs.readFileSync(settingsPath, 'utf-8')
-      fs.writeFileSync(settingsPath, data, 'utf-8')
-    }
-  } catch { /* ignore */ }
+    await mainWindow.webContents.invoke('window:beforeClose')
+  } catch { /* renderer may already be destroyed */ }
   mainWindow.close()
 })
 
@@ -613,10 +607,14 @@ ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
 
 ipcMain.handle('dsd:getTempPath', () => getDsdTempDir())
 
-app.on('before-quit', () => {
+app.on('before-quit', async () => {
   cleanupDsdTemp()
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('window:beforeClose')
+    try {
+      mainWindow.webContents.send('window:beforeClose')
+      // Give renderer a moment to save state
+      await new Promise(r => setTimeout(r, 200))
+    } catch { /* ignore */ }
   }
 })
 

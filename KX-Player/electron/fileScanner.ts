@@ -329,7 +329,7 @@ async function enrichWithWorkers(
         }
         if (!fs.existsSync(workerPath)) {
           for (const f of chunk) {
-            results.set(f, { duration: 0, coverData: null, title: null, artist: null })
+            results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
           }
           completed += chunk.length
           onProgress?.(completed, total)

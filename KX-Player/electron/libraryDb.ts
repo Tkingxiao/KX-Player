@@ -211,10 +211,10 @@ function insertMeta(database: SqlJsDatabase, key: string, value: string) {
 export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySnapshot): Promise<void> {
   const sql = await ensureSql()
   const database = openDatabase(filePath, sql)
-  clearSnapshot(database)
 
   database.exec('BEGIN TRANSACTION')
   try {
+    clearSnapshot(database)
     insertMeta(database, 'folderPaths', JSON.stringify(snapshot.folderPaths.map(normalizePath)))
     insertMeta(database, 'fileCount', String(snapshot.fileCount))
     insertMeta(database, 'scannedAt', String(snapshot.scannedAt))
@@ -500,8 +500,15 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
   const fileCount = Number(getSingleMeta(database, 'fileCount') || allTracks.length)
   const scannedAt = Number(getSingleMeta(database, 'scannedAt') || 0)
 
+  let parsedFolderPaths: string[]
+  try {
+    parsedFolderPaths = JSON.parse(folderPathsRaw)
+  } catch {
+    return null
+  }
+
   return {
-    folderPaths: JSON.parse(folderPathsRaw),
+    folderPaths: parsedFolderPaths,
     artists,
     folderTree,
     allTracks,

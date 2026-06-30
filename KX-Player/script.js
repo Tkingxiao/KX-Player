@@ -193,11 +193,15 @@ function showConfirm(title, message) {
       $('confirm-modal').classList.add('hidden')
       okBtn.removeEventListener('click', okHandler)
       cancelBtn.removeEventListener('click', cancelHandler)
+      document.removeEventListener('keydown', keyHandler)
     }
     const okHandler = () => { cleanup(); resolve(true) }
     const cancelHandler = () => { cleanup(); resolve(false) }
+    const keyHandler = (e) => { if (e.key === 'Escape') { e.preventDefault(); cancelHandler() } if (e.key === 'Enter') { e.preventDefault(); okHandler() } }
     okBtn.addEventListener('click', okHandler)
     cancelBtn.addEventListener('click', cancelHandler)
+    document.addEventListener('keydown', keyHandler)
+    okBtn.focus()
   })
 }
 
@@ -1085,7 +1089,7 @@ function findNodeByPath(tree, path) {
   for (const n of tree) {
     const npath = n.path.replace(/\\/g, '/')
     if (npath === np) return n
-    const r = findNodeByPath(n.children, path)
+    const r = findNodeByPath(n.children, np)
     if (r) return r
   }
   return null
@@ -1171,6 +1175,7 @@ function renderRecentView() {
 // === Lyrics ===
 let activeLrcTab = 'lyrics'
 function renderLrcContent() {
+  _lastLrcActiveIdx = -1
   const t = S.playingTid ? S.all.find(x => x.id === S.playingTid) : null
   const container = $('content-area')
   if (!container) return
@@ -1349,7 +1354,7 @@ async function playDsdTrack(track, seekTime = 0) {
   const sampleRate = decoded.sampleRate || 44100
   const frames = Math.floor(pcmView.length / channels)
   const context = new AudioContext({ sampleRate })
-  if (context.state === 'suspended') context.resume()
+  if (context.state === 'suspended') await context.resume()
   const gainNode = context.createGain()
   const buffer = context.createBuffer(channels, frames, sampleRate)
 
@@ -1478,7 +1483,7 @@ function renderPContent(plObj, tks) {
   return `<div class="pl-content-header"><div class="pl-content-cover">${cd ? `<img src="${cd}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>'}</div><div class="pl-content-info"><div class="pl-content-label">\u64ad\u653e\u5217\u8868</div><div class="pl-content-name" data-plid="${plObj.id}" title="\u53cc\u51fb\u91cd\u547d\u540d">${esc(plObj.name)}</div><div class="pl-content-actions"><button class="btn-primary" data-ppl="${plObj.id}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><button class="btn-danger" data-delpl="${plObj.id}">\u5220\u9664</button></div></div></div>${tableVT('vl-pl-' + plObj.id, tks, (idx) => playT(idx, true))}`
 }
 function renderFContent(fav, tks) {
-  const td = tks.find(t => t.coverData || t.albumCoverData), cd = td ? td.coverData || t.albumCoverData : null
+  const td = tks.find(t => t.coverData || t.albumCoverData), cd = td ? td.coverData || td.albumCoverData : null
   return `<div class="pl-content-header"><div class="pl-content-cover">${cd ? `<img src="${cd}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>'}</div><div class="pl-content-info"><div class="pl-content-label">收藏夹</div><div class="pl-content-name" data-fvid="${fav.id}" title="${fav.isDefault ? '默认收藏夹' : '双击重命名'}">${esc(fav.name)}</div><div class="pl-content-actions"><button class="btn-primary" data-pfav="${fav.id}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>播放全部</button>${!fav.isDefault ? `<button class="btn-danger" data-delfv="${fav.id}">删除</button>` : ''}</div></div></div>${tableVT('vl-fv-' + fav.id, tks, (idx) => playT(idx, true))}`
 }
 
@@ -1517,8 +1522,8 @@ async function rescan() {
   }
   const tid = addT('\u91cd\u65b0\u626b\u63cf...')
   api.removeScanProgressListener()
-  api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
-  api.onScannerStage((stage) => { const e = document.getElementById(tid + '-status'); if (e) e.textContent = stage })
+  const removeProgress = api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
+  const removeStage = api.onScannerStage((stage) => { const e = document.getElementById(tid + '-status'); if (e) e.textContent = stage })
   try {
     const currentTrackId = pl.length > 0 && S.tI >= 0 ? pl[S.tI]?.id : null
     const r = await api.scanFoldersWithProgress(fp)
@@ -1543,7 +1548,7 @@ async function rescan() {
     rmT(tid)
     renderAll()
   } catch (e) { updT(tid, '\u5931\u8d25', 0, e.message) }
-  finally { _scanRunning = false }
+  finally { _scanRunning = false; removeProgress?.(); removeStage?.() }
 }
 
 // === Panel ===
@@ -2117,6 +2122,9 @@ function exitSearch() {
   $('search-input').value = ''; S.q = ''; $('search-clear').classList.add('hidden'); $('search-back').classList.remove('visible')
   if (S.prevView) {
     S.view = S.prevView; S.aF = S._prevAF || null; S.aPl = S._prevAPl || null
+    // Restore folder navigation state
+    if (S._prevFolderStack) { S.folderStack = S._prevFolderStack; S._prevFolderStack = null }
+    if (S._prevActiveFp !== undefined) { S.activeFp = S._prevActiveFp; S._prevActiveFp = undefined }
     // Restore the playlist/fav track list
     if (S.aF) { const fav = S.favs.find(f => f.id === S.aF); pl = fav ? fav.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean) : S.all }
     else if (S.aPl) { const plObj = S.pls.find(p => p.id === S.aPl); pl = plObj ? plObj.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean) : S.all }
@@ -2335,11 +2343,11 @@ $('search-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') {
     const q = $('search-input').value
     S.q = q; $('search-back').classList.toggle('visible', !!S.q); $('search-clear').classList.toggle('hidden', !S.q); $('search-input').classList.toggle('has-back', !!S.q)
-    if (!S.prevView) { S.prevView = S.view; S._prevAF = S.aF; S._prevAPl = S.aPl }
-    S.view = 'all'; S.aF = null; S.aPl = null; S.folderStack = []
+    if (!S.prevView) { S.prevView = S.view; S._prevAF = S.aF; S._prevAPl = S.aPl; S._prevFolderStack = [...S.folderStack]; S._prevActiveFp = S.activeFp }
+    S.view = 'all'; S.aF = null; S.aPl = null; S.folderStack = []; S.activeFp = null
     if (S.tI >= 0 && pl[S.tI]) S.playingTid = pl[S.tI].id
     const lq = S.q.toLowerCase()
-    pl = S.all.filter(t => (t.name || '').toLowerCase().includes(lq) || (t.artist || '').toLowerCase().includes(lq))
+    pl = S.all.filter(t => (t.name || '').toLowerCase().includes(lq) || (t.artist || '').toLowerCase().includes(lq) || (t.metaArtist || '').toLowerCase().includes(lq) || (t.album || '').toLowerCase().includes(lq))
     syncPlayingState()
     renderAll(); schedSave()
   }
@@ -2622,13 +2630,13 @@ function commitImgChanges() {
 
 function collectAllTracks(node) {
   let all = []
-  for (const c of node.children) { collectAllTracksInto(c, all) }
   for (const t of node.tracks) all.push(t)
+  for (const c of node.children) { collectAllTracksInto(c, all) }
   return all
 }
 function collectAllTracksInto(node, out) {
-  for (const c of node.children) collectAllTracksInto(c, out)
   for (const t of node.tracks) out.push(t)
+  for (const c of node.children) collectAllTracksInto(c, out)
 }
 
 function hasMusicRecursive(node) {
@@ -2779,7 +2787,7 @@ async function init() {
     audio.volume = S.muted ? 0 : S.vol / 100
     $('volume-fill').style.width = S.muted ? '0%' : S.vol + '%'; $('volume-text').textContent = S.muted ? '0' : S.vol
   } catch (e) {
-    /* silent init error */
+    console.error('Init error:', e)
   }
 }
 
