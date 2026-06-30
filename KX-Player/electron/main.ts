@@ -77,7 +77,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      webSecurity: false,
+      webSecurity: !process.env.VITE_DEV_SERVER_URL,
     },
     icon: path.join(__dirname, '../public/favicon.ico'),
     backgroundColor: '#1a1a1e',
@@ -119,10 +119,12 @@ app.whenReady().then(() => {
     }
   })
 
-  // Bypass certificate verification for dev server to avoid SSL handshake errors
-  mainWindow?.webContents.session.setCertificateVerifyProc((request, callback) => {
-    callback(0) // 0 = net::OK, accept all certificates
-  })
+  // Bypass certificate verification only for dev server
+  if (process.env.VITE_DEV_SERVER_URL) {
+    mainWindow?.webContents.session.setCertificateVerifyProc((_request, callback) => {
+      callback(0) // 0 = net::OK, accept all certificates
+    })
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -148,7 +150,8 @@ ipcMain.handle('dialog:openFolder', async () => {
 })
 
 ipcMain.handle('dialog:openImageFile', async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
+  if (!mainWindow) return null
+  const result = await dialog.showOpenDialog(mainWindow, {
     filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'bmp', 'webp', 'gif'] }],
     properties: ['openFile'],
   })
@@ -156,7 +159,8 @@ ipcMain.handle('dialog:openImageFile', async () => {
 })
 
 ipcMain.handle('dialog:openAudioFiles', async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
+  if (!mainWindow) return []
+  const result = await dialog.showOpenDialog(mainWindow, {
     filters: [{ name: '音频/视频', extensions: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'wma', 'opus', 'ape', 'wv', 'aiff', 'dsf', 'dff', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'] }],
     properties: ['openFile', 'multiSelections'],
   })
@@ -262,9 +266,10 @@ ipcMain.handle('media:setAudioDevice', async (_event, deviceId: string) => {
     await mainWindow.webContents.executeJavaScript(`
       (async () => {
         const audioElements = document.querySelectorAll('audio');
+        const deviceId = ${JSON.stringify(deviceId)};
         for (const audio of audioElements) {
           if (typeof audio.setSinkId === 'function') {
-            try { await audio.setSinkId('${deviceId}') } catch {}
+            try { await audio.setSinkId(deviceId) } catch {}
           }
         }
         return true;
