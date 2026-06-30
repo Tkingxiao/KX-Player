@@ -596,9 +596,10 @@ ipcMain.handle('window:close', () => {
 ipcMain.handle('window:forceClose', async () => {
   if (!mainWindow) return
   forceCloseFlag = true
-  // Give renderer time to save state before closing
+  // Send close notification and give renderer time to save state
   try {
-    await mainWindow.webContents.invoke('window:beforeClose')
+    mainWindow.webContents.send('window:beforeClose')
+    await new Promise(r => setTimeout(r, 200))
   } catch { /* renderer may already be destroyed */ }
   mainWindow.close()
 })

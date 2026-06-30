@@ -118,7 +118,7 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
 }
 
 async function processBatch(files: string[], timeoutMs: number): Promise<WorkerResultItem[]> {
-  const results: WorkerResult[] = []
+  const results: WorkerResultItem[] = []
   let lastReported = 0
   let reportTimer: NodeJS.Timeout | null = null
   function reportProgress(completed: number, immediate = false) {
