@@ -2590,7 +2590,6 @@ function applyImgTransform() {
   const z = parseInt(zoomEl.value) / 100
   // Preview: scale is relative to filling the preview box, proportionally
   const previewFill = Math.max(pw / natW, ph / natH)
-  const viewportFill = Math.max(vw / natW, vh / natH)
   const previewScale = previewFill * z
   const imgW = natW * previewScale, imgH = natH * previewScale
   const opacity = parseInt(opacityEl.value) / 100
@@ -2700,7 +2699,7 @@ $('btn-volume').addEventListener('contextmenu', async e => {
   if (spShown) { $('speaker-popup').classList.add('hidden'); spShown = false; return }
   try {
     const devs = await navigator.mediaDevices.enumerateDevices(); const audioOut = devs.filter(d => d.kind === 'audiooutput')
-    const list = $('speaker-device-list'); list.innerHTML = audioOut.map((d, i) => `<button class="speaker-device-item${S.devId === d.deviceId ? ' active' : ''}" data-did="${d.deviceId}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" class="speaker-device-icon"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>${d.label || '\u8bbe\u5907 ' + i}</button>`).join('')
+    const list = $('speaker-device-list'); list.innerHTML = audioOut.map((d, i) => `<button class="speaker-device-item${S.devId === d.deviceId ? ' active' : ''}" data-did="${d.deviceId}"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" class="speaker-device-icon"><polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>${esc(d.label || '\u8bbe\u5907 ' + i)}</button>`).join('')
     $('speaker-popup').classList.remove('hidden'); spShown = true
     list.onclick = async ev => {
       const b = ev.target.closest('button'); if (b && b.dataset.did) {
@@ -2713,7 +2712,7 @@ $('btn-volume').addEventListener('contextmenu', async e => {
 
 document.addEventListener('click', e => {
   if (spShown && !e.target.closest('#speaker-popup') && !e.target.closest('#btn-volume')) { $('speaker-popup').classList.add('hidden'); spShown = false }
-  if (!e.target.closest('#ctx-menu') && !e.target.closest('#ctx-playlist-sub')) hC()
+  if (!_ctxMenu.classList.contains('hidden') && !e.target.closest('#ctx-menu') && !e.target.closest('#ctx-playlist-sub')) hC()
 })
 
 // Titlebar

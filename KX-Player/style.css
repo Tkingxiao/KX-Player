@@ -284,7 +284,6 @@ button:active { transform: scale(0.96); }
 .tools-progress-fill { height: 100%; border-radius: 3px; background: var(--accent); width: 0%; transition: width 0.3s; }
 
 #playlist-panel { position: fixed; left: auto; top: auto; right: 16px; bottom: calc(var(--player-height) + 8px); z-index: 250; width: 340px; max-height: calc(100vh - var(--player-height) - 16px); }
-#playlist-panel.hidden { display: none; }
 .panel-overlay { position: fixed; inset: 0; }
 .panel-content { position: relative; width: 100%; height: 480px; background: var(--bg-player); border: 1px solid var(--border); border-radius: 16px; backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); display: flex; flex-direction: column; animation: slideIn 0.25s ease; overflow: hidden; }
 @keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
