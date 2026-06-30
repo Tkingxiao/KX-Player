@@ -21,23 +21,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
   forceCloseWindow: () => ipcRenderer.invoke('window:forceClose'),
   isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
   onMaximizeChange: (callback: (maximized: boolean) => void) => {
-    ipcRenderer.on('window:maximizeChange', (_event, maximized) => callback(maximized))
+    const handler = (_event: any, maximized: boolean) => callback(maximized)
+    ipcRenderer.on('window:maximizeChange', handler)
+    return () => ipcRenderer.removeListener('window:maximizeChange', handler)
   },
   onScanProgress: (callback: (data: any) => void) => {
-    ipcRenderer.on('scanner:progress', (_event, data) => callback(data))
-  },
-  onScannerProgress: (callback: (data: any) => void) => {
-    ipcRenderer.on('scanner:progress', (_event, data) => callback(data))
+    const handler = (_event: any, data: any) => callback(data)
+    ipcRenderer.on('scanner:progress', handler)
+    return () => ipcRenderer.removeListener('scanner:progress', handler)
   },
   onScannerStage: (callback: (data: string) => void) => {
-    ipcRenderer.on('scanner:stage', (_event, data) => callback(data))
+    const handler = (_event: any, data: string) => callback(data)
+    ipcRenderer.on('scanner:stage', handler)
+    return () => ipcRenderer.removeListener('scanner:stage', handler)
   },
   removeScanProgressListener: () => {
     ipcRenderer.removeAllListeners('scanner:progress')
     ipcRenderer.removeAllListeners('scanner:stage')
   },
   onBeforeClose: (callback: () => void) => {
-    ipcRenderer.on('window:beforeClose', () => callback())
+    const handler = () => callback()
+    ipcRenderer.on('window:beforeClose', handler)
+    return () => ipcRenderer.removeListener('window:beforeClose', handler)
   },
   startWatching: (folderPaths: string[]) => ipcRenderer.invoke('scanner:startWatching', folderPaths),
   stopWatching: () => ipcRenderer.invoke('scanner:stopWatching'),
