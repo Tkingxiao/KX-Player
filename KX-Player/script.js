@@ -1662,7 +1662,7 @@ function showFavAndPlPicker(e, tid) {
   showCtx(e, fakeCi)
 }
 
-function showFavPicker(tid, baseX, baseY, baseH) {
+function showFavPicker(tid, baseX, baseY) {
   const ps = $('ctx-playlist-sub')
   ps.innerHTML = S.favs.map(f => `<button data-ffid="${f.id}">${f.isDefault ? '\u2605 ' : ''}${esc(f.name)}</button>`).join('')
   ps.classList.remove('hidden')
@@ -1681,7 +1681,7 @@ function showFavPicker(tid, baseX, baseY, baseH) {
   ps.onclick = function (ev) { const b = ev.target.closest('button'); if (b && b.dataset.ffid) { a2F(b.dataset.ffid, tid); ps.classList.add('hidden'); hC(); renderAll() } }
 }
 
-function showPlPicker(tid, baseX, baseY, baseH) {
+function showPlPicker(tid, baseX, baseY) {
   const ps = $('ctx-playlist-sub')
   ps.innerHTML = S.pls.map(p => `<button data-plid="${p.id}">${esc(p.name)}</button>`).join('')
   ps.classList.remove('hidden')
