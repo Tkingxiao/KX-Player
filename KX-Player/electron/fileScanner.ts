@@ -343,9 +343,13 @@ async function enrichWithWorkers(
         })
 
         let hasResponded = false
+      let chunkTimer: NodeJS.Timeout | null = null
 
-        worker.on('message', (msg: any) => {
+      const clearChunkTimer = () => { if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null } }
+
+      worker.on('message', (msg: any) => {
           hasResponded = true
+          clearChunkTimer()
           if (msg.type === 'result') {
             for (const r of msg.results) {
               results.set(r.path, {
@@ -370,6 +374,7 @@ async function enrichWithWorkers(
         })
 
         worker.on('error', () => {
+          clearChunkTimer()
           if (!hasResponded) {
             for (const f of chunk) {
               results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
@@ -381,6 +386,7 @@ async function enrichWithWorkers(
         })
 
       worker.on('exit', (code) => {
+        clearChunkTimer()
         if (!hasResponded && code !== 0) {
           for (const f of chunk) {
             results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
@@ -391,7 +397,7 @@ async function enrichWithWorkers(
         resolve()
       })
 
-      setTimeout(() => {
+      chunkTimer = setTimeout(() => {
         if (!hasResponded) {
           worker.terminate()
           for (const f of chunk) {
