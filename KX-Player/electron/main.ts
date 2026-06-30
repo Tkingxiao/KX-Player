@@ -504,10 +504,12 @@ ipcMain.handle('dsd:decodePcm', async (_event, filePath: string) => {
     const stdoutChunks: Buffer[] = []
     const stderrChunks: Buffer[] = []
     let settled = false
+    let timeoutTimer: NodeJS.Timeout | null = null
 
     const finish = (payload: unknown) => {
       if (settled) return
       settled = true
+      if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null }
       resolve(payload)
     }
 
@@ -524,7 +526,7 @@ ipcMain.handle('dsd:decodePcm', async (_event, filePath: string) => {
       finish({ ok: true, sampleRate: 44100, channels: 2, bitsPerSample: 16, pcmBase64: pcmBuffer.toString('base64') })
     })
 
-    setTimeout(() => {
+    timeoutTimer = setTimeout(() => {
       try { child.kill() } catch { }
       finish({ ok: false, error: 'DSD decode timeout' })
     }, 600000)

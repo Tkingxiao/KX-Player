@@ -298,17 +298,17 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
       folderStack.push(...node.children)
     }
 
-    insertArtist.free()
-    insertAlbum.free()
-    insertTrack.free()
-    insertFolder.free()
-    insertFolderTrack.free()
-
     database.exec('COMMIT')
     saveToDisk(database, filePath)
   } catch (error) {
     database.exec('ROLLBACK')
     throw error
+  } finally {
+    try { insertArtist.free() } catch { /* ignore */ }
+    try { insertAlbum.free() } catch { /* ignore */ }
+    try { insertTrack.free() } catch { /* ignore */ }
+    try { insertFolder.free() } catch { /* ignore */ }
+    try { insertFolderTrack.free() } catch { /* ignore */ }
   }
 }
 
