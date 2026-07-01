@@ -363,29 +363,32 @@ async function loadS() {
 async function loadLibraryData() {
   try {
     if (!fp.length) return
-    const library = await api.loadLibrary()
+    console.time('[startup] total')
+    // Load library from database (with covers) or fall back to scanning
+    let library = await api.loadLibrary()
     const cache = library ? null : await api.loadCache()
-    let useCache = false
     if (library && Array.isArray(library.folderPaths)) {
       const libraryPaths = library.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
       if (arrayMatchSorted(fp, libraryPaths)) {
         applyScanResult(library)
-        useCache = true
+      } else {
+        library = null
       }
     } else if (cache && Array.isArray(cache.folderPaths)) {
       const cachePaths = cache.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
       if (arrayMatchSorted(fp, cachePaths) && cache.scanResult) {
         applyScanResult(cache.scanResult)
-        useCache = true
+        library = cache.scanResult
       }
     }
-    if (!useCache) {
+    if (!library) {
       const result = await api.scanFoldersWithProgress(fp)
       applyScanResult(result)
     }
     const allIds = new Set(S.all.map(t => t.id))
     cleanupStale(allIds)
     await restartWatching()
+    console.timeEnd('[startup] total')
   } catch (e) { /* ignore */ }
 }
 
@@ -1528,7 +1531,11 @@ async function rescan() {
   const removeStage = api.onScannerStage((stage) => { const e = document.getElementById(tid + '-status'); if (e) e.textContent = stage })
   try {
     const currentTrackId = pl.length > 0 && S.tI >= 0 ? pl[S.tI]?.id : null
+    console.time('[total] scan->show')
+    console.time('[scan] IPC wait')
     const r = await api.scanFoldersWithProgress(fp)
+    console.timeEnd('[scan] IPC wait')
+    console.time('[scan] applyAndRender')
     const at = applyScanResult(r)
     const allIds = new Set(at.map(t => t.id))
     cleanupStale(allIds)
@@ -1549,6 +1556,8 @@ async function rescan() {
     updT(tid, '\u5b8c\u6210\u2714', 100, `\u5171 ${r.fileCount || at.length} \u9996`)
     rmT(tid)
     renderAll()
+    console.timeEnd('[scan] applyAndRender')
+    console.timeEnd('[total] scan->show')
   } catch (e) { updT(tid, '\u5931\u8d25', 0, e.message) }
   finally { _scanRunning = false; removeProgress?.(); removeStage?.() }
 }
@@ -2676,7 +2685,19 @@ function buildFolderMeta(tree) {
 }
 
 // Panel
-$('btn-playlist-panel').addEventListener('click', () => { $('playlist-panel').classList.remove('hidden'); renderPanel() })
+$('btn-playlist-panel').addEventListener('click', () => {
+  const panel = $('playlist-panel')
+  const btn = $('btn-playlist-panel')
+  if (btn) {
+    const rect = btn.getBoundingClientRect()
+    const playerBar = $('player-bar')
+    const playerHeight = playerBar ? playerBar.offsetHeight : 80
+    panel.style.left = (rect.right + 4) + 'px'
+    panel.style.bottom = (playerHeight + 8) + 'px'
+  }
+  panel.classList.remove('hidden')
+  renderPanel()
+})
 $('playlist-overlay').addEventListener('click', () => { $('playlist-panel').classList.add('hidden') })
 $('playlist-panel').querySelector('.panel-close').addEventListener('click', () => { $('playlist-panel').classList.add('hidden') })
 $('panel-body').addEventListener('click', e => { const t = e.target.closest('.panel-track'); if (t) { const idx = parseInt(t.dataset.pidx); if (!isNaN(idx)) playT(idx) } })

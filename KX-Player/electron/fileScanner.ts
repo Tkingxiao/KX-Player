@@ -3,22 +3,62 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
-import glob from 'fast-glob'
 import chokidar from 'chokidar'
+import * as musicMetadata from 'music-metadata'
 
 const AUDIO_EXTS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.m4a', '.aac', '.wma', '.opus', '.ape', '.wv', '.aiff', '.alac', '.dsf', '.dff', '.dsd'])
 const VIDEO_EXTS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'])
 const ALL_EXTS = new Set([...AUDIO_EXTS, ...VIDEO_EXTS])
 
-const SCAN_TIMEOUT_MS = 30000
-const LARGE_FILE_SCAN_TIMEOUT_MS = 120000 // 2 minutes for large files
+// On Windows, prepend \\?\ for paths > 240 chars to bypass MAX_PATH (260 char) limit.
+function longPath(p: string): string {
+  if (process.platform !== 'win32') return p
+  // Only add prefix for absolute paths that might exceed the limit
+  if (p.length > 240 && !p.startsWith('\\\\?\\')) {
+    return '\\\\?\\' + p.replace(/\//g, '\\')
+  }
+  return p
+}
+
+// Robust recursive file discovery that handles Windows long paths.
+async function discoverFiles(folderPaths: string[]): Promise<string[]> {
+  const results: string[] = []
+  const visited = new Set<string>()
+  async function walk(dirPath: string): Promise<void> {
+    const lp = longPath(dirPath)
+    let entries: fs.Dirent[] = []
+    try { entries = await fs.promises.readdir(lp, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name)
+      if (entry.isDirectory()) {
+        if (!visited.has(fullPath) && visited.size < 10000) {
+          visited.add(fullPath)
+          await walk(fullPath)
+        }
+      } else if (entry.isFile() || entry.isSymbolicLink()) {
+        const ext = path.extname(entry.name).toLowerCase()
+        if (ALL_EXTS.has(ext)) {
+          results.push(fullPath)
+        }
+      }
+    }
+  }
+  for (const fp of folderPaths) {
+    visited.add(fp)
+    await walk(fp)
+  }
+  return results
+}
+
+const SCAN_TIMEOUT_MS = 5000
+const LARGE_FILE_SCAN_TIMEOUT_MS = 15000 // 15 seconds for large files
 const CHOKIDAR_DELAY = 1000
 const YIELD_INTERVAL = 500 // yield to event loop every N iterations to keep main process responsive
 
 const COVER_FILE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'])
 const MAX_COVER_BYTES = 15 * 1024 * 1024
-const COVER_NAME_HINTS = ['cover', 'folder', 'front', 'albumart', 'album', 'art', 'jacket', 'ジャケット']
-const NON_COVER_HINTS = ['ui', '说明', 'screenshot', 'screen', 'manual', 'readme', 'player', 'capture', 'shot', 'ss', 'banner', 'icon']
+const COVER_NAME_HINTS = ['cover', 'folder', 'front', 'albumart', 'album', 'art', 'jacket', 'ジャケット', '封面', '专辑封面', '专辑图']
+const NON_COVER_HINTS = ['ui', '说明', 'screenshot', 'screen', 'manual', 'readme', 'player', 'capture', 'shot', 'ss', 'banner', 'icon', 'thumb', 'thumbnail', 'small', 'icon']
 
 function normalizeImageMime(format: string): string {
   let f = format.toLowerCase().trim()
@@ -163,6 +203,30 @@ function findExternalCover(dirPath: string, maxDepth = 1): string | null {
 
   scan(dirPath, 0)
   if (!bestPath) return null
+  // If the best score is negative (non-cover match), still use it as a fallback
+  if (bestScore < 0) return null
+  return coverToBase64(bestPath)
+}
+
+// Broader cover search: find any image in the album directory, with fallback for
+// directories containing images but no standard cover-named file.
+function findAnyImage(dirPath: string): string | null {
+  let entries: fs.Dirent[] = []
+  try { entries = fs.readdirSync(dirPath, { withFileTypes: true }) } catch { return null }
+  let bestPath: string | null = null
+  let bestSize = 0
+  for (const entry of entries) {
+    if (entry.isDirectory()) continue
+    const ext = path.extname(entry.name).toLowerCase()
+    if (!COVER_FILE_EXTS.has(ext)) continue
+    const filePath = path.join(dirPath, entry.name)
+    const score = scoreCoverCandidate(filePath, 0)
+    if (score > -100 && score > bestSize) { // not excluded, prefer larger scores
+      bestSize = score
+      bestPath = filePath
+    }
+  }
+  if (!bestPath) return null
   return coverToBase64(bestPath)
 }
 
@@ -231,20 +295,6 @@ function normalizeName(filename: string): string {
   return name || path.basename(filename)
 }
 
-async function discoverFiles(folderPaths: string[]): Promise<string[]> {
-  const extPattern = [...ALL_EXTS].map(e => e.replace('.', '')).join(',')
-  const patterns = folderPaths.map(fp => {
-    const normalized = fp.replace(/\\/g, '/').replace(/\/+$/, '')
-    return `${normalized}/**/*.{${extPattern}}`
-  })
-  return await glob(patterns, {
-    onlyFiles: true,
-    caseSensitiveMatch: false,
-    ignore: ['**/node_modules/**', '**/.git/**'],
-    absolute: true,
-  })
-}
-
 function throttleProgress(callback: (completed: number, total: number) => void, total: number) {
   let lastReported = -1
   let timer: NodeJS.Timeout | null = null
@@ -274,6 +324,7 @@ async function enrichWithWorkers(
   let completed = 0
   const reportProgress = onProgress ? throttleProgress(onProgress, total) : () => {}
 
+  console.time('[scan] cacheCheck')
   for (const [i, filePath] of files.entries()) {
     if (i > 0 && i % YIELD_INTERVAL === 0) await yieldToEventLoop()
     const stat = getFileStat(filePath)
@@ -294,13 +345,14 @@ async function enrichWithWorkers(
       normalFiles.push(filePath)
     }
   }
+  console.timeEnd('[scan] cacheCheck')
 
   if (normalFiles.length === 0) {
     reportProgress(total)
     return results
   }
 
-  const MAX_WORKERS = 4
+  const MAX_WORKERS = 6
   const cpuCount = Math.min(MAX_WORKERS, Math.max(1, os.cpus().length - 1))
   const chunkSize = Math.ceil(normalFiles.length / cpuCount)
   const chunks: string[][] = []
@@ -316,6 +368,7 @@ async function enrichWithWorkers(
     })
   }
 
+  console.time('[scan] workerBatch')
   const workerPromises = chunks.map((chunk) => {
     return new Promise<void>((resolve) => {
       try {
@@ -420,6 +473,7 @@ async function enrichWithWorkers(
 })
 
   await Promise.all(workerPromises)
+  console.timeEnd('[scan] workerBatch')
   reportProgress(total)
   return results
 }
@@ -687,25 +741,96 @@ async function buildFolderTree(
   return roots
 }
 
+// For albums that still have no cover after scanning, extract the cover from
+// the first track using a targeted music-metadata parse (fast, per-album).
+// Falls back to findExternalCover / findAnyImage if embedded extraction fails.
+const COVER_EXTRACT_TIMEOUT = 3000 // 3s per album cover extraction
+async function fillAlbumCovers(artists: ScannedArtist[]): Promise<void> {
+  for (const artist of artists) {
+    for (const album of artist.albums) {
+      if (album.coverData) continue // already has a cover
+      
+      // Try embedded cover extraction from first track (with timeout)
+      // Only attempt for small files; large files skip to external search
+      const targetTrack = album.tracks[0]
+      if (targetTrack) {
+        try {
+          const meta = await Promise.race([
+            musicMetadata.parseFile(targetTrack.path, {
+              duration: false,
+              skipCovers: false,
+            }),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), COVER_EXTRACT_TIMEOUT))
+          ])
+          if (meta.common.picture && meta.common.picture.length > 0) {
+              const pic = meta.common.picture[0]
+              const data = Buffer.isBuffer(pic.data) ? pic.data : Buffer.from(pic.data)
+              if (data.length > 0 && data.length <= 15 * 1024 * 1024) {
+                let fmt = pic.format || 'image/jpeg'
+                if (!fmt.startsWith('image/')) fmt = `image/${fmt}`
+                const b64 = `data:${fmt};base64,${data.toString('base64')}`
+                album.coverData = b64
+                targetTrack.coverData = b64
+                continue
+              }
+            }
+          } catch {
+            // embedded extraction failed or timed out, try external
+          }
+        }
+
+      // Fallback: try external cover files in the album directory
+      if (album.dirPath) {
+        const externalCover = findExternalCover(album.dirPath, 1)
+        if (externalCover) {
+          album.coverData = externalCover
+          continue
+        }
+        // Last resort: any image file in the directory
+        const anyImage = findAnyImage(album.dirPath)
+        if (anyImage) {
+          album.coverData = anyImage
+        }
+      }
+    }
+  }
+}
+
 export async function scanFoldersWithProgress(
   folderPaths: string[],
   existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number; genre: string | null; bitrate: number | null; sampleRate: number | null }> = new Map(),
   onProgress?: (completed: number, total: number) => void,
   onStage?: (stage: string) => void
 ): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number }> {
+  console.time('[scan] total')
   onStage?.('发现文件...')
+  console.time('[scan] discoverFiles')
   const files = await discoverFiles(folderPaths)
+  console.timeEnd('[scan] discoverFiles')
   const totalFiles = files.length
   onProgress?.(0, totalFiles)
   onStage?.(`解析元数据... (${totalFiles} 个文件)`)
 
+  console.time('[scan] enrichWithWorkers')
   const metaResults = await enrichWithWorkers(files, existingMeta, onProgress)
+  console.timeEnd('[scan] enrichWithWorkers')
 
   onStage?.('整理结构...')
+  console.time('[scan] groupTracksByFolder')
   const artists = await groupTracksByFolder(files, metaResults, folderPaths)
+  console.timeEnd('[scan] groupTracksByFolder')
+  console.time('[scan] buildFolderTree')
   const folderTree = await buildFolderTree(files, metaResults, folderPaths)
+  console.timeEnd('[scan] buildFolderTree')
+
+  // Extract covers for albums that have none (from external or embedded sources)
+  console.time('[scan] fillAlbumCovers')
+  await fillAlbumCovers(artists)
+  console.timeEnd('[scan] fillAlbumCovers')
+
   const allTracks: ScannedTrack[] = []
   let ti = 0
+  console.time('[scan] assembleAllTracks')
   for (const artist of artists) {
     for (const album of artist.albums) {
       for (const track of album.tracks) {
@@ -716,7 +841,15 @@ export async function scanFoldersWithProgress(
       }
     }
   }
+  console.timeEnd('[scan] assembleAllTracks')
 
+  // Verify cover coverage
+  const tracksWithCover = allTracks.filter(t => t.coverData || t.albumCoverData).length
+  const albumsWithCover = artists.reduce((a, ar) => a + ar.albums.filter(al => al.coverData).length, 0)
+  const totalAlbums = artists.reduce((a, ar) => a + ar.albums.length, 0)
+  console.log(`[scan] cover coverage: ${tracksWithCover}/${allTracks.length} tracks, ${albumsWithCover}/${totalAlbums} albums`)
+
+  console.timeEnd('[scan] total')
   return { artists, folderTree, allTracks, fileCount: totalFiles }
 }
 

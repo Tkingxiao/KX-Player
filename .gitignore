@@ -41,10 +41,10 @@ npm-debug.log*
 #vscode 2022 build cache
 .vs
 CLAUDE.md
-CLAUDE.md
 AGENTS.md
 
 # Error
 error.md
 plan.md
 better.md
+record-time.js
