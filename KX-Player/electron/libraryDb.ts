@@ -1,6 +1,27 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import initSqlJs from 'sql.js'
+import sharp from 'sharp'
+
+// Compress cover image: resize to max 400px, JPEG quality 75
+// Skips images smaller than 50KB to avoid unnecessary processing.
+async function compressCover(dataUrl: string | null): Promise<string | null> {
+  if (!dataUrl) return null
+  try {
+    const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/)
+    if (!match) return dataUrl
+    const buffer = Buffer.from(match[2], 'base64')
+    // Skip compression for small images (< 50KB)
+    if (buffer.length < 50 * 1024) return dataUrl
+    const compressed = await sharp(buffer)
+      .resize(400, 400, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 75 })
+      .toBuffer()
+    return `data:image/jpeg;base64,${compressed.toString('base64')}`
+  } catch {
+    return dataUrl // fallback to original on error
+  }
+}
 
 export interface TrackRecord {
   id: string
@@ -118,7 +139,6 @@ function initializeSchema(database: SqlJsDatabase) {
       root_path TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name);
-
     CREATE TABLE IF NOT EXISTS albums (
       album_id INTEGER PRIMARY KEY AUTOINCREMENT,
       artist_id INTEGER NOT NULL,
@@ -129,7 +149,6 @@ function initializeSchema(database: SqlJsDatabase) {
       FOREIGN KEY (artist_id) REFERENCES artists(artist_id)
     );
     CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
-
     CREATE TABLE IF NOT EXISTS tracks (
       id TEXT PRIMARY KEY,
       artist_id INTEGER NOT NULL,
@@ -158,13 +177,6 @@ function initializeSchema(database: SqlJsDatabase) {
     CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
     CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
     CREATE INDEX IF NOT EXISTS idx_tracks_path ON tracks(path);
-
-    -- Add columns to existing databases; each ALTER TABLE is wrapped in try-catch
-    -- because sql.js exec() throws on any failing statement.
-    try { database.exec('ALTER TABLE tracks ADD COLUMN genre TEXT') } catch { /* column may already exist */ }
-    try { database.exec('ALTER TABLE tracks ADD COLUMN bitrate INTEGER') } catch { /* column may already exist */ }
-    try { database.exec('ALTER TABLE tracks ADD COLUMN sample_rate INTEGER') } catch { /* column may already exist */ }
-
     CREATE TABLE IF NOT EXISTS folder_nodes (
       path TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -173,7 +185,6 @@ function initializeSchema(database: SqlJsDatabase) {
       cover_data TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_folder_nodes_parent_path ON folder_nodes(parent_path);
-
     CREATE TABLE IF NOT EXISTS folder_tracks (
       folder_path TEXT NOT NULL,
       track_id TEXT NOT NULL,
@@ -183,6 +194,10 @@ function initializeSchema(database: SqlJsDatabase) {
     );
     CREATE INDEX IF NOT EXISTS idx_folder_tracks_track_id ON folder_tracks(track_id);
   `)
+  // Add columns to existing databases (safe no-op if already present)
+  try { database.exec('ALTER TABLE tracks ADD COLUMN genre TEXT') } catch { /* ok */ }
+  try { database.exec('ALTER TABLE tracks ADD COLUMN bitrate INTEGER') } catch { /* ok */ }
+  try { database.exec('ALTER TABLE tracks ADD COLUMN sample_rate INTEGER') } catch { /* ok */ }
 }
 
 function saveToDisk(database: SqlJsDatabase, filePath: string) {
@@ -249,10 +264,13 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
       const artistId = Number(database.exec('SELECT last_insert_rowid() AS id')[0].values[0][0])
 
       for (const album of artist.albums) {
-        insertAlbum.run([artistId, album.name, album.artist, album.coverPath, album.coverData])
+        // Compress album cover before storing
+        const compressedAlbumCover = await compressCover(album.coverData)
+        insertAlbum.run([artistId, album.name, album.artist, album.coverPath, compressedAlbumCover])
         const albumId = Number(database.exec('SELECT last_insert_rowid() AS id')[0].values[0][0])
 
         for (const track of album.tracks) {
+          const compressedTrackCover = await compressCover(track.coverData)
           insertTrack.run([
             track.id,
             artistId,
@@ -265,7 +283,7 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
             track.format,
             track.isVideo ? 1 : 0,
             track.coverPath,
-            track.coverData,
+            compressedTrackCover,
             track.lyricsPath,
             track.fileMtime,
             track.fileSize,
@@ -274,7 +292,7 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
             track.genre ?? null,
             track.bitrate ?? null,
             track.sampleRate ?? null,
-            album.coverData ?? null,
+            compressedAlbumCover ?? null,
           ])
         }
       }
@@ -515,6 +533,68 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
     fileCount,
     scannedAt,
   }
+}
+
+/**
+ * Lightweight library load that strips cover_data and album_cover_data from the response.
+ * Use this for fast startup; covers can be loaded on demand via getTrackCovers().
+ */
+export async function loadTrackListSnapshot(filePath: string): Promise<LibrarySnapshot | null> {
+  const snapshot = await loadLibrarySnapshot(filePath)
+  if (!snapshot) return null
+  // Strip cover data from all tracks to reduce IPC payload from MBs to KBs
+  for (const track of snapshot.allTracks) {
+    track.coverData = null
+    track.albumCoverData = null
+  }
+  for (const artist of snapshot.artists) {
+    for (const album of artist.albums) {
+      album.coverData = null
+      for (const track of album.tracks) {
+        track.coverData = null
+        track.albumCoverData = null
+      }
+    }
+  }
+  function stripFolderCovers(nodes: FolderNodeRecord[]) {
+    for (const node of nodes) {
+      node.coverData = null
+      for (const t of node.tracks) { t.coverData = null; t.albumCoverData = null }
+      stripFolderCovers(node.children)
+    }
+  }
+  stripFolderCovers(snapshot.folderTree)
+  return snapshot
+}
+
+/**
+ * Load cover data for specific tracks from the database.
+ * Returns a Map of trackId → coverData (base64 string) and albumCoverData.
+ */
+export async function getTrackCovers(filePath: string, trackIds: string[]): Promise<Map<string, { coverData: string | null; albumCoverData: string | null }>> {
+  if (trackIds.length === 0) return new Map()
+  const sql = await ensureSql()
+  if (!fs.existsSync(filePath)) return new Map()
+  const database = openDatabase(filePath, sql)
+  const results = new Map<string, { coverData: string | null; albumCoverData: string | null }>()
+  // Process in batches of 50 to avoid huge queries
+  for (let i = 0; i < trackIds.length; i += 50) {
+    const batch = trackIds.slice(i, i + 50)
+    const placeholders = batch.map(() => '?').join(',')
+    const stmt = database.prepare(`
+      SELECT id, cover_data, album_cover_data FROM tracks WHERE id IN (${placeholders})
+    `)
+    stmt.bind(batch)
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as any
+      results.set(String(row.id), {
+        coverData: row.cover_data ? String(row.cover_data) : null,
+        albumCoverData: row.album_cover_data ? String(row.album_cover_data) : null,
+      })
+    }
+    stmt.free()
+  }
+  return results
 }
 
 export async function loadTrackMetadataIndex(filePath: string): Promise<Map<string, {

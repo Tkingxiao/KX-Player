@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openAudioFiles: () => ipcRenderer.invoke('dialog:openAudioFiles'),
   scanFoldersWithProgress: (paths: string[]) => ipcRenderer.invoke('scanner:scanFoldersWithProgress', paths),
   loadLibrary: () => ipcRenderer.invoke('library:load'),
+  loadLibraryFast: () => ipcRenderer.invoke('library:loadFast'),
+  getTrackCovers: (trackIds: string[]) => ipcRenderer.invoke('library:getCovers', trackIds),
   readAsDataURL: (filePath: string) => ipcRenderer.invoke('file:readAsDataURL', filePath),
   readTextFile: (filePath: string) => ipcRenderer.invoke('file:readTextFile', filePath),
   fileExists: (filePath: string) => ipcRenderer.invoke('file:exists', filePath),

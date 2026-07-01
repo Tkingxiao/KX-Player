@@ -11,7 +11,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             rollupOptions: {
-              external: ['electron', 'sql.js'],
+              external: ['electron', 'sql.js', 'sharp', 'music-metadata'],
             },
           },
         },

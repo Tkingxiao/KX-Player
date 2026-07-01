@@ -5,6 +5,12 @@ import IconvLite from 'iconv-lite'
 import * as musicMetadata from 'music-metadata'
 
 const DSD_EXTS = new Set(['.dsf', '.dff', '.dsd'])
+const VIDEO_EXTS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'])
+
+// Skip full metadata parsing for files larger than this threshold (bytes).
+// For ASMR/audio files >10MB, music-metadata is very slow due to cover
+// extraction and full file scanning. Use filename-based info instead.
+const LARGE_FILE_SKIP_PARSE = 10 * 1024 * 1024
 
 // Detect garbled text from Shift-JIS misread as ISO-8859-1
 // Characters 0x80-0xFF in Latin-1 are common indicators
@@ -69,6 +75,21 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
       return extractBasicInfo(filePath)
     }
 
+    const ext = path.extname(filePath).toLowerCase()
+    const stat = fs.statSync(filePath)
+
+    // Skip music-metadata for video files; use filename only
+    if (VIDEO_EXTS.has(ext)) {
+      return extractBasicInfo(filePath)
+    }
+
+    // Skip full metadata parse for very large files; use filename only
+    if (stat.size > LARGE_FILE_SKIP_PARSE) {
+      return extractBasicInfo(filePath)
+    }
+
+    // Parse metadata (with covers for small files; large files use filename only)
+    // skipCovers=false for ≤10MB files so they retain embedded cover art
     const meta = await musicMetadata.parseFile(filePath, {
       duration: true,
       skipCovers: false,
@@ -112,7 +133,6 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
       sampleRate,
     }
   } catch (err) {
-    console.error(`Error parsing ${filePath}:`, err)
     return extractBasicInfo(filePath)
   }
 }

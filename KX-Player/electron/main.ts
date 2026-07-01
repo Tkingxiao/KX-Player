@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import { execFile, spawn } from 'node:child_process'
 import { scanFoldersWithProgress, startWatching, stopWatching } from './fileScanner'
-import { loadLibrarySnapshot, loadTrackMetadataIndex, saveLibrarySnapshot } from './libraryDb'
+import { loadLibrarySnapshot, loadTrackListSnapshot, getTrackCovers, loadTrackMetadataIndex, saveLibrarySnapshot } from './libraryDb'
 
 // Shared MIME type mapping for image files
 const IMG_MIME: Record<string, string> = { jpg: 'jpeg', jpeg: 'jpeg', png: 'png', bmp: 'bmp', webp: 'webp', gif: 'gif' }
@@ -18,10 +18,10 @@ function writeLog(msg: string) {
   } catch { /* ignore */ }
 }
 
-// Disable crashpad and crash reporting to speed up startup
+// Disable crash reporting and GPU cache to suppress startup errors
 app.commandLine.appendSwitch('disable-crashpad')
-app.commandLine.appendSwitch('no-report-upload')
-app.commandLine.appendSwitch('disable-default-apps')
+app.commandLine.appendSwitch('disable-breakpad')
+app.commandLine.appendSwitch('disable-gpu-shader-disk-cache')
 app.commandLine.appendSwitch('disable-extensions')
 
 let mainWindow: BrowserWindow | null = null
@@ -108,6 +108,9 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // Set cache to userData subdirectory to avoid access-denied errors
+  app.setPath('cache', path.join(getUserDataDir(), 'Cache'))
+
   createWindow()
   createTray() // Create system tray icon at startup
 
@@ -169,7 +172,9 @@ ipcMain.handle('dialog:openAudioFiles', async () => {
 
 ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: string[]) => {
   const sender = event.sender
+  console.time('[scan] loadMetadataIndex')
   const metadataIndex = await loadTrackMetadataIndex(getLibraryDbPath())
+  console.timeEnd('[scan] loadMetadataIndex')
   const result = await scanFoldersWithProgress(folderPaths, metadataIndex,
     (completed, total) => {
       if (!sender.isDestroyed()) {
@@ -182,25 +187,25 @@ ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: str
       }
     }
   )
-  // Auto-save cache after scan (fire and forget to avoid blocking UI)
-  ;(async () => {
-    try {
-      await saveLibrarySnapshot(getLibraryDbPath(), {
-        folderPaths,
-        artists: result.artists,
-        folderTree: result.folderTree,
-        allTracks: result.allTracks,
-        fileCount: result.fileCount,
-        scannedAt: Date.now(),
-      })
+  // Save scan results to library database (must complete before return for cache persistence)
+  console.time('[scan] saveLibrary')
+  try {
+    await saveLibrarySnapshot(getLibraryDbPath(), {
+      folderPaths,
+      artists: result.artists,
+      folderTree: result.folderTree,
+      allTracks: result.allTracks,
+      fileCount: result.fileCount,
+      scannedAt: Date.now(),
+    })
 
-      const cachePath = getCachePath()
-      const dir = path.dirname(cachePath)
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-      const cache = { folderPaths, scanResult: result }
-      await fsp.writeFile(cachePath, JSON.stringify(cache), 'utf-8')
-    } catch { /* ignore */ }
-  })()
+    const cachePath = getCachePath()
+    const dir = path.dirname(cachePath)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    const cache = { folderPaths, scanResult: result }
+    await fsp.writeFile(cachePath, JSON.stringify(cache), 'utf-8')
+  } catch { /* ignore */ }
+  console.timeEnd('[scan] saveLibrary')
   return result
 })
 
@@ -209,6 +214,25 @@ ipcMain.handle('library:load', async () => {
     return await loadLibrarySnapshot(getLibraryDbPath())
   } catch {
     return null
+  }
+})
+
+// Lightweight load without cover data for faster startup
+ipcMain.handle('library:loadFast', async () => {
+  try {
+    return await loadTrackListSnapshot(getLibraryDbPath())
+  } catch {
+    return null
+  }
+})
+
+// Load cover data for specific tracks on demand
+ipcMain.handle('library:getCovers', async (_event, trackIds: string[]) => {
+  try {
+    const covers = await getTrackCovers(getLibraryDbPath(), trackIds)
+    return Object.fromEntries(covers)
+  } catch {
+    return {}
   }
 })
 
