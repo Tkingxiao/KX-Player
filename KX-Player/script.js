@@ -874,32 +874,98 @@ async function loadLrcForTrack(t) {
     const baseName = lastSep >= 0 ? t.path.substring(lastSep + 1) : t.path
     const lastDot = baseName.lastIndexOf('.')
     const nameWithoutExt = lastDot >= 0 ? baseName.substring(0, lastDot) : baseName
+    const ext = lastDot >= 0 ? baseName.substring(lastDot).toLowerCase() : ''
+
+    // Try LRC first, then VTT, then SRT
+    let lyricsContent = null
+    let subtitleFormat = null // null = LRC, 'vtt', 'srt'
+
     const lrcPath = dir + sep + nameWithoutExt + '.lrc'
-    const lrcExists = await api.fileExists(lrcPath)
-    if (!lrcExists) return
-    const lrcContent = await api.readTextFile(lrcPath)
-    if (!lrcContent) return
-    const lines = lrcContent.split(/\r?\n/)
-    const timeRegex = /\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\]/g
-    const textRegex = /\[\d{2}:\d{2}(?:\.\d{2,3})?\]/g
-    const seen = new Map()
-    for (const line of lines) {
-      const timestamps = [...line.matchAll(timeRegex)]
-      if (timestamps.length === 0) continue
-      const text = line.replace(textRegex, '').trim()
-      if (!text) continue
-      for (const ts of timestamps) {
-        const min = parseInt(ts[1])
-        const sec = parseInt(ts[2])
-        const ms = ts[3] ? parseInt(ts[3].padEnd(3, '0')) : 0
-        const time = min * 60 + sec + ms / 1000
-        if (!seen.has(time)) {
-          seen.set(time, text)
+    if (await api.fileExists(lrcPath)) {
+      lyricsContent = await api.readTextFile(lrcPath)
+    }
+
+    // If no LRC, try VTT and SRT files
+    if (!lyricsContent) {
+      const subtitleExts = ['.vtt', '.srt']
+      for (const subExt of subtitleExts) {
+        // For audio files like song.mp3, try song.mp3.vtt (double extension pattern)
+        const doublePath = dir + sep + baseName + subExt
+        if (await api.fileExists(doublePath)) {
+          lyricsContent = await api.readTextFile(doublePath)
+          subtitleFormat = subExt.slice(1) // 'vtt' or 'srt'
+          break
+        }
+        // Also try song.vtt (single extension)
+        const singlePath = dir + sep + nameWithoutExt + subExt
+        if (await api.fileExists(singlePath)) {
+          lyricsContent = await api.readTextFile(singlePath)
+          subtitleFormat = subExt.slice(1)
+          break
         }
       }
     }
-    lrc = [...seen.entries()].map(([time, text]) => ({ time, text }))
-    lrc.sort((a, b) => a.time - b.time)
+
+    if (!lyricsContent) return
+
+    if (subtitleFormat === 'vtt' || subtitleFormat === 'srt') {
+      // Parse WebVTT / SRT format
+      const lines = lyricsContent.split(/\r?\n/)
+      // VTT uses period: 00:00:21.813, SRT uses comma: 00:00:21,813
+      const timestampRegex = /(\d{2}):(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*\d{2}:\d{2}:\d{2}[.,]\d{3}/
+      const seen = new Map()
+      let i = 0
+      // Skip WEBVTT header
+      if (subtitleFormat === 'vtt' && lines[0] && lines[0].trim().toUpperCase().startsWith('WEBVTT')) i = 1
+      for (; i < lines.length; i++) {
+        const line = lines[i]
+        const tsMatch = line.match(timestampRegex)
+        if (!tsMatch) continue
+        const hours = parseInt(tsMatch[1])
+        const min = parseInt(tsMatch[2])
+        const sec = parseInt(tsMatch[3])
+        const ms = parseInt(tsMatch[4])
+        const time = hours * 3600 + min * 60 + sec + ms / 1000
+        // Next non-empty line is the text
+        let text = ''
+        for (let j = i + 1; j < lines.length; j++) {
+          const nextLine = lines[j].trim()
+          if (!nextLine) break
+          // Skip cue identifiers (numeric-only lines)
+          if (/^\d+$/.test(nextLine)) continue
+          text = nextLine
+          break
+        }
+        if (text && !seen.has(time)) {
+          seen.set(time, text)
+        }
+      }
+      lrc = [...seen.entries()].map(([time, text]) => ({ time, text }))
+      lrc.sort((a, b) => a.time - b.time)
+    } else {
+      // Parse LRC format
+      const lines = lyricsContent.split(/\r?\n/)
+      const timeRegex = /\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\]/g
+      const textRegex = /\[\d{2}:\d{2}(?:\.\d{2,3})?\]/g
+      const seen = new Map()
+      for (const line of lines) {
+        const timestamps = [...line.matchAll(timeRegex)]
+        if (timestamps.length === 0) continue
+        const text = line.replace(textRegex, '').trim()
+        if (!text) continue
+        for (const ts of timestamps) {
+          const min = parseInt(ts[1])
+          const sec = parseInt(ts[2])
+          const ms = ts[3] ? parseInt(ts[3].padEnd(3, '0')) : 0
+          const time = min * 60 + sec + ms / 1000
+          if (!seen.has(time)) {
+            seen.set(time, text)
+          }
+        }
+      }
+      lrc = [...seen.entries()].map(([time, text]) => ({ time, text }))
+      lrc.sort((a, b) => a.time - b.time)
+    }
   } catch (e) { /* ignore */ }
 }
 
