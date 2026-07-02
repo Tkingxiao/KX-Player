@@ -18,7 +18,8 @@ async function compressCover(dataUrl: string | null): Promise<string | null> {
       .jpeg({ quality: 75 })
       .toBuffer()
     return `data:image/jpeg;base64,${compressed.toString('base64')}`
-  } catch {
+  } catch (e) {
+    console.error('[compressCover] sharp compression failed, using original:', e)
     return dataUrl // fallback to original on error
   }
 }
