@@ -83,16 +83,12 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
       return extractBasicInfo(filePath)
     }
 
-    // Skip full metadata parse for very large files; use filename only
-    if (stat.size > LARGE_FILE_SKIP_PARSE) {
-      return extractBasicInfo(filePath)
-    }
+    // For large files, skip cover extraction only — still parse title/artist/duration
+    const skipCovers = stat.size > LARGE_FILE_SKIP_PARSE
 
-    // Parse metadata (with covers for small files; large files use filename only)
-    // skipCovers=false for ≤10MB files so they retain embedded cover art
     const meta = await musicMetadata.parseFile(filePath, {
       duration: true,
-      skipCovers: false,
+      skipCovers,
     })
     
     let coverB64: string | null = null

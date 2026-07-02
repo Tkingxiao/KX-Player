@@ -2,6 +2,47 @@ import { api } from './api.js'
 
 const VIDEO_EXTS = new Set(['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'])
 
+// === Fuzzy Search Utilities ===
+let _sify = null, _pinyinFn = null
+async function _loadSearchLibs() {
+  try { const m = await import('chinese-conv'); _sify = m.sify } catch { _sify = (s) => s }
+  try { const m = await import('pinyin-pro'); _pinyinFn = m.pinyin } catch { _pinyinFn = null }
+}
+_loadSearchLibs()
+
+function _normalizeForSearch(s) {
+  if (!s) return ''
+  return (_sify ? _sify(s) : s).toLowerCase()
+}
+
+function _getPinyinInitials(s) {
+  if (!s || !_pinyinFn) return s ? s.toLowerCase() : ''
+  const simplified = _sify ? _sify(s) : s
+  return _pinyinFn(simplified, { pattern: 'first', toneType: 'none', type: 'array' }).join('')
+}
+
+// Fuzzy match: returns true if query matches text via any of:
+// 1. Direct substring match (after normalization)
+// 2. Pinyin initials match
+function fuzzyMatch(text, query) {
+  if (!text || !query) return false
+  const nt = _normalizeForSearch(text)
+  const nq = _normalizeForSearch(query)
+  if (nt.includes(nq)) return true
+  const textInitials = _getPinyinInitials(nt)
+  const queryInitials = _getPinyinInitials(nq)
+  if (!queryInitials) return false
+  if (textInitials.startsWith(queryInitials)) return true
+  let ti = 0
+  for (let qi = 0; qi < queryInitials.length && ti < textInitials.length; qi++) {
+    while (ti < textInitials.length && textInitials[ti] !== queryInitials[qi]) ti++
+    if (ti >= textInitials.length) return false
+    ti++
+  }
+  return true
+}
+
+
 const S = {
   af: [], all: [], aI: -1, alI: -1, tI: -1,
   playing: false, cTime: 0, dur: 0,
@@ -16,7 +57,10 @@ const S = {
   selMode: false, bgBlur: 0,
   listTextColor: null, listTextColorsCached: null,
   folderTree: [], folderStack: [], _syncingView: false,
+  folderSort: 'name', // 'name' | 'time' | 'tracks'
+  folderView: 'grid', // 'grid' | 'list'
   activeFp: null, // currently active folder path in sidebar
+  _searchFolders: [],
   _folderMeta: null, // precomputed folder metadata { path: { trackCount, validChildCount, hasMusic, coverData } }
 }
 
@@ -300,7 +344,7 @@ async function saveS() {
       folderPaths: fp, favs: S.favs, recents: S.recents, view: S.view, q: S.q, theme: S.theme, clr: S.clr, ovl: S.ovl, devId: S.devId,
       bgPath: S.bgPath, bgSize: S.bgSize, aI: S.aI, alI: S.alI, tI: S.tI, playing: S.playing, cTime: S.cTime,
       dur: S.dur, vol: S.vol, muted: S.muted, mode: S.mode, pls: S.pls, aPl: S.aPl, aF: S.aF,
-      bgBlur: S.bgBlur, selMode: S.selMode, folderStack: S.folderStack, _imgEditState: S._imgEditState, listTextColor: S.listTextColor,
+      bgBlur: S.bgBlur, selMode: S.selMode, folderStack: S.folderStack, folderSort: S.folderSort, folderView: S.folderView, _imgEditState: S._imgEditState, listTextColor: S.listTextColor,
       titlebarOpacity: S.titlebarOpacity, playerOpacity: S.playerOpacity, sidebarOpacity: S.sidebarOpacity,
       playingTid: S.playingTid
     }))
@@ -335,6 +379,8 @@ async function loadS() {
     if (Array.isArray(s.favs)) S.favs = s.favs; if (Array.isArray(s.pls)) S.pls = s.pls
     if (s.aPl) S.aPl = s.aPl; if (s.aF) S.aF = s.aF
     if (Array.isArray(s.folderStack)) S.folderStack = s.folderStack
+    if (s.folderSort) S.folderSort = s.folderSort
+    if (s.folderView) S.folderView = s.folderView
 
     // Load background image from app data directory file
     if (S.bgPath) {
@@ -403,7 +449,7 @@ function apTh() {
   root.style.setProperty('--accent-r', r); root.style.setProperty('--accent-g', g); root.style.setProperty('--accent-b', b)
   if (isDark) {
     root.style.setProperty('--bg', '#0d0d12'); root.style.setProperty('--bg-card', 'rgba(22,22,30,0.92)')
-    root.style.setProperty('--bg-sidebar', 'rgba(16,16,22,0.84)'); root.style.setProperty('--bg-player', 'rgba(20,20,28,0.35)')
+    root.style.setProperty('--bg-sidebar', 'rgba(16,16,22,0.84)'); root.style.setProperty('--bg-player', 'rgba(20,20,28,0.95)')
     root.style.setProperty('--bg-input', 'rgba(255,255,255,0.08)'); root.style.setProperty('--bg-hover', 'rgba(255,255,255,0.06)')
     root.style.setProperty('--bg-active', 'rgba(255,255,255,0.1)'); root.style.setProperty('--text', '#f0f0f5')
     root.style.setProperty('--text-sub', '#b8b8c0'); root.style.setProperty('--text-muted', '#606070')
@@ -416,7 +462,7 @@ function apTh() {
     root.style.setProperty('--modal-overlay', 'rgba(0,0,0,0.55)')
   } else {
     root.style.setProperty('--bg', '#F5F5F7'); root.style.setProperty('--bg-card', 'rgba(255,255,255,0.92)')
-    root.style.setProperty('--bg-sidebar', 'rgba(255,255,255,0.84)'); root.style.setProperty('--bg-player', 'rgba(255,255,255,0.05)')
+    root.style.setProperty('--bg-sidebar', 'rgba(255,255,255,0.84)'); root.style.setProperty('--bg-player', 'rgba(255,255,255,0.95)')
     root.style.setProperty('--bg-input', 'rgba(0,0,0,0.06)'); root.style.setProperty('--bg-hover', 'rgba(0,0,0,0.04)')
     root.style.setProperty('--bg-active', 'rgba(0,0,0,0.06)'); root.style.setProperty('--text', '#1c1c1e')
     root.style.setProperty('--text-sub', '#3a3a3c'); root.style.setProperty('--text-muted', '#8e8e93')
@@ -442,6 +488,8 @@ function apTh() {
   const playerAlpha = (S.playerOpacity ?? 100) / 100
   const pbBg = isDark ? `rgba(20,20,28,${playerAlpha})` : `rgba(255,255,255,${playerAlpha})`
   playerBarEl.style.backgroundColor = pbBg
+  const panelContent = document.querySelector('.panel-content')
+  if (panelContent) panelContent.style.backgroundColor = pbBg
 }
 
 function apThBg() {
@@ -998,12 +1046,67 @@ function renderContent() {
   if (S.view === 'tools') { S.prevView = null; renderToolsContent(); return }
 }
 
+function _folderMtime(node) {
+  const meta = S._folderMeta || {}
+  const nMeta = meta[node.path] || {}
+  let latest = 0
+  if (nMeta.hasMusic) {
+    for (const t of (node.tracks || [])) { if (t.fileMtime > latest) latest = t.fileMtime }
+    for (const c of (node.children || [])) {
+      const cm = _folderMtime(c)
+      if (cm > latest) latest = cm
+    }
+  }
+  return latest
+}
+
+function sortFolders(arr) {
+  const mode = S.folderSort || 'name'
+  const sorted = [...arr]
+  if (mode === 'time') {
+    sorted.sort((a, b) => _folderMtime(b) - _folderMtime(a))
+  } else if (mode === 'tracks') {
+    const meta = S._folderMeta || {}
+    sorted.sort((a, b) => ((meta[b.path] || {}).trackCount || 0) - ((meta[a.path] || {}).trackCount || 0))
+  } else {
+    sorted.sort((a, b) => a.name.localeCompare(b.name))
+  }
+  return sorted
+}
+
+function folderSortBtnHTML() {
+  const modes = [['name', '名称'], ['time', '最近修改'], ['tracks', '曲目数']]
+  const isList = S.folderView === 'list'
+  return `<div class="folder-sort-bar">${modes.map(([k, label]) => `<button class="folder-sort-btn${S.folderSort === k ? ' active' : ''}" data-fsort="${k}">${label}</button>`).join('')}<div class="folder-view-toggle"><button class="folder-sort-btn${!isList ? ' active' : ''}" data-fview="grid" title="网格视图"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></button><button class="folder-sort-btn${isList ? ' active' : ''}" data-fview="list" title="列表视图"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></button></div></div>`
+}
+
+function folderListRowHTML(n) {
+  const meta = S._folderMeta || {}
+  const nMeta = meta[n.path] || {}
+  const coverBg = nMeta.coverData
+  const trackCount = nMeta.trackCount || n.trackCount || 0
+  const validChildCount = nMeta.validChildCount ?? n.children.filter(c => hasMusicRecursive(c)).length
+  const subtitle = trackCount ? `${trackCount} 首${n.children.length ? ` · ${validChildCount} 子文件夹` : ''}` : `${validChildCount} 个子文件夹`
+  return `<div class="folder-list-row" data-fp="${esc(n.path)}"><div class="folder-list-cover">${coverBg ? `<img src="${coverBg}" alt="" />` : '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'}</div><div class="folder-list-info"><div class="folder-list-name">${esc(n.name)}</div><div class="folder-list-sub">${subtitle}</div></div></div>`
+}
+
 function renderFolderAll() {
   const bc = $('breadcrumb'), ca = $('content-area')
   if (S.q) {
     bc.innerHTML = `<button class="btn-breadcrumb-back" id="btn-search-back"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align:middle;margin-right:3px"><polyline points="15,18 9,12 15,6"/></svg>返回</button><span class="breadcrumb-sep">|</span><button class="breadcrumb-item current">搜索结果</button>`
-    if (!pl.length) { ca.innerHTML = emptyS('未找到匹配的音乐', '请尝试其他搜索关键词', false); return }
-    ca.innerHTML = `<div class="section-title">搜索结果<span>${pl.length} 首</span></div><button class="btn-primary" style="margin-bottom:12px" data-pall="search"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>播放全部</button>${tableVT('vl-search', pl, (idx) => playT(idx, true))}`
+    if (!pl.length && !S._searchFolders.length) { ca.innerHTML = emptyS('未找到匹配的内容', '请尝试其他搜索关键词', false); return }
+    let html = ''
+    if (S._searchFolders.length) {
+      const isList = S.folderView === 'list'
+      const folderHtml = isList ? S._searchFolders.map(n => folderListRowHTML(n)).join('') : S._searchFolders.map(n => folderCardHTML(n)).join('')
+      const containerCls = isList ? 'folder-list' : 'artist-grid'
+      html += `<div class="section-title">文件夹<span>${S._searchFolders.length} 个</span></div><div class="${containerCls}">${folderHtml}</div>`
+    }
+    if (pl.length) {
+      if (html) html += '<div style="height:20px"></div>'
+      html += `<div class="section-title">音乐<span>${pl.length} 首</span></div><button class="btn-primary" style="margin-bottom:12px" data-pall="search"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>播放全部</button>${tableVT('vl-search', pl, (idx) => playT(idx, true))}`
+    }
+    ca.innerHTML = html
     return
   }
   const tree = S.folderTree || []
@@ -1015,9 +1118,11 @@ function renderFolderAll() {
   }
   if (S.folderStack.length === 0) {
     bc.innerHTML = `<button class="breadcrumb-item current">\u5168\u90e8\u97f3\u4e50</button>`
-    const validRoots = tree.filter(n => meta[n.path]?.hasMusic)
-    const html = validRoots.map(n => folderCardHTML(n)).join('')
-    ca.innerHTML = `<div class="section-title">\u6587\u4ef6\u5939<span>${validRoots.length} \u4e2a\u6587\u4ef6\u5939</span></div><div class="artist-grid">${html}</div>`
+    const validRoots = sortFolders(tree.filter(n => meta[n.path]?.hasMusic))
+    const isList = S.folderView === 'list'
+    const html = isList ? validRoots.map(n => folderListRowHTML(n)).join('') : validRoots.map(n => folderCardHTML(n)).join('')
+    const containerCls = isList ? 'folder-list' : 'artist-grid'
+    ca.innerHTML = `<div class="section-title">\u6587\u4ef6\u5939<span>${validRoots.length} \u4e2a\u6587\u4ef6\u5939</span></div>${folderSortBtnHTML()}<div class="${containerCls}">${html}</div>`
     return
   }
   const node = findNodeByPath(tree, S.folderStack[S.folderStack.length - 1])
@@ -1112,12 +1217,15 @@ function renderFolderNode(node) {
   }
   bc.innerHTML = bcHtml
   const meta = S._folderMeta || {}
-  const validChildren = node.children.filter(c => meta[c.path]?.hasMusic)
+  const validChildren = sortFolders(node.children.filter(c => meta[c.path]?.hasMusic))
   let html = ''
 
-  // Subfolder cards only (click to navigate) \u2014 use shared folderCardHTML for consistency
+  // Subfolder cards only (click to navigate)
   if (validChildren.length > 0) {
-    html += `<div class="section-title">\u5b50\u6587\u4ef6\u5939<span>${validChildren.length} \u4e2a</span></div><div class="artist-grid">${validChildren.map(c => folderCardHTML(c)).join('')}</div>`
+    const isList = S.folderView === 'list'
+    const childHtml = isList ? validChildren.map(c => folderListRowHTML(c)).join('') : validChildren.map(c => folderCardHTML(c)).join('')
+    const containerCls = isList ? 'folder-list' : 'artist-grid'
+    html += `<div class="section-title">\u5b50\u6587\u4ef6\u5939<span>${validChildren.length} \u4e2a</span></div>${folderSortBtnHTML()}<div class="${containerCls}">${childHtml}</div>`
   }
 
   // Direct tracks in this folder
@@ -1942,6 +2050,14 @@ async function startConvertBatch(files) {
 
 // === Events ===
 $('content-area').addEventListener('click', e => {
+  const sortBtn = e.target.closest('[data-fsort]')
+  if (sortBtn) {
+    S.folderSort = sortBtn.dataset.fsort; schedSave(); renderContent(); return
+  }
+  const viewBtn = e.target.closest('[data-fview]')
+  if (viewBtn) {
+    S.folderView = viewBtn.dataset.fview; schedSave(); renderContent(); return
+  }
   const lAct = e.target.closest('[data-lact]')
   if (lAct) {
     const currentTrack = S.playingTid ? S.all.find(t => t.id === S.playingTid) : null
@@ -2130,7 +2246,7 @@ $('#breadcrumb').addEventListener('click', e => {
 })
 
 function exitSearch() {
-  $('search-input').value = ''; S.q = ''; $('search-clear').classList.add('hidden'); $('search-back').classList.remove('visible')
+  $('search-input').value = ''; S.q = ''; S._searchFolders = []; $('search-clear').classList.add('hidden'); $('search-back').classList.remove('visible')
   if (S.prevView) {
     S.view = S.prevView; S.aF = S._prevAF || null; S.aPl = S._prevAPl || null
     // Restore folder navigation state
@@ -2357,8 +2473,18 @@ $('search-input').addEventListener('keydown', e => {
     if (!S.prevView) { S.prevView = S.view; S._prevAF = S.aF; S._prevAPl = S.aPl; S._prevFolderStack = [...S.folderStack]; S._prevActiveFp = S.activeFp }
     S.view = 'all'; S.aF = null; S.aPl = null; S.folderStack = []; S.activeFp = null
     if (S.tI >= 0 && pl[S.tI]) S.playingTid = pl[S.tI].id
-    const lq = S.q.toLowerCase()
-    pl = S.all.filter(t => (t.name || '').toLowerCase().includes(lq) || (t.artist || '').toLowerCase().includes(lq) || (t.metaArtist || '').toLowerCase().includes(lq) || (t.album || '').toLowerCase().includes(lq))
+    // Search by track metadata (fuzzy: substring + pinyin initials)
+    pl = S.all.filter(t => fuzzyMatch(t.name, q) || fuzzyMatch(t.artist, q) || fuzzyMatch(t.metaArtist, q) || fuzzyMatch(t.album, q))
+    // Search by folder name (fuzzy)
+    function findFoldersByName(nodes) {
+      const results = []
+      for (const n of nodes) {
+        if (fuzzyMatch(n.name, q)) { results.push(n); continue }
+        if (n.children.length) results.push(...findFoldersByName(n.children))
+      }
+      return results
+    }
+    S._searchFolders = findFoldersByName(S.folderTree)
     syncPlayingState()
     renderAll(); schedSave()
   }
