@@ -5,9 +5,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openImageFile: () => ipcRenderer.invoke('dialog:openImageFile'),
   openAudioFiles: () => ipcRenderer.invoke('dialog:openAudioFiles'),
   scanFoldersWithProgress: (paths: string[]) => ipcRenderer.invoke('scanner:scanFoldersWithProgress', paths),
+  scanFoldersIncremental: (paths: string[]) => ipcRenderer.invoke('library:scanIncremental', paths),
+  removeFolder: (folderPath: string, remainingPaths: string[]) => ipcRenderer.invoke('library:removeFolder', folderPath, remainingPaths),
   loadLibrary: () => ipcRenderer.invoke('library:load'),
   loadLibraryFast: () => ipcRenderer.invoke('library:loadFast'),
   getTrackCovers: (trackIds: string[]) => ipcRenderer.invoke('library:getCovers', trackIds),
+  loadFolderCovers: () => ipcRenderer.invoke('library:loadFolderCovers'),
   readAsDataURL: (filePath: string) => ipcRenderer.invoke('file:readAsDataURL', filePath),
   readTextFile: (filePath: string) => ipcRenderer.invoke('file:readTextFile', filePath),
   fileExists: (filePath: string) => ipcRenderer.invoke('file:exists', filePath),
@@ -53,8 +56,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('scanner:fsChanged', handler)
     return () => ipcRenderer.removeListener('scanner:fsChanged', handler)
   },
-  loadCache: () => ipcRenderer.invoke('cache:load'),
-  saveCache: (cache: unknown) => ipcRenderer.invoke('cache:save', cache),
   loadBgImage: () => ipcRenderer.invoke('bgImage:load'),
   saveBgImage: (dataUrl: string) => ipcRenderer.invoke('bgImage:save', dataUrl),
   removeBgImage: () => ipcRenderer.invoke('bgImage:remove'),
