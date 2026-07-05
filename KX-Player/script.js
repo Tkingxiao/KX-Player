@@ -1,50 +1,10 @@
 import { api } from './api.js'
-
-const VIDEO_EXTS = new Set(['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'])
-
-// === Fuzzy Search Utilities ===
-let _sify = null, _pinyinFn = null
-async function _loadSearchLibs() {
-  try { const m = await import('chinese-conv'); _sify = m.sify } catch { _sify = (s) => s }
-  try { const m = await import('pinyin-pro'); _pinyinFn = m.pinyin } catch { _pinyinFn = null }
-}
-_loadSearchLibs()
-
-function _normalizeForSearch(s) {
-  if (!s) return ''
-  return (_sify ? _sify(s) : s).toLowerCase()
-}
-
-function _getPinyinInitials(s) {
-  if (!s || !_pinyinFn) return s ? s.toLowerCase() : ''
-  const simplified = _sify ? _sify(s) : s
-  return _pinyinFn(simplified, { pattern: 'first', toneType: 'none', type: 'array' }).join('')
-}
-
-// Fuzzy match: returns true if query matches text via any of:
-// 1. Direct substring match (after normalization)
-// 2. Pinyin initials match
-function fuzzyMatch(text, query) {
-  if (!text || !query) return false
-  const nt = _normalizeForSearch(text)
-  const nq = _normalizeForSearch(query)
-  if (nt.includes(nq)) return true
-  const textInitials = _getPinyinInitials(nt)
-  const queryInitials = _getPinyinInitials(nq)
-  if (!queryInitials) return false
-  if (textInitials.startsWith(queryInitials)) return true
-  let ti = 0
-  for (let qi = 0; qi < queryInitials.length && ti < textInitials.length; qi++) {
-    while (ti < textInitials.length && textInitials[ti] !== queryInitials[qi]) ti++
-    if (ti >= textInitials.length) return false
-    ti++
-  }
-  return true
-}
-
+import { $, esc, pathJoin, isChildPath, arrayMatchSorted, hashPath, fmtTime, isVideoFile, nName, fuzzyMatch, fmtFSize, collectAllTracks, collectAllTracksInto } from './utils.js'
+import { virtualList, invalidateVL, _startResizeThrottle } from './virtual-list.js'
+import { _getCoverData, _loadCoversForTrackIds, _preloadVisibleCovers, _updateFolderTreeCovers, _clearCoverCache, _onCoversLoaded } from './cover.js'
 
 const S = {
-  af: [], all: [], aI: -1, alI: -1, tI: -1,
+  all: [], aI: -1, alI: -1, tI: -1,
   playing: false, cTime: 0, dur: 0,
   vol: 50, pVol: 50, muted: false,
   mode: 0, playingTid: null,
@@ -87,38 +47,11 @@ let dsdState = {
   raf: 0,
 }
 
-function $(sel) { return document.querySelector(/^[#.]/.test(sel) ? sel : '#' + sel) }
 // Cache frequently accessed DOM elements for performance
 const _progressFill = $('progress-fill')
 const _progressHandle = $('progress-handle')
 const _progressCurrent = $('progress-current')
 const _progressDuration = $('progress-duration')
-function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/`/g, '&#96;').replace(/\$/g, '&#36;') }
-function pathJoin(a, b) { return a.replace(/[/\\]+$/, '') + '\\' + b }
-function isChildPath(child, parent) {
-  const np = parent.replace(/\\/g, '/').replace(/\/+$/, '')
-  const nc = child.replace(/\\/g, '/')
-  return nc.startsWith(np + '/')
-}
-function arrayMatchSorted(a, b) {
-  if (a.length !== b.length) return false
-  const sa = [...a].sort(), sb = [...b].sort()
-  for (let i = 0; i < sa.length; i++) { if (sa[i] !== sb[i]) return false }
-  return true
-}
-function hashPath(p) {
-  // Double hash to reduce collision risk for large libraries
-  let h1 = 0, h2 = 0
-  for (let i = 0; i < p.length; i++) {
-    h1 = ((h1 << 5) - h1) + p.charCodeAt(i); h1 |= 0
-    h2 = ((h2 << 7) - h2) + p.charCodeAt(i); h2 |= 0
-  }
-  return 'dsd' + Math.abs(h1).toString(36) + Math.abs(h2).toString(36)
-}
-function fmtTime(t) { if (!t || !isFinite(t)) return '00:00'; const m = Math.floor(t / 60), s = Math.floor(t % 60); return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') }
-function isVideoFile(t) { return t && t.isVideo === true }
-// Extract filename without extension from track path for display
-function nName(t) { const p = String(t.path || '').replace(/\\/g, '/').split('/').pop() || ''; return p.replace(/\.[^/.]+$/, '') || p }
 
 // Pre-computed set of default-favorite track IDs for O(1) lookup during rendering
 let _defaultFavIds = null
@@ -145,68 +78,6 @@ function syncPlayingState() {
     S.playingTid = pl[S.tI]?.id || null
   }
 }
-
-// === Resize throttler: suspend VL renders during window resize ===
-let _resizeActive = false
-let _resizeTimer = null
-function _startResizeThrottle() {
-  _resizeActive = true
-  clearTimeout(_resizeTimer)
-  _resizeTimer = setTimeout(() => { _resizeActive = false }, 300)
-}
-
-// === Virtual List ===
-function virtualList(containerId, items, rowHeight, renderItem, onClick) {
-  const c = $(containerId)
-  if (!c) return
-  // Remove previous listeners and observer to prevent accumulation
-  if (c._vlRO) { c._vlRO.disconnect(); c._vlRO = null }
-  if (c._vlScrollFn) { c.removeEventListener('scroll', c._vlScrollFn) }
-  if (c._vlClickFn) { c.removeEventListener('click', c._vlClickFn) }
-  if (c._vlDblClickFn) { c.removeEventListener('dblclick', c._vlDblClickFn) }
-  c.innerHTML = ''
-  if (!items.length) { c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u6682\u65e0\u5185\u5bb9</h3></div>'; return }
-  const totalH = items.length * rowHeight
-  const spacer = document.createElement('div'); spacer.style.height = totalH + 'px'; spacer.style.position = 'relative'
-  const view = document.createElement('div'); view.style.position = 'absolute'; view.style.top = '0'; view.style.left = '0'; view.style.right = '0'
-  spacer.appendChild(view); c.appendChild(spacer)
-  const buffer = 10
-  function render() {
-    if (_resizeActive) return
-    const scrollTop = c.scrollTop, clientH = c.clientHeight || 600
-    const start = Math.max(0, Math.floor(scrollTop / rowHeight) - buffer)
-    const end = Math.min(items.length, Math.ceil((scrollTop + clientH) / rowHeight) + buffer)
-    view.style.top = (start * rowHeight) + 'px'
-    let html = ''
-    for (let i = start; i < end; i++) html += renderItem(items[i], i)
-    view.innerHTML = html
-  }
-  c._vlRender = render; c._vlItems = items; render()
-  const scrollFn = () => render()
-  c._vlScrollFn = scrollFn
-  c.addEventListener('scroll', scrollFn, { passive: true })
-  let resizeTimer
-  const ro = new ResizeObserver(() => {
-    if (_resizeActive) return
-    clearTimeout(resizeTimer)
-    resizeTimer = setTimeout(render, 200)
-  })
-  ro.observe(c); c._vlRO = ro
-  if (onClick) {
-    const clickFn = e => {
-      const playBtn = e.target.closest('.idx-play-btn')
-      if (playBtn) { const row = e.target.closest('.song-row'); if (row && row.dataset.tid) onClick(row.dataset.tid, true) }
-    }
-    const dblClickFn = e => {
-      const row = e.target.closest('.song-row')
-      if (row && row.dataset.tid) onClick(row.dataset.tid, true)
-    }
-    c._vlClickFn = clickFn; c._vlDblClickFn = dblClickFn
-    c.addEventListener('click', clickFn)
-    c.addEventListener('dblclick', dblClickFn)
-  }
-}
-function invalidateVL(containerId) { const c = $(containerId); if (c && c._vlRender) c._vlRender() }
 
 // === Sync All Lists Playing State ===
 function syncAllListsPlaying() {
@@ -304,21 +175,9 @@ async function idbGet(store, key) {
 }
 
 function applyScanResult(result) {
-  const rs = result?.artists || result || []
   S.folderTree = result?.folderTree || []
   S._folderMeta = buildFolderMeta(S.folderTree)
   const at = result?.allTracks ? result.allTracks.map(t => ({ ...t })) : []
-  if (!at.length) {
-    for (const a of rs) {
-      for (const al of a.albums) {
-        for (const t of al.tracks) {
-          t.albumCoverData = al.coverData
-          at.push(t)
-        }
-      }
-    }
-  }
-  S.af = rs
   S.all = at
   return at
 }
@@ -368,17 +227,12 @@ async function saveS() {
     // Sync-save to main process FIRST for immediate disk persistence
     api.syncSaveSettings(data)
     await api.saveSettings(data)
-    await idbSet('settings', 'state', data)
   } catch (e) { /* ignore */ }
 }
 
 async function loadS() {
   try {
     let s = await api.loadSettings()
-    // Fallback to IndexedDB if file settings are empty
-    if (!s || Object.keys(s).length === 0) {
-      try { s = await idbGet('settings', 'state') || {} } catch (e) { /* ignore */ }
-    }
     if (!s || Object.keys(s).length === 0) return
     if (typeof s.mode === 'number') S.mode = s.mode; if (Array.isArray(s.recents)) S.recents = s.recents
     if (s.view) S.view = s.view; if (s.q) S.q = s.q; if (s.theme) S.theme = s.theme; if (s.clr) S.clr = s.clr
@@ -427,21 +281,15 @@ async function loadLibraryData() {
   try {
     if (!fp.length) return
     console.time('[startup] total')
-    // Load library from database (with covers) or fall back to scanning
-    let library = await api.loadLibrary()
-    const cache = library ? null : await api.loadCache()
+    // Use fast load (no cover data) to avoid loading 200MB+ of base64 at startup.
+    // Covers are loaded on demand from SQLite (already compressed to 400px thumbnails).
+    let library = await api.loadLibraryFast()
     if (library && Array.isArray(library.folderPaths)) {
       const libraryPaths = library.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
       if (arrayMatchSorted(fp, libraryPaths)) {
         applyScanResult(library)
       } else {
         library = null
-      }
-    } else if (cache && Array.isArray(cache.folderPaths)) {
-      const cachePaths = cache.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
-      if (arrayMatchSorted(fp, cachePaths) && cache.scanResult) {
-        applyScanResult(cache.scanResult)
-        library = cache.scanResult
       }
     }
     if (!library) {
@@ -450,10 +298,45 @@ async function loadLibraryData() {
     }
     const allIds = new Set(S.all.map(t => t.id))
     cleanupStale(allIds)
+    // Load folder covers from SQLite (compressed, ~2-5KB each) and update _folderMeta
+    const folderCovers = await api.loadFolderCovers()
+    if (folderCovers && S._folderMeta) {
+      for (const [p, cd] of Object.entries(folderCovers)) {
+        if (S._folderMeta[p]) S._folderMeta[p].coverData = cd
+      }
+    }
+    // Also update folderTree nodes with covers
+    _updateFolderTreeCovers(S.folderTree, folderCovers)
+    // Preload covers for visible tracks
+    _preloadVisibleCovers(S.all)
     console.timeEnd('[startup] total')
   } catch (e) { /* ignore */ }
   // Start file watcher (separate from library loading so failures don't block each other)
   try { await restartWatching() } catch (e) { console.warn('[watcher] init failed:', e) }
+
+  // Register callback to update UI when covers are loaded asynchronously
+  _onCoversLoaded(() => {
+    // Update player cover if current track got a new cover
+    if (S.tI >= 0 && S.tI < pl.length) {
+      const currentTrack = pl[S.tI]
+      const coverData = _getCoverData(currentTrack)
+      if (coverData) {
+        const coverImgEl = $('player-cover-img')
+        const coverEl = $('player-cover')
+        if (coverImgEl && coverEl) {
+          coverImgEl.src = coverData
+          coverImgEl.style.display = ''
+          coverEl.querySelector('.cover-placeholder').style.display = 'none'
+        }
+      }
+    }
+    // Invalidate virtual lists to trigger re-render of visible rows with new covers
+    invalidateVL('vl-songs')
+    // Re-render folder view if active
+    if (S.view === 'folder') {
+      renderFolderAll()
+    }
+  })
 }
 
 // === Theme ===
@@ -1015,7 +898,7 @@ function playT(idx, keepView) {
 }
 
 function updPUI(t, skipLrc) {
-  const cd = t.coverData || t.albumCoverData
+  let cd = _getCoverData(t)
   const titleEl = $('player-title'), artistEl = $('player-artist')
   const coverEl = $('player-cover'), coverImgEl = $('player-cover-img')
   titleEl.textContent = nName(t)
@@ -1035,6 +918,8 @@ function updPUI(t, skipLrc) {
         ph.outerHTML = '<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'
       }
     }
+    // Lazy-load cover if not in memory
+    if (t && t.id) _loadCoversForTrackIds([t.id])
   }
   if (!skipLrc && S.view === 'lyrics') renderLrcContent()
 }
@@ -1372,7 +1257,7 @@ function renderLrcContent() {
   const t = S.playingTid ? S.all.find(x => x.id === S.playingTid) : null
   const container = $('content-area')
   if (!container) return
-  const cd = t ? (t.coverData || t.albumCoverData) : null
+  const cd = t ? _getCoverData(t) : null
   const lrcHtml = buildLrcLines(lrc)
   container.innerHTML = t ? `<div class="lyrics-page-actions"><button class="lyrics-action-btn" data-lact="folder">\u6240\u5728\u6587\u4ef6\u5939</button><button class="lyrics-action-btn" data-lact="copy">\u590d\u5236\u8def\u5f84</button></div><div class="lyrics-content-layout"><div class="lyrics-content-left"><div class="lyrics-content-cover">${cd ? `<img src="${cd}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg></div>'}</div></div><div class="lyrics-content-right"><div class="lyrics-content-info"><div class="lc-title">${esc(nName(t))}</div><div class="lc-artist">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}${isVideoFile(t) ? ' \u00b7 \u89c6\u9891-\u4ec5\u97f3\u9891\u6a21\u5f0f' : ''}</div></div><div class="lyrics-tab-btns"><button class="lyrics-tab-btn${activeLrcTab === 'lyrics' ? ' active' : ''}" data-ltab="lyrics">\u6b4c\u8bcd</button><button class="lyrics-tab-btn${activeLrcTab === 'meta' ? ' active' : ''}" data-ltab="meta">\u4fe1\u606f</button></div><div class="lyrics-container-wrapper"><div class="lyrics-lines-scroll${activeLrcTab !== 'lyrics' ? ' hidden' : ''}" id="lyrics-lines-scroll">${lrcHtml || '<div class="lc-empty">\u6682\u65e0\u6b4c\u8bcd</div>'}</div><div class="lyrics-meta-panel${activeLrcTab !== 'meta' ? ' hidden' : ''}" id="lyrics-meta-panel"><div class="meta-row"><span class="meta-label">\u6587\u4ef6\u540d</span><span class="meta-value">${esc(nName(t))}</span></div><div class="meta-row"><span class="meta-label">\u827a\u672f\u5bb6</span><span class="meta-value">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}</span></div><div class="meta-row"><span class="meta-label">\u4e13\u8f91</span><span class="meta-value">${esc(t.album || '')}</span></div><div class="meta-row"><span class="meta-label">\u683c\u5f0f</span><span class="meta-value">${t.format.toUpperCase()}${isVideoFile(t) ? ' (\u89c6\u9891)' : ''}</span></div><div class="meta-row"><span class="meta-label">\u65f6\u957f</span><span class="meta-value">${fmtTime(t.duration)}</span></div><div class="meta-row"><span class="meta-label">\u6587\u4ef6</span><span class="meta-value">${esc(t.path)}</span></div></div></div></div></div>` : '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u672a\u5728\u64ad\u653e</h3></div>'
   const lines = container.querySelectorAll('.lc-line')
@@ -1647,7 +1532,7 @@ function _resetPlayingIfRemoved(tid) {
   S.playingTid = null; S.view = 'all'; S.aF = null; S.aPl = null
   audio.pause(); S.playing = false; lrc = []
 }
-function a2P(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p || p.trackIds.includes(tid)) return; p.trackIds.push(tid); if (!p.coverData) { const t = S.all.find(x => x.id === tid); if (t) p.coverData = t.coverData || t.albumCoverData } schedSave(); renderAll() }
+function a2P(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p || p.trackIds.includes(tid)) return; p.trackIds.push(tid); if (!p.coverData) { const t = S.all.find(x => x.id === tid); if (t) p.coverData = _getCoverData(t) } schedSave(); renderAll() }
 function rFP(pid, tid) { const p = S.pls.find(x => x.id === pid); if (!p) return; p.trackIds = p.trackIds.filter(id => id !== tid); if (!p.trackIds.length) p.coverData = null; _resetPlayingIfRemoved(tid); schedSave(); renderAll() }
 function mkF(n) { n = n || '\u65b0\u6536\u85cf\u5939'; const id = 'fav-' + Date.now() + '-' + (++_idCounter); S.favs.push({ id, name: n, trackIds: [], isDefault: false }); schedSave(); renderAll(); requestAnimationFrame(() => startRename('fav', id)) }
 async function rmF(id) { const f = S.favs.find(x => x.id === id); if (!f) return; const ok = await showConfirm('删除收藏夹', `确定删除收藏夹“${f.name}”吗？`); if (!ok) return; S.favs = S.favs.filter(x => x.id !== id); if (S.aF === id) { S.aF = null; S.view = 'all' } schedSave(); renderAll() }
@@ -1671,11 +1556,11 @@ function startRename(type, id) {
 }
 
 function renderPContent(plObj, tks) {
-  const td = tks.find(t => t.coverData || t.albumCoverData), cd = td ? td.coverData || td.albumCoverData : null
+  const td = tks.find(t => _getCoverData(t)), cd = td ? _getCoverData(td) : null
   return `<div class="pl-content-header"><div class="pl-content-cover">${cd ? `<img src="${cd}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>'}</div><div class="pl-content-info"><div class="pl-content-label">\u64ad\u653e\u5217\u8868</div><div class="pl-content-name" data-plid="${plObj.id}" title="\u53cc\u51fb\u91cd\u547d\u540d">${esc(plObj.name)}</div><div class="pl-content-actions"><button class="btn-primary" data-ppl="${plObj.id}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><button class="btn-danger" data-delpl="${plObj.id}">\u5220\u9664</button></div></div></div>${tableVT('vl-pl-' + plObj.id, tks, (idx) => playT(idx, true))}`
 }
 function renderFContent(fav, tks) {
-  const td = tks.find(t => t.coverData || t.albumCoverData), cd = td ? td.coverData || td.albumCoverData : null
+  const td = tks.find(t => _getCoverData(t)), cd = td ? _getCoverData(td) : null
   return `<div class="pl-content-header"><div class="pl-content-cover">${cd ? `<img src="${cd}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>'}</div><div class="pl-content-info"><div class="pl-content-label">收藏夹</div><div class="pl-content-name" data-fvid="${fav.id}" title="${fav.isDefault ? '默认收藏夹' : '双击重命名'}">${esc(fav.name)}</div><div class="pl-content-actions"><button class="btn-primary" data-pfav="${fav.id}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>播放全部</button>${!fav.isDefault ? `<button class="btn-danger" data-delfv="${fav.id}">删除</button>` : ''}</div></div></div>${tableVT('vl-fv-' + fav.id, tks, (idx) => playT(idx, true))}`
 }
 
@@ -1686,30 +1571,40 @@ async function importFolder() {
   try {
     const result = await api.openFolder(); if (!result || !result.length) return
     const normalized = result.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
-    for (const p of normalized) { if (!fp.includes(p)) fp.push(p) }
-    const tid = addT('\u6b63\u5728\u626b\u63cf\u97f3\u4e50\u6587\u4ef6...')
+    const newPaths = normalized.filter(p => !fp.includes(p))
+    if (!newPaths.length) return // all folders already imported
+    for (const p of newPaths) fp.push(p)
+    const tid = addT('正在扫描音乐文件...')
     api.removeScanProgressListener()
     let removeProgress = null
-    removeProgress = api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
-    const r = await api.scanFoldersWithProgress(fp)
+    removeProgress = api.onScannerProgress((data) => { updT(tid, `${data.stage || '解析中...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
+    // Only scan the new folders (incremental scan)
+    const r = await api.scanFoldersIncremental(fp)
     const at = applyScanResult(r)
+    // Restore folder covers from DB
+    const folderCovers = await api.loadFolderCovers()
+    if (folderCovers) {
+      for (const [p, cd] of Object.entries(folderCovers)) {
+        if (S._folderMeta && S._folderMeta[p]) S._folderMeta[p].coverData = cd
+      }
+      _updateFolderTreeCovers(S.folderTree, folderCovers)
+    }
     const allIds = new Set(at.map(t => t.id))
     cleanupStale(allIds)
     S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = []; S.activeFp = null
     pl = at
-    // Check if currently playing track still exists in new scan results
     if (S.playingTid && !allIds.has(S.playingTid)) { S.playingTid = null; S.playing = false; audio.pause(); lrc = [] }
-    if (r.fileCount > 0) { updT(tid, '\u5b8c\u6210\u2714', 100, `\u5171 ${r.fileCount || at.length} \u9996\u97f3\u4e50`); rmT(tid) } else { updT(tid, '\u672a\u627e\u5230\u97f3\u4e50', 0, '\u8bf7\u68c0\u67e5\u6587\u4ef6\u5939\u5185\u5bb9'); setTimeout(() => rmT(tid), 5000) }
+    if (r.fileCount > 0) { updT(tid, '完成✔', 100, `共 ${r.fileCount || at.length} 首音乐`); rmT(tid) } else { updT(tid, '未找到音乐', 0, '请检查文件夹内容'); setTimeout(() => rmT(tid), 5000) }
     await restartWatching()
     renderAll()
-  } catch (e) { alert('\u5bfc\u5165\u5931\u8d25: ' + e.message) }
+  } catch (e) { alert('导入失败: ' + e.message) }
   finally { _scanRunning = false; removeProgress?.() }
 }
 
 async function rescan() {
   if (_scanRunning) { _pendingRescan = true; return }
   if (!fp.length) {
-    S.af = []; S.all = []; S.folderTree = []; S.folderStack = []; S._folderMeta = null
+    S.all = []; S.folderTree = []; S.folderStack = []; S._folderMeta = null
     pl = []; S.playingTid = null; S.tI = -1; audio.pause()
     cleanupStale(new Set())
     renderAll(); schedSave()
@@ -2157,11 +2052,6 @@ $('content-area').addEventListener('click', e => {
     const row = e.target.closest('.song-row'); if (row && row.dataset.tid) { const idx = pl.findIndex(tk => tk.id === row.dataset.tid); if (idx >= 0) playT(idx, true); return }
   }
   const t = e.target.closest('.song-row'); if (t && t.dataset.tid) { /* single click does nothing, use dblclick or play button */ return }
-  if (e.target.closest('[data-pa]')) {
-    const el = e.target.closest('[data-pa]'); const [ai, al_] = el.dataset.pa.split(':').map(Number)
-    if (!isNaN(ai)) { const a = S.af[ai]; if (al_ !== undefined && !isNaN(al_)) { if (a) playAll(a.albums[al_]?.tracks || []); return } const tks = a ? [].concat(...a.albums.map(al => al.tracks)) : []; playAll(tks) }
-    return
-  }
   if (e.target.closest('[data-ppl]')) { const el = e.target.closest('[data-ppl]'); const pid = el.dataset.ppl; const p = S.pls.find(x => x.id === pid); if (p) { const tks = p.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean); playAll(tks) } return }
   if (e.target.closest('[data-pfav]')) { const el = e.target.closest('[data-pfav]'); const fid = el.dataset.pfav; const f = S.favs.find(x => x.id === fid); if (f) { const tks = f.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean); playAll(tks) } return }
   if (e.target.closest('[data-pall]')) { playAll(S.all); return }
@@ -2230,7 +2120,7 @@ $('content-area').addEventListener('contextmenu', e => {
 function showFolderCtx(e, folderPath) {
   const m = $('ctx-menu')
   const folderName = folderPath.split(/[\\/]/).pop() || folderPath
-  m.innerHTML = `<button data-a="fopen">打开文件夹</button><button data-a="fshow">在文件资源管理器中打开</button><button data-a="fcopy">复制文件夹路径</button><hr><button data-a="frescan">重新扫描此库</button><button data-a="frem" class="danger">从扫描列表移除“${esc(folderName)}”</button>`
+  m.innerHTML = `<button data-a="fopen">打开文件夹</button><button data-a="fshow">在文件资源管理器中打开</button><button data-a="fcopy">复制文件夹路径</button><hr><button data-a="frescan">扫描此文件夹</button><button data-a="frem" class="danger">从扫描列表移除“${esc(folderName)}”</button>`
   m.classList.remove('hidden')
   m.style.left = Math.min(e.clientX, window.innerWidth - 220) + 'px'
   m.style.top = Math.min(e.clientY, window.innerHeight - 160) + 'px'
@@ -2239,16 +2129,64 @@ function showFolderCtx(e, folderPath) {
     if (b.dataset.a === 'fopen') { S.activeFp = folderPath; S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = [folderPath]; renderAll(); schedSave(); hC(); return }
     if (b.dataset.a === 'fshow') { await api.showItemInFolder(folderPath); hC(); return }
     if (b.dataset.a === 'fcopy') { copyText(folderPath, '已复制文件夹路径'); hC(); return }
-    if (b.dataset.a === 'frescan') { hC(); await rescan(); return }
+    if (b.dataset.a === 'frescan') {
+      hC()
+      if (_scanRunning) return
+      _scanRunning = true
+      const tid = addT('扫描文件夹...')
+      api.removeScanProgressListener()
+      const removeProgress = api.onScannerProgress((data) => { updT(tid, `${data.stage || '解析中...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
+      try {
+        const r = await api.scanFoldersIncremental(fp)
+        const at = applyScanResult(r)
+        const allIds = new Set(at.map(t => t.id))
+        cleanupStale(allIds)
+        const folderCovers = await api.loadFolderCovers()
+        if (folderCovers) {
+          for (const [p, cd] of Object.entries(folderCovers)) {
+            if (S._folderMeta && S._folderMeta[p]) S._folderMeta[p].coverData = cd
+          }
+          _updateFolderTreeCovers(S.folderTree, folderCovers)
+        }
+        if (S.aF) {
+          const fav = S.favs.find(f => f.id === S.aF)
+          pl = fav ? fav.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean) : at
+        } else if (S.aPl) {
+          const plObj = S.pls.find(p => p.id === S.aPl)
+          pl = plObj ? plObj.trackIds.map(id => S.all.find(t => t.id === id)).filter(Boolean) : at
+        } else { pl = at }
+        if (S.playingTid && !allIds.has(S.playingTid)) { S.playingTid = null; S.playing = false; audio.pause(); lrc = [] }
+        updT(tid, '完成✔', 100, `共 ${r.fileCount || at.length} 首`)
+        rmT(tid)
+        await restartWatching()
+        renderAll()
+      } catch (err) { updT(tid, '失败', 0, err.message) }
+      finally { _scanRunning = false; removeProgress?.() }
+      return
+    }
     if (b.dataset.a === 'frem') {
       hC()
       const ok = await showConfirm('移除文件夹', `确定从扫描列表移除文件夹“${folderName}”吗？`)
       if (!ok) return
       fp = fp.filter(p => p !== folderPath)
-      S.folderTree = S.folderTree.filter(n => n.path !== folderPath && !isChildPath(n.path, folderPath))
-      S._folderMeta = buildFolderMeta(S.folderTree)
-      await rescan()
+      const r = await api.removeFolder(folderPath, fp)
+      if (r && r.allTracks) {
+        applyScanResult(r)
+        const allIds = new Set(r.allTracks.map(t => t.id))
+        cleanupStale(allIds)
+        pl = pl.filter(t => allIds.has(t.id))
+        if (S.playingTid && !allIds.has(S.playingTid)) { S.playingTid = null; S.playing = false; audio.pause(); lrc = [] }
+      }
+      const folderCovers = await api.loadFolderCovers()
+      if (folderCovers) {
+        for (const [p, cd] of Object.entries(folderCovers)) {
+          if (S._folderMeta && S._folderMeta[p]) S._folderMeta[p].coverData = cd
+        }
+        _updateFolderTreeCovers(S.folderTree, folderCovers)
+      }
+      await restartWatching()
       schedSave()
+      renderAll()
       return
     }
     hC()
@@ -2847,17 +2785,6 @@ function commitImgChanges() {
   schedSave(); apThBg()
 }
 
-function collectAllTracks(node) {
-  let all = []
-  for (const t of node.tracks) all.push(t)
-  for (const c of node.children) { collectAllTracksInto(c, all) }
-  return all
-}
-function collectAllTracksInto(node, out) {
-  for (const t of node.tracks) out.push(t)
-  for (const c of node.children) collectAllTracksInto(c, out)
-}
-
 function hasMusicRecursive(node) {
   if (!node) return false
   if (node.tracks && node.tracks.length > 0) return true
@@ -2894,21 +2821,23 @@ function buildFolderMeta(tree) {
 }
 
 // Panel
+function _closePlaylistPanel() {
+  const panel = $('playlist-panel')
+  const content = panel.querySelector('.panel-content')
+  if (!content || panel.classList.contains('hidden')) return
+  content.classList.add('panel-closing')
+  content.addEventListener('animationend', () => {
+    content.classList.remove('panel-closing')
+    panel.classList.add('hidden')
+  }, { once: true })
+}
 $('btn-playlist-panel').addEventListener('click', () => {
   const panel = $('playlist-panel')
-  const btn = $('btn-playlist-panel')
-  if (btn) {
-    const rect = btn.getBoundingClientRect()
-    const playerBar = $('player-bar')
-    const playerHeight = playerBar ? playerBar.offsetHeight : 80
-    panel.style.left = (rect.right + 4) + 'px'
-    panel.style.bottom = (playerHeight + 60) + 'px'
-  }
   panel.classList.remove('hidden')
   renderPanel()
 })
-$('playlist-overlay').addEventListener('click', () => { $('playlist-panel').classList.add('hidden') })
-$('playlist-panel').querySelector('.panel-close').addEventListener('click', () => { $('playlist-panel').classList.add('hidden') })
+$('playlist-overlay').addEventListener('click', _closePlaylistPanel)
+$('playlist-panel').querySelector('.panel-close').addEventListener('click', _closePlaylistPanel)
 $('panel-body').addEventListener('click', e => { const t = e.target.closest('.panel-track'); if (t) { const idx = parseInt(t.dataset.pidx); if (!isNaN(idx)) playT(idx) } })
 
 // Volume wheel

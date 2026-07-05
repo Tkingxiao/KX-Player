@@ -7,10 +7,18 @@ import * as musicMetadata from 'music-metadata'
 const DSD_EXTS = new Set(['.dsf', '.dff', '.dsd'])
 const VIDEO_EXTS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'])
 
+// Format categories for smart parsing strategy
+// Fast formats: well-structured headers, quick to parse
+const FAST_EXTS = new Set(['.mp3', '.flac', '.ogg', '.oga', '.opus', '.m4a', '.mp4', '.aac', '.wav', '.aiff', '.aif', '.wma', '.asf'])
+// Slow formats: complex structures, may need full file scanning
+const SLOW_EXTS = new Set(['.ape', '.dsf', '.dff', '.dsd', '.mpc', '.wv', '.tak', '.spx'])
+
 // Skip full metadata parsing for files larger than this threshold (bytes).
 // For ASMR/audio files >10MB, music-metadata is very slow due to cover
 // extraction and full file scanning. Use filename-based info instead.
 const LARGE_FILE_SKIP_PARSE = 10 * 1024 * 1024
+// Very large file threshold — skip duration calculation, estimate from file size
+const VERY_LARGE_FILE = 500 * 1024 * 1024 // 500MB
 
 // Detect garbled text from Shift-JIS misread as ISO-8859-1
 // Characters 0x80-0xFF in Latin-1 are common indicators
@@ -83,12 +91,28 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
       return extractBasicInfo(filePath)
     }
 
-    // For large files, skip cover extraction only — still parse title/artist/duration
-    const skipCovers = stat.size > LARGE_FILE_SKIP_PARSE
+    // Smart parsing strategy based on format and file size:
+    // 1. Very large files (>500MB): skip duration, estimate from bitrate
+    // 2. Slow formats (APE, DSD, etc.): use shorter timeout, skip duration for large files
+    // 3. Fast formats (MP3, FLAC, etc.): full parse with duration
+    
+    const isVeryLarge = stat.size > VERY_LARGE_FILE
+    const isSlowFormat = SLOW_EXTS.has(ext)
+    const isFastFormat = FAST_EXTS.has(ext)
+
+    let skipDuration = false
+    if (isVeryLarge) {
+      // For very large files, skip duration calculation (requires full file scan)
+      // Duration will be estimated from bitrate after parsing
+      skipDuration = true
+    } else if (isSlowFormat && stat.size > LARGE_FILE_SKIP_PARSE) {
+      // For slow formats >10MB, also skip duration to avoid long scans
+      skipDuration = true
+    }
 
     const meta = await musicMetadata.parseFile(filePath, {
-      duration: true,
-      skipCovers,
+      duration: !skipDuration,
+      skipCovers: true,
     })
     
     let coverB64: string | null = null
@@ -118,9 +142,17 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
     const genre = meta.common.genre && meta.common.genre.length > 0 ? meta.common.genre.join(', ') : null
     const bitrate = meta.format.bitrate ? Math.round(meta.format.bitrate) : null
     const sampleRate = meta.format.sampleRate || null
+
+    // Calculate duration: use parsed value, or estimate from file size + bitrate
+    let duration = meta.format.duration ? Math.round(meta.format.duration) : 0
+    if (duration === 0 && skipDuration && bitrate && bitrate > 0) {
+      // Estimate duration from file size and bitrate: duration = (fileSize * 8) / bitrate
+      duration = Math.round((stat.size * 8) / bitrate)
+    }
+
     return {
       path: filePath,
-      duration: meta.format.duration ? Math.round(meta.format.duration) : 0,
+      duration,
       coverB64,
       title: tryFixEncoding(rawTitle),
       artist: tryFixEncoding(rawArtist),
@@ -180,15 +212,29 @@ async function processBatch(files: string[], timeoutMs: number): Promise<WorkerR
 }
 
 if (parentPort) {
-  const { files, timeoutMs } = workerData
-  processBatch(files, timeoutMs).then(results => {
-    if (parentPort) {
-      parentPort.postMessage({ type: 'result', results })
-    }
-  }).catch(err => {
-    console.error('Worker batch error:', err)
-    if (parentPort) {
-      parentPort.postMessage({ type: 'error', message: err.message })
+  // Support both workerData (first run) and postMessage (subsequent runs for reuse)
+  const handleWork = (data: { files: string[]; timeoutMs: number }) => {
+    processBatch(data.files, data.timeoutMs).then(results => {
+      if (parentPort) {
+        parentPort.postMessage({ type: 'result', results })
+      }
+    }).catch(err => {
+      console.error('Worker batch error:', err)
+      if (parentPort) {
+        parentPort.postMessage({ type: 'error', message: err.message })
+      }
+    })
+  }
+
+  if (workerData && workerData.files) {
+    // Initial run via workerData
+    handleWork(workerData)
+  }
+
+  // Listen for subsequent work via postMessage
+  parentPort.on('message', (msg: any) => {
+    if (msg && msg.files) {
+      handleWork(msg)
     }
   })
 }

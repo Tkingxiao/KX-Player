@@ -5,6 +5,7 @@ import crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
 import chokidar from 'chokidar'
 import * as musicMetadata from 'music-metadata'
+import { getCoversDir } from './coverService'
 
 const AUDIO_EXTS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.m4a', '.aac', '.wma', '.opus', '.ape', '.wv', '.aiff', '.alac', '.dsf', '.dff', '.dsd'])
 const VIDEO_EXTS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'])
@@ -50,8 +51,8 @@ async function discoverFiles(folderPaths: string[]): Promise<string[]> {
   return results
 }
 
-const SCAN_TIMEOUT_MS = 5000
-const LARGE_FILE_SCAN_TIMEOUT_MS = 15000 // 15 seconds for large files
+const SCAN_TIMEOUT_MS = 15000 // 15s per file (up from 5s — some files need longer parsing)
+const LARGE_FILE_SCAN_TIMEOUT_MS = 30000 // 30 seconds for large files
 const CHOKIDAR_DELAY = 1000
 const YIELD_INTERVAL = 500 // yield to event loop every N iterations to keep main process responsive
 
@@ -313,9 +314,80 @@ function throttleProgress(callback: (completed: number, total: number) => void, 
   }
 }
 
+// Worker pool for metadata parsing. Workers are terminated and recreated
+// before each scan to avoid stale/dead workers from previous runs.
+let _workerPool: Worker[] = []
+let _workerPath: string | null = null
+
+function _getWorkerPath(): string | null {
+  if (_workerPath) return _workerPath
+  const candidates = [
+    path.join(__dirname, 'workers', 'metadata-worker.js'),
+    path.join(__dirname, '..', 'dist-electron', 'workers', 'metadata-worker.js'),
+    path.join(process.cwd(), 'dist-electron', 'workers', 'metadata-worker.js'),
+  ]
+  for (const p of candidates) {
+    if (fs.existsSync(p)) { _workerPath = p; return p }
+  }
+  return null
+}
+
+function _terminateWorkerPool() {
+  if (_workerPool.length === 0) return
+  for (const w of _workerPool) {
+    try { w.terminate() } catch { /* ignore */ }
+  }
+  _workerPool = []
+}
+
+/**
+ * LPT (Longest Processing Time first) file distribution.
+ * Sorts files by size descending, then assigns each file to the worker
+ * with the smallest total size. This ensures balanced load across workers
+ * since larger files take proportionally longer to parse.
+ * 
+ * For large file counts (>5000), falls back to round-robin to avoid
+ * the O(n log n) sort + O(n) stat overhead.
+ */
+function distributeFilesBySize(files: string[], workerCount: number): string[][] {
+  if (files.length === 0) return []
+  const effectiveWorkers = Math.min(workerCount, files.length)
+  const chunks: string[][] = Array.from({ length: effectiveWorkers }, () => [])
+
+  // For large file counts, use round-robin to avoid stat overhead
+  if (files.length > 5000) {
+    for (let i = 0; i < files.length; i++) {
+      chunks[i % effectiveWorkers].push(files[i])
+    }
+    return chunks.filter(c => c.length > 0)
+  }
+
+  const sizes = new Float64Array(effectiveWorkers) // total size per worker
+
+  // Get file sizes and sort descending (largest first)
+  const fileSizes: Array<{ path: string; size: number }> = []
+  for (const f of files) {
+    try { fileSizes.push({ path: f, size: fs.statSync(f).size }) } catch { fileSizes.push({ path: f, size: 0 }) }
+  }
+  fileSizes.sort((a, b) => b.size - a.size)
+
+  // Assign each file to the worker with the least total size
+  for (const { path: filePath, size } of fileSizes) {
+    let minIdx = 0
+    for (let i = 1; i < effectiveWorkers; i++) {
+      if (sizes[i] < sizes[minIdx]) minIdx = i
+    }
+    chunks[minIdx].push(filePath)
+    sizes[minIdx] += size
+  }
+
+  // Remove empty chunks (if fewer files than workers)
+  return chunks.filter(c => c.length > 0)
+}
+
 async function enrichWithWorkers(
   files: string[],
-  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number; genre: string | null; bitrate: number | null; sampleRate: number | null }> = new Map(),
+  existingMeta: Map<string, { duration: number; hasCover: boolean; title: string | null; artist: string | null; fileMtime: number; fileSize: number; genre: string | null; bitrate: number | null; sampleRate: number | null }> = new Map(),
   onProgress?: (completed: number, total: number) => void
 ): Promise<Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>> {
   const results = new Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; genre: string | null; bitrate: number | null; sampleRate: number | null }>()
@@ -332,7 +404,7 @@ async function enrichWithWorkers(
     if (stat && cached && cached.fileMtime === stat.mtime && cached.fileSize === stat.size) {
       results.set(filePath, {
         duration: cached.duration,
-        coverData: cached.coverData,
+        coverData: null, // Cover preserved by saveLibrarySnapshot's DB fallback
         title: cached.title,
         artist: cached.artist,
         genre: cached.genre,
@@ -352,95 +424,115 @@ async function enrichWithWorkers(
     return results
   }
 
-  const MAX_WORKERS = 6
-  const cpuCount = Math.min(MAX_WORKERS, Math.max(1, os.cpus().length - 1))
-  const chunkSize = Math.ceil(normalFiles.length / cpuCount)
-  const chunks: string[][] = []
-  for (let i = 0; i < normalFiles.length; i += chunkSize) {
-    chunks.push(normalFiles.slice(i, i + chunkSize))
-  }
+  // Audio metadata parsing is I/O-bound (disk reads) + CPU-bound (tag parsing).
+  // Over-subscribing workers beyond core count helps keep CPU busy during I/O waits.
+  // Formula: cores * 1.5, clamped to [2, 16] for reasonable resource usage.
+  const physicalCores = Math.max(1, os.cpus().length - 1)
+  const cpuCount = Math.min(16, Math.max(2, Math.ceil(physicalCores * 1.5)))
+  // LPT (Longest Processing Time first) algorithm: distribute files by size
+  // so each worker gets roughly equal total file size for balanced load
+  const chunks = distributeFilesBySize(normalFiles, cpuCount)
 
   // Use larger timeout if any chunk contains large files (>1GB)
-  const LARGE_FILE_SIZE = 1024 * 1024 * 1024
+  const LARGE_FILE_SIZE = 100 * 1024 * 1024 // 100MB threshold for extended timeout
   function hasLargeFiles(chunk: string[]): boolean {
     return chunk.some(f => {
       try { return fs.statSync(f).size > LARGE_FILE_SIZE } catch { return false }
     })
   }
 
+  const workerPath = _getWorkerPath()
+  if (!workerPath) {
+    for (const f of normalFiles) {
+      results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
+    }
+    completed += normalFiles.length
+    reportProgress(total)
+    return results
+  }
+
+  // Always terminate stale workers and create fresh ones for each scan.
+  _terminateWorkerPool()
+
+  console.time('[scan] workerCreate')
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      const perFileTimeout = hasLargeFiles(chunks[i]) ? LARGE_FILE_SCAN_TIMEOUT_MS : SCAN_TIMEOUT_MS
+      const w = new Worker(workerPath, { workerData: { files: chunks[i], timeoutMs: perFileTimeout } })
+      _workerPool.push(w)
+    } catch (e) {
+      console.error('[scan] worker creation failed:', e)
+      break
+    }
+  }
+  console.timeEnd('[scan] workerCreate')
+
   console.time('[scan] workerBatch')
-  const workerPromises = chunks.map((chunk) => {
+  const workerPromises = chunks.map((chunk, idx) => {
     return new Promise<void>((resolve) => {
-      try {
-        // Try multiple possible worker paths
-        let workerPath = path.join(__dirname, 'workers', 'metadata-worker.js')
-        if (!fs.existsSync(workerPath)) {
-          workerPath = path.join(__dirname, '..', 'dist-electron', 'workers', 'metadata-worker.js')
+      const worker = _workerPool[idx]
+      if (!worker) {
+        for (const f of chunk) {
+          results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
         }
-        if (!fs.existsSync(workerPath)) {
-          workerPath = path.join(process.cwd(), 'dist-electron', 'workers', 'metadata-worker.js')
+        completed += chunk.length
+        reportProgress(completed)
+        resolve()
+        return
+      }
+
+      // Scale timeout per file count: each file gets SCAN_TIMEOUT_MS (5s), min 10s, max 10min
+      const chunkTimeout = Math.max(10000, Math.min(600000, chunk.length * SCAN_TIMEOUT_MS))
+      let hasResponded = false
+      let chunkTimer: NodeJS.Timeout | null = null
+      const clearChunkTimer = () => { if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null } }
+
+      const messageHandler = (msg: any) => {
+        if (msg.type === 'progress') {
+          // Reset timer on progress to keep long-running chunks alive
+          clearChunkTimer()
+          chunkTimer = setTimeout(handleTimeout, chunkTimeout)
+          return
         }
-        if (!fs.existsSync(workerPath)) {
+        if (hasResponded) return
+        hasResponded = true
+        clearChunkTimer()
+        worker.removeListener('message', messageHandler)
+        worker.removeListener('error', errorHandler)
+        if (msg.type === 'result') {
+          for (const r of msg.results) {
+            results.set(r.path, {
+              duration: r.duration || 0,
+              coverData: r.coverB64 || null,
+              title: r.title || null,
+              artist: r.artist || null,
+              genre: r.genre || null,
+              bitrate: r.bitrate || null,
+              sampleRate: r.sampleRate || null,
+            })
+          }
+          completed += chunk.length
+          reportProgress(completed)
+          resolve()
+        } else if (msg.type === 'error') {
+          console.error('[scan] worker reported error:', msg.message)
           for (const f of chunk) {
             results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
           }
           completed += chunk.length
-          onProgress?.(completed, total)
+          reportProgress(completed)
           resolve()
-          return
         }
+      }
+      worker.on('message', messageHandler)
 
-        const chunkTimeout = hasLargeFiles(chunk) ? LARGE_FILE_SCAN_TIMEOUT_MS : SCAN_TIMEOUT_MS
-        const worker = new Worker(workerPath, {
-          workerData: { files: chunk, timeoutMs: chunkTimeout },
-        })
-
-        let hasResponded = false
-      let chunkTimer: NodeJS.Timeout | null = null
-
-      const clearChunkTimer = () => { if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null } }
-
-      worker.on('message', (msg: any) => {
-          hasResponded = true
-          clearChunkTimer()
-          if (msg.type === 'result') {
-            for (const r of msg.results) {
-              results.set(r.path, {
-                duration: r.duration || 0,
-                coverData: r.coverB64 || null,
-                title: r.title || null,
-                artist: r.artist || null,
-                genre: r.genre || null,
-                bitrate: r.bitrate || null,
-                sampleRate: r.sampleRate || null,
-              })
-            }
-            // Only count files not already counted by progress messages
-            const progressCount = msg.results?.length || 0
-            completed += Math.max(0, chunk.length - progressCount)
-            reportProgress(completed)
-            resolve()
-          } else if (msg.type === 'progress') {
-            completed += 1
-            reportProgress(completed)
-          }
-        })
-
-        worker.on('error', () => {
-          clearChunkTimer()
-          if (!hasResponded) {
-            for (const f of chunk) {
-              results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
-            }
-            completed += chunk.length
-            reportProgress(completed)
-          }
-          resolve()
-        })
-
-      worker.on('exit', (code) => {
+      const errorHandler = (err: Error) => {
+        console.error('[scan] worker error:', err?.message || err)
         clearChunkTimer()
-        if (!hasResponded && code !== 0) {
+        worker.removeListener('message', messageHandler)
+        worker.removeListener('error', errorHandler)
+        if (!hasResponded) {
+          hasResponded = true
           for (const f of chunk) {
             results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
           }
@@ -448,11 +540,17 @@ async function enrichWithWorkers(
           reportProgress(completed)
         }
         resolve()
-      })
+      }
+      worker.on('error', errorHandler)
 
-      chunkTimer = setTimeout(() => {
+      const handleTimeout = () => {
         if (!hasResponded) {
-          worker.terminate()
+          console.warn('[scan] worker timeout for chunk', idx, 'size', chunk.length)
+          hasResponded = true
+          worker.removeListener('message', messageHandler)
+          worker.removeListener('error', errorHandler)
+          try { worker.terminate() } catch { /* ignore */ }
+          _workerPool = _workerPool.filter(w => w !== worker)
           for (const f of chunk) {
             results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
           }
@@ -460,21 +558,19 @@ async function enrichWithWorkers(
           reportProgress(completed)
           resolve()
         }
-      }, chunkTimeout)
-    } catch {
-      for (const f of chunk) {
-        results.set(f, { duration: 0, coverData: null, title: null, artist: null, genre: null, bitrate: null, sampleRate: null })
       }
-      completed += chunk.length
-      reportProgress(completed)
-      resolve()
-    }
+      chunkTimer = setTimeout(handleTimeout, chunkTimeout)
+
+      // Workers are created fresh with workerData for each scan.
+      // No need to send postMessage — workerData is available at worker startup.
+      // The worker will process it and respond via parentPort.postMessage.
+      })
   })
-})
 
   await Promise.all(workerPromises)
   console.timeEnd('[scan] workerBatch')
   reportProgress(total)
+  _terminateWorkerPool() // Clean up workers after scan
   return results
 }
 
@@ -494,6 +590,9 @@ async function groupTracksByFolder(
 ): Promise<ScannedArtist[]> {
   const artistMap = new Map<string, { path: string; albums: Map<string, ScannedAlbum> }>()
 
+  // Pre-normalize root paths to avoid repeated replace in the inner loop
+  const normalizedRoots = rootPaths.map(rp => rp.replace(/\\/g, '/').replace(/\/+$/, ''))
+
   for (const [fi, fp] of files.entries()) {
     if (fi > 0 && fi % YIELD_INTERVAL === 0) await yieldToEventLoop()
     const meta = metaResults.get(fp)
@@ -504,8 +603,8 @@ async function groupTracksByFolder(
     const nfp = fp.replace(/\\/g, '/')
     let matchedRoot: string | null = null
 
-    for (let ri = 0; ri < rootPaths.length; ri++) {
-      const nrp = rootPaths[ri].replace(/\\/g, '/').replace(/\/+$/, '')
+    for (let ri = 0; ri < normalizedRoots.length; ri++) {
+      const nrp = normalizedRoots[ri]
       if (nfp === nrp || nfp.startsWith(nrp + '/')) {
         matchedRoot = nrp
         break
@@ -741,17 +840,66 @@ async function buildFolderTree(
   return roots
 }
 
-// For albums that still have no cover after scanning, extract the cover from
-// the first track using a targeted music-metadata parse (fast, per-album).
-// Falls back to findExternalCover / findAnyImage if embedded extraction fails.
+// For albums that still have no cover after scanning, find covers using a
+// three-tier strategy ordered by speed:
+//   1. Filesystem cache check — O(1) per track, reuses covers from previous scans
+//   2. External cover files  — reads small image files from disk
+//   3. Embedded extraction   — last resort, parses audio metadata (slowest)
 const COVER_EXTRACT_TIMEOUT = 3000 // 3s per album cover extraction
 async function fillAlbumCovers(artists: ScannedArtist[]): Promise<void> {
+  // Build set of track IDs that already have cover files on disk (fast, one readdir)
+  let existingCovers = new Set<string>()
+  try {
+    const coversDir = getCoversDir()
+    if (fs.existsSync(coversDir)) {
+      const files = fs.readdirSync(coversDir)
+      for (const f of files) {
+        if (f.startsWith('folder_') || !f.endsWith('.jpg')) continue
+        existingCovers.add(f.slice(0, -4)) // strip .jpg → trackId
+      }
+    }
+  } catch { /* ignore */ }
+
   for (const artist of artists) {
     for (const album of artist.albums) {
-      if (album.coverData) continue // already has a cover
-      
-      // Try embedded cover extraction from first track (with timeout)
-      // Only attempt for small files; large files skip to external search
+      if (album.coverData) continue
+
+      // --- Tier 1: Filesystem cache (fastest — no audio parsing) ---
+      // Check if any track in this album already has a saved cover file
+      let foundCached = false
+      for (const track of album.tracks) {
+        const trackId = hashPath(track.path)
+        if (existingCovers.has(trackId)) {
+          try {
+            const coversDir = getCoversDir()
+            const coverPath = path.join(coversDir, `${trackId}.jpg`)
+            const buffer = fs.readFileSync(coverPath)
+            if (buffer.length > 0) {
+              album.coverData = `data:image/jpeg;base64,${buffer.toString('base64')}`
+              track.coverData = album.coverData
+              foundCached = true
+              break
+            }
+          } catch { /* skip */ }
+        }
+      }
+      if (foundCached) continue
+
+      // --- Tier 2: External cover files (fast — reads small image) ---
+      if (album.dirPath) {
+        const externalCover = findExternalCover(album.dirPath, 1)
+        if (externalCover) {
+          album.coverData = externalCover
+          continue
+        }
+        const anyImage = findAnyImage(album.dirPath)
+        if (anyImage) {
+          album.coverData = anyImage
+          continue
+        }
+      }
+
+      // --- Tier 3: Embedded cover extraction (slowest — parses audio file) ---
       const targetTrack = album.tracks[0]
       if (targetTrack) {
         try {
@@ -763,34 +911,17 @@ async function fillAlbumCovers(artists: ScannedArtist[]): Promise<void> {
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), COVER_EXTRACT_TIMEOUT))
           ])
           if (meta.common.picture && meta.common.picture.length > 0) {
-              const pic = meta.common.picture[0]
-              const data = Buffer.isBuffer(pic.data) ? pic.data : Buffer.from(pic.data)
-              if (data.length > 0 && data.length <= 15 * 1024 * 1024) {
-                let fmt = pic.format || 'image/jpeg'
-                if (!fmt.startsWith('image/')) fmt = `image/${fmt}`
-                const b64 = `data:${fmt};base64,${data.toString('base64')}`
-                album.coverData = b64
-                targetTrack.coverData = b64
-                continue
-              }
+            const pic = meta.common.picture[0]
+            const data = Buffer.isBuffer(pic.data) ? pic.data : Buffer.from(pic.data)
+            if (data.length > 0 && data.length <= 15 * 1024 * 1024) {
+              let fmt = pic.format || 'image/jpeg'
+              if (!fmt.startsWith('image/')) fmt = `image/${fmt}`
+              const b64 = `data:${fmt};base64,${data.toString('base64')}`
+              album.coverData = b64
+              targetTrack.coverData = b64
             }
-          } catch {
-            // embedded extraction failed or timed out, try external
           }
-        }
-
-      // Fallback: try external cover files in the album directory
-      if (album.dirPath) {
-        const externalCover = findExternalCover(album.dirPath, 1)
-        if (externalCover) {
-          album.coverData = externalCover
-          continue
-        }
-        // Last resort: any image file in the directory
-        const anyImage = findAnyImage(album.dirPath)
-        if (anyImage) {
-          album.coverData = anyImage
-        }
+        } catch { /* embedded extraction failed */ }
       }
     }
   }
@@ -798,7 +929,7 @@ async function fillAlbumCovers(artists: ScannedArtist[]): Promise<void> {
 
 export async function scanFoldersWithProgress(
   folderPaths: string[],
-  existingMeta: Map<string, { duration: number; coverData: string | null; title: string | null; artist: string | null; fileMtime: number; fileSize: number; genre: string | null; bitrate: number | null; sampleRate: number | null }> = new Map(),
+  existingMeta: Map<string, { duration: number; hasCover: boolean; title: string | null; artist: string | null; fileMtime: number; fileSize: number; genre: string | null; bitrate: number | null; sampleRate: number | null }> = new Map(),
   onProgress?: (completed: number, total: number) => void,
   onStage?: (stage: string) => void
 ): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number }> {
@@ -843,6 +974,38 @@ export async function scanFoldersWithProgress(
   }
   console.timeEnd('[scan] assembleAllTracks')
 
+  // Propagate covers from allTracks back to folder tree nodes
+  // This is needed because fillAlbumCovers runs after buildFolderTree,
+  // so folder nodes don't get covers from album/track data on cache re-scan
+  console.time('[scan] propagateCoversToFolderTree')
+  const pathToCover = new Map<string, string>()
+  for (const t of allTracks) {
+    const cover = t.coverData || t.albumCoverData
+    if (cover) {
+      const trackDir = path.dirname(t.path).replace(/\\/g, '/')
+      if (!pathToCover.has(trackDir)) pathToCover.set(trackDir, cover)
+    }
+  }
+  function propagateCoversToNode(node: FolderNode): void {
+    // Check if this node has a cover from track data
+    const coverFromTrack = pathToCover.get(node.path.replace(/\\/g, '/'))
+    if (coverFromTrack && !node.coverData) {
+      node.coverData = coverFromTrack
+    }
+    // Recurse to children
+    for (const child of node.children) {
+      propagateCoversToNode(child)
+      // If this node still has no cover, try to inherit from children
+      if (!node.coverData && child.coverData) {
+        node.coverData = child.coverData
+      }
+    }
+  }
+  for (const rootNode of folderTree) {
+    propagateCoversToNode(rootNode)
+  }
+  console.timeEnd('[scan] propagateCoversToFolderTree')
+
   // Verify cover coverage
   const tracksWithCover = allTracks.filter(t => t.coverData || t.albumCoverData).length
   const albumsWithCover = artists.reduce((a, ar) => a + ar.albums.filter(al => al.coverData).length, 0)
@@ -851,6 +1014,165 @@ export async function scanFoldersWithProgress(
 
   console.timeEnd('[scan] total')
   return { artists, folderTree, allTracks, fileCount: totalFiles }
+}
+
+/**
+ * Incremental scan: only parse new/changed files via workers.
+ * Uses existing metadata from DB for unchanged files, making it much faster
+ * than a full scan when only a few folders are added or changed.
+ */
+export async function scanFoldersIncremental(
+  allFolderPaths: string[],
+  existingMeta: Map<string, {
+    duration: number; coverData: string | null; title: string | null; artist: string | null;
+    genre: string | null; bitrate: number | null; sampleRate: number | null;
+    fileMtime: number; fileSize: number
+  }>,
+  onProgress?: (completed: number, total: number) => void,
+  onStage?: (stage: string) => void
+): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number; changedPaths: Set<string> }> {
+  console.time('[scan-incr] total')
+
+  // Load cover data from filesystem for existing cached files
+  // Build reverse map: trackId → filePath for O(1) lookup instead of O(n*m)
+  console.time('[scan-incr] loadCovers')
+  try {
+    const coversDir = getCoversDir()
+    if (fs.existsSync(coversDir)) {
+      const idToPath = new Map<string, string>()
+      for (const [filePath] of existingMeta) {
+        idToPath.set(hashPath(filePath), filePath)
+      }
+      const coverFiles = fs.readdirSync(coversDir)
+      for (const cf of coverFiles) {
+        if (cf.startsWith('folder_') || !cf.endsWith('.jpg')) continue
+        const trackId = cf.slice(0, -4)
+        const filePath = idToPath.get(trackId)
+        if (filePath) {
+          const meta = existingMeta.get(filePath)
+          if (meta) {
+            try {
+              const buffer = fs.readFileSync(path.join(coversDir, cf))
+              if (buffer.length > 0) {
+                meta.coverData = `data:image/jpeg;base64,${buffer.toString('base64')}`
+              }
+            } catch { /* skip */ }
+          }
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  console.timeEnd('[scan-incr] loadCovers')
+
+  // Discover files in ALL folders (to get complete file list)
+  console.time('[scan-incr] discoverFiles')
+  const files = await discoverFiles(allFolderPaths)
+  console.timeEnd('[scan-incr] discoverFiles')
+  const totalFiles = files.length
+
+  // Find new/changed files
+  const changedFiles: string[] = []
+  for (const filePath of files) {
+    const normalizedPath = filePath.replace(/\\/g, '/')
+    const cached = existingMeta.get(normalizedPath)
+    if (!cached) { changedFiles.push(filePath); continue }
+    const stat = getFileStat(filePath)
+    if (!stat || cached.fileMtime !== stat.mtime || cached.fileSize !== stat.size) {
+      changedFiles.push(filePath)
+    }
+  }
+
+  console.log(`[scan-incr] ${changedFiles.length} new/changed out of ${totalFiles} files`)
+
+  // Build metaResults from existing data
+  const metaResults = new Map<string, {
+    duration: number; coverData: string | null; title: string | null; artist: string | null;
+    genre: string | null; bitrate: number | null; sampleRate: number | null
+  }>()
+  for (const filePath of files) {
+    const normalizedPath = filePath.replace(/\\/g, '/')
+    const cached = existingMeta.get(normalizedPath)
+    if (cached) {
+      metaResults.set(filePath, {
+        duration: cached.duration,
+        coverData: cached.coverData,
+        title: cached.title,
+        artist: cached.artist,
+        genre: cached.genre,
+        bitrate: cached.bitrate,
+        sampleRate: cached.sampleRate,
+      })
+    }
+  }
+
+  // Process only new/changed files via workers
+  if (changedFiles.length > 0) {
+    onStage?.('解析新文件元数据...')
+    const workerResults = await enrichWithWorkers(changedFiles, existingMeta, (completed, total) => {
+      onProgress?.(completed, total)
+    })
+    for (const [filePath, meta] of workerResults) {
+      metaResults.set(filePath, meta)
+    }
+  } else {
+    onProgress?.(0, 0)
+  }
+
+  // Build structures (same as full scan)
+  onStage?.('构建音乐库...')
+
+  console.time('[scan-incr] groupTracksByFolder')
+  const artists = await groupTracksByFolder(files, metaResults, allFolderPaths)
+  console.timeEnd('[scan-incr] groupTracksByFolder')
+
+  console.time('[scan-incr] buildFolderTree')
+  const folderTree = await buildFolderTree(files, metaResults, allFolderPaths)
+  console.timeEnd('[scan-incr] buildFolderTree')
+
+  await fillAlbumCovers(artists)
+
+  console.time('[scan-incr] assembleAllTracks')
+  const allTracks: ScannedTrack[] = []
+  let ti = 0
+  for (const artist of artists) {
+    for (const album of artist.albums) {
+      for (const track of album.tracks) {
+        track.albumCoverData = album.coverData || track.coverData || null
+        allTracks.push(track)
+        ti++
+        if (ti % YIELD_INTERVAL === 0) await yieldToEventLoop()
+      }
+    }
+  }
+  console.timeEnd('[scan-incr] assembleAllTracks')
+
+  // Propagate covers to folder tree
+  const pathToCover = new Map<string, string>()
+  for (const t of allTracks) {
+    const cover = t.coverData || t.albumCoverData
+    if (cover) {
+      const trackDir = path.dirname(t.path).replace(/\\/g, '/')
+      if (!pathToCover.has(trackDir)) pathToCover.set(trackDir, cover)
+    }
+  }
+  function propagateCovers(node: FolderNode): void {
+    const c = pathToCover.get(node.path.replace(/\\/g, '/'))
+    if (c && !node.coverData) node.coverData = c
+    for (const child of node.children) {
+      propagateCovers(child)
+      if (!node.coverData && child.coverData) node.coverData = child.coverData
+    }
+  }
+  for (const rootNode of folderTree) propagateCovers(rootNode)
+
+  const tracksWithCover = allTracks.filter(t => t.coverData || t.albumCoverData).length
+  console.log(`[scan-incr] cover coverage: ${tracksWithCover}/${allTracks.length} tracks`)
+  console.timeEnd('[scan-incr] total')
+
+  // Build set of normalized changed paths for incremental cover saving
+  const changedPaths = new Set(changedFiles.map(f => f.replace(/\\/g, '/')))
+
+  return { artists, folderTree, allTracks, fileCount: totalFiles, changedPaths }
 }
 
 export async function startWatching(
@@ -900,4 +1222,8 @@ export function stopWatching(): void {
   }
   watchers = []
   onChangeCallback = null
+}
+
+export function terminateWorkerPool(): void {
+  _terminateWorkerPool()
 }

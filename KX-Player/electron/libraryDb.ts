@@ -1,28 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import initSqlJs from 'sql.js'
-import sharp from 'sharp'
-
-// Compress cover image: resize to max 400px, JPEG quality 75
-// Skips images smaller than 50KB to avoid unnecessary processing.
-async function compressCover(dataUrl: string | null): Promise<string | null> {
-  if (!dataUrl) return null
-  try {
-    const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/)
-    if (!match) return dataUrl
-    const buffer = Buffer.from(match[2], 'base64')
-    // Skip compression for small images (< 50KB)
-    if (buffer.length < 50 * 1024) return dataUrl
-    const compressed = await sharp(buffer)
-      .resize(400, 400, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: 75 })
-      .toBuffer()
-    return `data:image/jpeg;base64,${compressed.toString('base64')}`
-  } catch (e) {
-    console.error('[compressCover] sharp compression failed, using original:', e)
-    return dataUrl // fallback to original on error
-  }
-}
 
 export interface TrackRecord {
   id: string
@@ -265,13 +243,11 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
       const artistId = Number(database.exec('SELECT last_insert_rowid() AS id')[0].values[0][0])
 
       for (const album of artist.albums) {
-        // Compress album cover before storing
-        const compressedAlbumCover = await compressCover(album.coverData)
-        insertAlbum.run([artistId, album.name, album.artist, album.coverPath, compressedAlbumCover])
+        // Store NULL for cover_data (covers now in filesystem)
+        insertAlbum.run([artistId, album.name, album.artist, album.coverPath, null])
         const albumId = Number(database.exec('SELECT last_insert_rowid() AS id')[0].values[0][0])
 
         for (const track of album.tracks) {
-          const compressedTrackCover = await compressCover(track.coverData)
           insertTrack.run([
             track.id,
             artistId,
@@ -284,7 +260,7 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
             track.format,
             track.isVideo ? 1 : 0,
             track.coverPath,
-            compressedTrackCover,
+            null, // cover_data → filesystem
             track.lyricsPath,
             track.fileMtime,
             track.fileSize,
@@ -293,7 +269,7 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
             track.genre ?? null,
             track.bitrate ?? null,
             track.sampleRate ?? null,
-            compressedAlbumCover ?? null,
+            null, // album_cover_data → filesystem
           ])
         }
       }
@@ -304,12 +280,13 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
     while (fi < folderStack.length) {
       const node = folderStack[fi++]
       const normalizedNodePath = normalizePath(node.path)
+      // Store NULL for cover_data (covers now in filesystem)
       insertFolder.run([
         normalizedNodePath,
         node.name,
         folderParentMap.get(normalizedNodePath) ?? null,
         node.trackCount,
-        node.coverData,
+        null,
       ])
       for (const track of node.tracks) {
         insertFolderTrack.run([normalizedNodePath, track.id])
@@ -568,39 +545,13 @@ export async function loadTrackListSnapshot(filePath: string): Promise<LibrarySn
   return snapshot
 }
 
-/**
- * Load cover data for specific tracks from the database.
- * Returns a Map of trackId → coverData (base64 string) and albumCoverData.
- */
-export async function getTrackCovers(filePath: string, trackIds: string[]): Promise<Map<string, { coverData: string | null; albumCoverData: string | null }>> {
-  if (trackIds.length === 0) return new Map()
-  const sql = await ensureSql()
-  if (!fs.existsSync(filePath)) return new Map()
-  const database = openDatabase(filePath, sql)
-  const results = new Map<string, { coverData: string | null; albumCoverData: string | null }>()
-  // Process in batches of 50 to avoid huge queries
-  for (let i = 0; i < trackIds.length; i += 50) {
-    const batch = trackIds.slice(i, i + 50)
-    const placeholders = batch.map(() => '?').join(',')
-    const stmt = database.prepare(`
-      SELECT id, cover_data, album_cover_data FROM tracks WHERE id IN (${placeholders})
-    `)
-    stmt.bind(batch)
-    while (stmt.step()) {
-      const row = stmt.getAsObject() as any
-      results.set(String(row.id), {
-        coverData: row.cover_data ? String(row.cover_data) : null,
-        albumCoverData: row.album_cover_data ? String(row.album_cover_data) : null,
-      })
-    }
-    stmt.free()
-  }
-  return results
-}
-
+// Metadata index for cache invalidation during scan.
+// Stores only a hasCover flag (not full coverData) to avoid loading 100-300MB.
+// Full covers are preserved in DB via saveLibrarySnapshot's existing-cover fallback
+// and restored via loadFolderCovers (which also falls back to track covers).
 export async function loadTrackMetadataIndex(filePath: string): Promise<Map<string, {
   duration: number
-  coverData: string | null
+  hasCover: boolean
   title: string | null
   artist: string | null
   fileMtime: number
@@ -622,7 +573,7 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
   const rows = rowsFromStmt(stmt, (row) => ({
     path: String(row.path),
     duration: Number(row.duration) || 0,
-    coverData: row.cover_data ? String(row.cover_data) : null,
+    hasCover: row.cover_data ? true : false,
     title: row.meta_title ? String(row.meta_title) : null,
     artist: row.meta_artist ? String(row.meta_artist) : null,
     fileMtime: Number(row.file_mtime) || 0,
@@ -634,7 +585,7 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
 
   const index = new Map<string, {
     duration: number
-    coverData: string | null
+    hasCover: boolean
     title: string | null
     artist: string | null
     fileMtime: number
@@ -645,5 +596,62 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
   }>()
 
   for (const row of rows) index.set(row.path, row)
+  return index
+}
+
+/**
+ * Load full metadata index for incremental scanning.
+ * Returns a Map keyed by normalized path (forward slashes) with all fields
+ * needed to rebuild the library without re-parsing unchanged files.
+ */
+export async function loadFullMetadataIndex(filePath: string): Promise<Map<string, {
+  duration: number
+  coverData: string | null
+  title: string | null
+  artist: string | null
+  genre: string | null
+  bitrate: number | null
+  sampleRate: number | null
+  fileMtime: number
+  fileSize: number
+}>> {
+  const sql = await ensureSql()
+  if (!fs.existsSync(filePath)) return new Map()
+  const database = openDatabase(filePath, sql)
+
+  const stmt = database.prepare(`
+    SELECT path, duration, meta_title, meta_artist, file_mtime, file_size,
+           genre, bitrate, sample_rate
+    FROM tracks
+  `)
+
+  const index = new Map<string, {
+    duration: number
+    coverData: string | null
+    title: string | null
+    artist: string | null
+    genre: string | null
+    bitrate: number | null
+    sampleRate: number | null
+    fileMtime: number
+    fileSize: number
+  }>()
+
+  const rows = rowsFromStmt(stmt, (r) => r)
+  for (const row of rows) {
+    const r = row as any
+    const normalizedPath = String(r.path).replace(/\\/g, '/')
+    index.set(normalizedPath, {
+      duration: Number(r.duration) || 0,
+      coverData: null, // covers loaded separately from filesystem
+      title: r.meta_title ? String(r.meta_title) : null,
+      artist: r.meta_artist ? String(r.meta_artist) : null,
+      genre: r.genre ? String(r.genre) : null,
+      bitrate: r.bitrate ? Number(r.bitrate) : null,
+      sampleRate: r.sample_rate ? Number(r.sample_rate) : null,
+      fileMtime: Number(r.file_mtime) || 0,
+      fileSize: Number(r.file_size) || 0,
+    })
+  }
   return index
 }

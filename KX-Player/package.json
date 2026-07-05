@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "electron": "^42.5.1",
-    "electron-builder": "^26.0.0",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.1",
     "vite": "^8.1.0",
     "vite-plugin-electron": "^0.29.0",
@@ -40,7 +40,10 @@
     },
     "files": [
       "dist/**/*",
-      "dist-electron/**/*"
+      "dist-electron/**/*",
+      "public/icon-256.png",
+      "public/icon-128.png",
+      "public/favicon.ico"
     ],
     "extraResources": [
       {
