@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu, nativeImage } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -137,6 +137,8 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  // If tray is active and not force-closing, keep app running in background
+  if (tray && !forceCloseFlag) return
   if (process.platform !== 'darwin') {
     app.quit()
   }
@@ -578,10 +580,34 @@ let tray: Tray | null = null
 
 function createTray() {
   if (tray) return
-  // Use favicon as tray icon
-  const iconPath = path.join(__dirname, '../public/favicon.ico')
-  if (!fs.existsSync(iconPath)) return
-  tray = new Tray(iconPath)
+  // Create tray icon from file or fallback to a minimal icon
+  let icon: Electron.NativeImage | null = null
+  const iconCandidates = [
+    path.join(__dirname, '../public/favicon.ico'),
+    path.join(__dirname, '../../public/favicon.ico'),
+    process.resourcesPath ? path.join(process.resourcesPath, 'public', 'favicon.ico') : '',
+  ].filter(Boolean)
+  for (const p of iconCandidates) {
+    if (fs.existsSync(p)) { try { icon = nativeImage.createFromPath(p); if (icon && !icon.isEmpty()) break } catch {} }
+  }
+  // Fallback: create a 16x16 icon from a raw RGBA buffer (blue dot)
+  if (!icon || icon.isEmpty()) {
+    const size = 16
+    const rgba = Buffer.alloc(size * size * 4, 0) // transparent by default
+    // Fill center 2x2 with a color (B,G,R,A)
+    const cx = Math.floor(size / 2)
+    for (let y = cx - 1; y <= cx; y++) {
+      for (let x = cx - 1; x <= cx; x++) {
+        const i = (y * size + x) * 4
+        rgba[i] = 0x40     // B
+        rgba[i + 1] = 0x80 // G
+        rgba[i + 2] = 0xFF // R
+        rgba[i + 3] = 0xFF // A
+      }
+    }
+    icon = nativeImage.createFromBuffer(rgba, { width: size, height: size })
+  }
+  tray = new Tray(icon)
   tray.setToolTip('KX 音乐播放器')
   const contextMenu = Menu.buildFromTemplate([
     {

@@ -861,30 +861,36 @@ export async function startWatching(
   onChangeCallback = onChange
 
   for (const fp of folderPaths) {
-    const watcher = chokidar.watch(fp, {
-      ignored: /(^|[\/\\])\../,
-      persistent: true,
-      ignoreInitial: true,
-      depth: 99,
-      awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
-    })
+    try {
+      const watcher = chokidar.watch(fp, {
+        ignored: /(^|[\/\\])\../,
+        persistent: true,
+        ignoreInitial: true,
+        depth: 99,
+        awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
+      })
 
-    let timer: NodeJS.Timeout | null = null
+      let timer: NodeJS.Timeout | null = null
 
-    const scheduleChange = () => {
-      if (!onChangeCallback) return
-      if (timer) clearTimeout(timer)
-      timer = setTimeout(() => {
-        timer = null
-        onChangeCallback?.()
-      }, CHOKIDAR_DELAY)
+      const scheduleChange = () => {
+        if (!onChangeCallback) return
+        if (timer) clearTimeout(timer)
+        timer = setTimeout(() => {
+          timer = null
+          onChangeCallback?.()
+        }, CHOKIDAR_DELAY)
+      }
+
+      watcher.on('add', scheduleChange)
+      watcher.on('change', scheduleChange)
+      watcher.on('unlink', scheduleChange)
+      watcher.on('addDir', scheduleChange)
+      watcher.on('unlinkDir', scheduleChange)
+
+      watchers.push(watcher)
+    } catch (e) {
+      console.error(`[watcher] Failed to watch ${fp}:`, e)
     }
-
-    watcher.on('add', scheduleChange)
-    watcher.on('change', scheduleChange)
-    watcher.on('unlink', scheduleChange)
-
-    watchers.push(watcher)
   }
 }
 

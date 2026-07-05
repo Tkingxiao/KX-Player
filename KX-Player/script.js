@@ -68,8 +68,11 @@ let fp = [], audio = new Audio(), lrc = [], pl = [], nI = 0
 let _lastLrcActiveIdx = -1
 let _idCounter = 0
 let _scanRunning = false
+let _pendingRescan = false
 let _loadTGeneration = 0
 let stopWatchingFs = null
+let _watchPollTimer = null
+let _watcherTriggered = false
 let lyricsManualScrollUntil = 0
 let dsdState = {
   active: false,
@@ -114,6 +117,8 @@ function hashPath(p) {
 }
 function fmtTime(t) { if (!t || !isFinite(t)) return '00:00'; const m = Math.floor(t / 60), s = Math.floor(t % 60); return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') }
 function isVideoFile(t) { return t && t.isVideo === true }
+// Extract filename without extension from track path for display
+function nName(t) { const p = String(t.path || '').replace(/\\/g, '/').split('/').pop() || ''; return p.replace(/\.[^/.]+$/, '') || p }
 
 // Pre-computed set of default-favorite track IDs for O(1) lookup during rendering
 let _defaultFavIds = null
@@ -330,9 +335,21 @@ async function restartWatching() {
   if (!fp.length) return
 
   try {
-    stopWatchingFs = await api.onFsChanged(() => { rescan() })
+    stopWatchingFs = await api.onFsChanged(() => {
+      console.log('[watcher] fs changed, triggering rescan')
+      _watcherTriggered = true
+      rescan()
+    })
+    _watcherTriggered = false
     await api.startWatching(fp)
-  } catch (e) { /* ignore */ }
+    console.log('[watcher] started for', fp.length, 'folders')
+  } catch (e) { console.warn('[watcher] restart failed:', e) }
+}
+
+function stopWatching() {
+  if (_watchPollTimer) { clearInterval(_watchPollTimer); _watchPollTimer = null }
+  if (stopWatchingFs) { stopWatchingFs(); stopWatchingFs = null }
+  api.stopWatching().catch(() => {})
 }
 
 // === Settings ===
@@ -433,9 +450,10 @@ async function loadLibraryData() {
     }
     const allIds = new Set(S.all.map(t => t.id))
     cleanupStale(allIds)
-    await restartWatching()
     console.timeEnd('[startup] total')
   } catch (e) { /* ignore */ }
+  // Start file watcher (separate from library loading so failures don't block each other)
+  try { await restartWatching() } catch (e) { console.warn('[watcher] init failed:', e) }
 }
 
 // === Theme ===
@@ -1000,7 +1018,7 @@ function updPUI(t, skipLrc) {
   const cd = t.coverData || t.albumCoverData
   const titleEl = $('player-title'), artistEl = $('player-artist')
   const coverEl = $('player-cover'), coverImgEl = $('player-cover-img')
-  titleEl.textContent = t.name
+  titleEl.textContent = nName(t)
   const artist = t.metaArtist || t.artist || '\u4f5a\u540d'
   const isVid = isVideoFile(t)
   artistEl.textContent = artist + (isVid ? ' \u00b7 \u89c6\u9891-\u4ec5\u97f3\u9891\u6a21\u5f0f' : '')
@@ -1216,14 +1234,13 @@ function folderCardHTML(n) {
 
 function tableH(tracks) {
   const cols = S.selMode ? '32px 40px 1.2fr 0.9fr 0.9fr 40px 60px 48px' : '40px 1.2fr 0.9fr 0.9fr 40px 60px 48px'
-  const checks = S.selMode ?
-    `<div class="song-row-header" style="grid-template-columns:${cols}"><div class="song-row-check"></div><div>#</div><div>\u6807\u9898</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div>` : ''
+  const checks = `<div class="song-row-header" style="grid-template-columns:${cols}">${S.selMode ? '<div class="song-row-check"></div>' : ''}<div>#</div><div>\u6587\u4ef6\u540d</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div>`
   const items = tracks.map((t, i) => {
     const isPlaying = S.playingTid && t.id === S.playingTid
     const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
     const isVid = isVideoFile(t)
     const liked = isDefaultFavTrack(t.id)
-    return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
+    return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(nName(t))}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
   }).join('')
   return `<div class="song-table">${checks}${items}</div>`
 }
@@ -1233,13 +1250,12 @@ function _trackRowHTML(t, i, cols) {
   const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
   const isVid = isVideoFile(t)
   const liked = isDefaultFavTrack(t.id)
-  return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
+  return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(nName(t))}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
 }
 
 function tableVT(containerId, tracks, onClick) {
   const cols = S.selMode ? '32px 40px 1.2fr 0.9fr 0.9fr 40px 60px 48px' : '40px 1.2fr 0.9fr 0.9fr 40px 60px 48px'
-  const header = S.selMode ?
-    `<div class="song-row-header" style="grid-template-columns:${cols}"><div class="song-row-check"></div><div>#</div><div>\u6807\u9898</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div>` : ''
+  const header = `<div class="song-row-header" style="grid-template-columns:${cols}">${S.selMode ? '<div class="song-row-check"></div>' : ''}<div>#</div><div>\u6587\u4ef6\u540d</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div>`
   const html = `<div class="song-table">${header}<div class="vl-container" id="${containerId}"></div></div>`
   requestAnimationFrame(() => {
     if (!tracks.length) {
@@ -1298,7 +1314,7 @@ function renderFolderNode(node) {
   if (node.tracks.length > 0) {
     const allTracks = [...node.tracks]
     pl = allTracks
-    html += `<div class="section-title" style="margin-top:${validChildren.length > 0 ? '24px' : '0'}">\u97f3\u4e50<span>${allTracks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pfolder="${esc(node.path)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><div class="song-table" id="vl-songs"></div>`
+    html += `<div class="section-title" style="margin-top:${validChildren.length > 0 ? '24px' : '0'}">\u97f3\u4e50<span>${allTracks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pfolder="${esc(node.path)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><div class="song-table"><div class="song-row-header" style="grid-template-columns:40px 1.2fr 0.9fr 0.9fr 40px 60px 48px"><div>#</div><div>\u6587\u4ef6\u540d</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div><div id="vl-songs"></div></div>`
   }
   $('content-area').innerHTML = html || '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u7a7a\u6587\u4ef6\u5939</h3></div>'
   if (node.tracks.length > 0) {
@@ -1308,7 +1324,7 @@ function renderFolderNode(node) {
       const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
       const isVid = isVideoFile(t)
       const liked = isDefaultFavTrack(t.id)
-      return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}"><div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(t.name)}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
+      return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}"><div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(nName(t))}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
     }, (tid, keepView) => { const idx = pl.findIndex(t => t.id === tid); if (idx >= 0) playT(idx, keepView) })
   }
 }
@@ -1358,7 +1374,7 @@ function renderLrcContent() {
   if (!container) return
   const cd = t ? (t.coverData || t.albumCoverData) : null
   const lrcHtml = buildLrcLines(lrc)
-  container.innerHTML = t ? `<div class="lyrics-page-actions"><button class="lyrics-action-btn" data-lact="folder">\u6240\u5728\u6587\u4ef6\u5939</button><button class="lyrics-action-btn" data-lact="copy">\u590d\u5236\u8def\u5f84</button></div><div class="lyrics-content-layout"><div class="lyrics-content-left"><div class="lyrics-content-cover">${cd ? `<img src="${cd}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg></div>'}</div></div><div class="lyrics-content-right"><div class="lyrics-content-info"><div class="lc-title">${esc(t.name)}</div><div class="lc-artist">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}${isVideoFile(t) ? ' \u00b7 \u89c6\u9891-\u4ec5\u97f3\u9891\u6a21\u5f0f' : ''}</div></div><div class="lyrics-tab-btns"><button class="lyrics-tab-btn${activeLrcTab === 'lyrics' ? ' active' : ''}" data-ltab="lyrics">\u6b4c\u8bcd</button><button class="lyrics-tab-btn${activeLrcTab === 'meta' ? ' active' : ''}" data-ltab="meta">\u4fe1\u606f</button></div><div class="lyrics-container-wrapper"><div class="lyrics-lines-scroll${activeLrcTab !== 'lyrics' ? ' hidden' : ''}" id="lyrics-lines-scroll">${lrcHtml || '<div class="lc-empty">\u6682\u65e0\u6b4c\u8bcd</div>'}</div><div class="lyrics-meta-panel${activeLrcTab !== 'meta' ? ' hidden' : ''}" id="lyrics-meta-panel"><div class="meta-row"><span class="meta-label">\u6807\u9898</span><span class="meta-value">${esc(t.name)}</span></div><div class="meta-row"><span class="meta-label">\u827a\u672f\u5bb6</span><span class="meta-value">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}</span></div><div class="meta-row"><span class="meta-label">\u4e13\u8f91</span><span class="meta-value">${esc(t.album || '')}</span></div><div class="meta-row"><span class="meta-label">\u683c\u5f0f</span><span class="meta-value">${t.format.toUpperCase()}${isVideoFile(t) ? ' (\u89c6\u9891)' : ''}</span></div><div class="meta-row"><span class="meta-label">\u65f6\u957f</span><span class="meta-value">${fmtTime(t.duration)}</span></div><div class="meta-row"><span class="meta-label">\u6587\u4ef6</span><span class="meta-value">${esc(t.path)}</span></div></div></div></div></div>` : '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u672a\u5728\u64ad\u653e</h3></div>'
+  container.innerHTML = t ? `<div class="lyrics-page-actions"><button class="lyrics-action-btn" data-lact="folder">\u6240\u5728\u6587\u4ef6\u5939</button><button class="lyrics-action-btn" data-lact="copy">\u590d\u5236\u8def\u5f84</button></div><div class="lyrics-content-layout"><div class="lyrics-content-left"><div class="lyrics-content-cover">${cd ? `<img src="${cd}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg></div>'}</div></div><div class="lyrics-content-right"><div class="lyrics-content-info"><div class="lc-title">${esc(nName(t))}</div><div class="lc-artist">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}${isVideoFile(t) ? ' \u00b7 \u89c6\u9891-\u4ec5\u97f3\u9891\u6a21\u5f0f' : ''}</div></div><div class="lyrics-tab-btns"><button class="lyrics-tab-btn${activeLrcTab === 'lyrics' ? ' active' : ''}" data-ltab="lyrics">\u6b4c\u8bcd</button><button class="lyrics-tab-btn${activeLrcTab === 'meta' ? ' active' : ''}" data-ltab="meta">\u4fe1\u606f</button></div><div class="lyrics-container-wrapper"><div class="lyrics-lines-scroll${activeLrcTab !== 'lyrics' ? ' hidden' : ''}" id="lyrics-lines-scroll">${lrcHtml || '<div class="lc-empty">\u6682\u65e0\u6b4c\u8bcd</div>'}</div><div class="lyrics-meta-panel${activeLrcTab !== 'meta' ? ' hidden' : ''}" id="lyrics-meta-panel"><div class="meta-row"><span class="meta-label">\u6587\u4ef6\u540d</span><span class="meta-value">${esc(nName(t))}</span></div><div class="meta-row"><span class="meta-label">\u827a\u672f\u5bb6</span><span class="meta-value">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}</span></div><div class="meta-row"><span class="meta-label">\u4e13\u8f91</span><span class="meta-value">${esc(t.album || '')}</span></div><div class="meta-row"><span class="meta-label">\u683c\u5f0f</span><span class="meta-value">${t.format.toUpperCase()}${isVideoFile(t) ? ' (\u89c6\u9891)' : ''}</span></div><div class="meta-row"><span class="meta-label">\u65f6\u957f</span><span class="meta-value">${fmtTime(t.duration)}</span></div><div class="meta-row"><span class="meta-label">\u6587\u4ef6</span><span class="meta-value">${esc(t.path)}</span></div></div></div></div></div>` : '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u672a\u5728\u64ad\u653e</h3></div>'
   const lines = container.querySelectorAll('.lc-line')
   const scroll = $('lyrics-lines-scroll')
   if (scroll && !scroll.dataset.manualBound) {
@@ -1691,7 +1707,7 @@ async function importFolder() {
 }
 
 async function rescan() {
-  if (_scanRunning) return
+  if (_scanRunning) { _pendingRescan = true; return }
   if (!fp.length) {
     S.af = []; S.all = []; S.folderTree = []; S.folderStack = []; S._folderMeta = null
     pl = []; S.playingTid = null; S.tI = -1; audio.pause()
@@ -1699,7 +1715,8 @@ async function rescan() {
     renderAll(); schedSave()
     return
   }
-  const tid = addT('\u91cd\u65b0\u626b\u63cf...')
+  const tid = addT(_watcherTriggered ? '\u6587\u4ef6\u53d8\u52a8\uff0c\u66f4\u65b0\u4e2d...' : '\u91cd\u65b0\u626b\u63cf...')
+  _watcherTriggered = false
   api.removeScanProgressListener()
   const removeProgress = api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
   const removeStage = api.onScannerStage((stage) => { const e = document.getElementById(tid + '-status'); if (e) e.textContent = stage })
@@ -1733,7 +1750,7 @@ async function rescan() {
     console.timeEnd('[scan] applyAndRender')
     console.timeEnd('[total] scan->show')
   } catch (e) { updT(tid, '\u5931\u8d25', 0, e.message) }
-  finally { _scanRunning = false; removeProgress?.(); removeStage?.() }
+  finally { _scanRunning = false; removeProgress?.(); removeStage?.(); if (_pendingRescan) { _pendingRescan = false; rescan() } }
 }
 
 // === Panel ===
@@ -1741,7 +1758,7 @@ function renderPanel() {
   const b = $('panel-body')
   if (!pl.length) { b.innerHTML = '<div class="panel-empty">\u64ad\u653e\u5217\u8868\u4e3a\u7a7a</div>'; $('panel-count').textContent = '0 \u9996'; return }
   $('panel-count').textContent = pl.length + ' \u9996'
-  b.innerHTML = pl.map((t, i) => `<div class="panel-track${i === nI ? ' playing' : ''}" data-pidx="${i}"><span class="pt-idx">${i + 1}</span><div class="pt-info"><div class="pt-title">${esc(t.name)}</div><div class="pt-artist">${esc(t.metaArtist || t.artist)}</div></div></div>`).join('')
+  b.innerHTML = pl.map((t, i) => `<div class="panel-track${i === nI ? ' playing' : ''}" data-pidx="${i}"><span class="pt-idx">${i + 1}</span><div class="pt-info"><div class="pt-title">${esc(nName(t))}</div><div class="pt-artist">${esc(t.metaArtist || t.artist)}</div></div></div>`).join('')
 }
 
 function playAll(tracks) { if (!tracks || !tracks.length) return; pl = tracks; syncPlayingState(); if (S.view !== 'lyrics') S.prevView = S.view; S.view = 'lyrics'; activeLrcTab = 'lyrics'; playT(0); renderPanel() }
@@ -2885,7 +2902,7 @@ $('btn-playlist-panel').addEventListener('click', () => {
     const playerBar = $('player-bar')
     const playerHeight = playerBar ? playerBar.offsetHeight : 80
     panel.style.left = (rect.right + 4) + 'px'
-    panel.style.bottom = (playerHeight + 8) + 'px'
+    panel.style.bottom = (playerHeight + 60) + 'px'
   }
   panel.classList.remove('hidden')
   renderPanel()
