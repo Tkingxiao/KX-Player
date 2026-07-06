@@ -707,6 +707,15 @@ ipcMain.handle('file:readTextFile', async (_event, filePath: string) => {
   }
 })
 
+ipcMain.handle('file:listDir', async (_event, dirPath: string) => {
+  try {
+    const entries = await fsp.readdir(dirPath, { withFileTypes: false })
+    return entries
+  } catch {
+    return []
+  }
+})
+
 ipcMain.handle('dialog:selectBgImage', async () => {
   if (!mainWindow) return null
   const result = await dialog.showOpenDialog(mainWindow, {

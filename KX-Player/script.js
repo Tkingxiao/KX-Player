@@ -33,6 +33,112 @@ let _loadTGeneration = 0
 let stopWatchingFs = null
 let _watchPollTimer = null
 let _watcherTriggered = false
+
+// === Table column sort & resize state ===
+// Resizable columns: artist, album, duration (indices into the non-check columns)
+// Default widths in px for resizable columns
+const _COL_DEFAULTS = { artist: 200, album: 200, duration: 60 }
+const _COL_MIN = { artist: 80, album: 80, duration: 48, name: 120 }
+let _colWidths = { ..._COL_DEFAULTS } // persisted via schedSave
+let _sortCol = null // 'name' | 'artist' | 'album' | 'duration' | null
+let _sortDir = 'asc' // 'asc' | 'desc'
+
+function _buildColString() {
+  const a = _colWidths.artist + 'px'
+  const b = _colWidths.album + 'px'
+  const d = _colWidths.duration + 'px'
+  return S.selMode
+    ? `32px 40px 1fr ${a} ${b} 40px ${d} 48px`
+    : `40px 1fr ${a} ${b} 40px ${d} 48px`
+}
+
+function _sortArrow(col) {
+  if (_sortCol !== col) return ''
+  return _sortDir === 'asc'
+    ? ' <span class="sort-arrow">\u25B2</span>'
+    : ' <span class="sort-arrow">\u25BC</span>'
+}
+
+function _tableHeaderHTML() {
+  const cols = _buildColString()
+  const check = S.selMode ? '<div class="song-row-check"></div>' : ''
+  return `<div class="song-row-header" style="grid-template-columns:${cols}">${check}<div class="col-hdr" data-sort-col="idx">#</div><div class="col-hdr col-hdr-sort" data-sort-col="name">\u6587\u4ef6\u540D${_sortArrow('name')}<div class="col-resize-handle" data-resize-col="name"></div></div><div class="col-hdr col-hdr-sort" data-sort-col="artist">\u827A\u672F\u5BB6${_sortArrow('artist')}<div class="col-resize-handle" data-resize-col="artist"></div></div><div class="col-hdr col-hdr-sort" data-sort-col="album">\u4E13\u8F91${_sortArrow('album')}<div class="col-resize-handle" data-resize-col="album"></div></div><div class="col-hdr"></div><div class="col-hdr col-hdr-sort" data-sort-col="duration">\u65F6\u957F${_sortArrow('duration')}<div class="col-resize-handle" data-resize-col="duration"></div></div><div class="col-hdr"></div></div>`
+}
+
+function _applySortToTracks(tracks) {
+  if (!_sortCol) return tracks
+  const dir = _sortDir === 'asc' ? 1 : -1
+  const sorted = [...tracks]
+  sorted.sort((a, b) => {
+    let va, vb
+    switch (_sortCol) {
+      case 'name': va = nName(a).toLowerCase(); vb = nName(b).toLowerCase(); break
+      case 'artist': va = (a.metaArtist || a.artist || '').toLowerCase(); vb = (b.metaArtist || b.artist || '').toLowerCase(); break
+      case 'album': va = (a.album || '').toLowerCase(); vb = (b.album || '').toLowerCase(); break
+      case 'duration': va = a.duration || 0; vb = b.duration || 0; return (va - vb) * dir
+      default: return 0
+    }
+    if (va < vb) return -1 * dir
+    if (va > vb) return 1 * dir
+    return 0
+  })
+  return sorted
+}
+
+function _initColumnHandlers(rootEl) {
+  if (!rootEl) return
+  // Sort click handlers
+  rootEl.querySelectorAll('.col-hdr-sort').forEach(el => {
+    el.addEventListener('click', (e) => {
+      if (e.target.classList.contains('col-resize-handle')) return
+      const col = el.dataset.sortCol
+      if (_sortCol === col) { _sortDir = _sortDir === 'asc' ? 'desc' : 'asc' }
+      else { _sortCol = col; _sortDir = 'asc' }
+      renderAll()
+    })
+  })
+  // Resize drag handlers
+  rootEl.querySelectorAll('.col-resize-handle').forEach(handle => {
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const col = handle.dataset.resizeCol
+      const startX = e.clientX
+      const startWidth = _colWidths[col]
+      const minWidth = _COL_MIN[col] || 60
+      const cols = _buildColString().split(' ')
+      // Find which column index this is for adjusting the flex column
+      const header = handle.closest('.song-row-header')
+      const headerRect = header.getBoundingClientRect()
+      const totalWidth = headerRect.width - 32 // account for padding
+      function onMove(ev) {
+        const delta = ev.clientX - startX
+        const newWidth = Math.max(minWidth, startWidth + delta)
+        _colWidths[col] = newWidth
+        const newCols = _buildColString()
+        // Update all grid rows in the table
+        const table = rootEl.querySelector('.song-table')
+        if (table) {
+          table.querySelectorAll('.song-row-header, .song-row').forEach(row => {
+            row.style.gridTemplateColumns = newCols
+          })
+        }
+      }
+      function onUp() {
+        document.removeEventListener('mousemove', onMove)
+        document.removeEventListener('mouseup', onUp)
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+        schedSave()
+      }
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+      document.addEventListener('mousemove', onMove)
+      document.addEventListener('mouseup', onUp)
+    })
+  })
+}
+
 let lyricsManualScrollUntil = 0
 let dsdState = {
   active: false,
@@ -222,7 +328,7 @@ async function saveS() {
       dur: S.dur, vol: S.vol, muted: S.muted, mode: S.mode, pls: S.pls, aPl: S.aPl, aF: S.aF,
       bgBlur: S.bgBlur, selMode: S.selMode, folderStack: S.folderStack, folderSort: S.folderSort, folderView: S.folderView, _imgEditState: S._imgEditState, listTextColor: S.listTextColor,
       titlebarOpacity: S.titlebarOpacity, playerOpacity: S.playerOpacity, sidebarOpacity: S.sidebarOpacity,
-      playingTid: S.playingTid
+      playingTid: S.playingTid, _colWidths, _sortCol, _sortDir
     }))
     // Sync-save to main process FIRST for immediate disk persistence
     api.syncSaveSettings(data)
@@ -252,6 +358,13 @@ async function loadS() {
     if (Array.isArray(s.folderStack)) S.folderStack = s.folderStack
     if (s.folderSort) S.folderSort = s.folderSort
     if (s.folderView) S.folderView = s.folderView
+    if (s._colWidths && typeof s._colWidths === 'object') {
+      for (const k of Object.keys(_COL_DEFAULTS)) {
+        if (typeof s._colWidths[k] === 'number' && s._colWidths[k] >= (_COL_MIN[k] || 40)) _colWidths[k] = s._colWidths[k]
+      }
+    }
+    if (s._sortCol && ['name','artist','album','duration'].includes(s._sortCol)) _sortCol = s._sortCol
+    if (s._sortDir && (s._sortDir === 'asc' || s._sortDir === 'desc')) _sortDir = s._sortDir
 
     // Load background image from app data directory file
     if (S.bgPath) {
@@ -765,6 +878,96 @@ async function loadT(idx) {
   S.tI = idx; S.playing = true
 }
 
+// Extract trailing track identifier suffix from a filename
+// e.g. "H!! 啊宇佐美酱_DAY01_trk01" → "_DAY01_trk01"
+// e.g. "song_track03" → "_track03", "audio_02" → "_02"
+function _extractTrackSuffix(name) {
+  // Match patterns like _trk01, _track01, _DAY01_trk01, _Disc1_Track02, _01 etc.
+  const m = name.match(/((?:[_\-](?:DAY|Disc|CD|Track|trk|part|vol|No|No\.|P)\w*)*[_\-](?:trk|track|Disc|CD|DAY|part|vol|No\.?|P)\w*[_\w]*?)$/i)
+  if (m) return m[1]
+  // Fallback: trailing _NNN or -NNN pattern
+  const m2 = name.match(/([_\-]\d{2,4})$/)
+  if (m2) return m2[1]
+  return ''
+}
+
+// Find the best matching lyrics file in a directory listing
+// Returns the filename (without directory) of the best match, or null
+function _findBestLyricsMatch(audioNameWithoutExt, audioExt, dirEntries) {
+  const lrcExts = new Set(['.lrc', '.vtt', '.srt'])
+  const candidates = []
+  for (const entry of dirEntries) {
+    const lower = entry.toLowerCase()
+    const dotIdx = lower.lastIndexOf('.')
+    if (dotIdx < 0) continue
+    const entryExt = lower.slice(dotIdx)
+    const entryName = entry.slice(0, dotIdx)
+    // Check for lyrics file extensions (including double-ext like .mp3.lrc)
+    let isLyricsFile = false
+    if (lrcExts.has(entryExt)) {
+      isLyricsFile = true
+    } else if (lrcExts.has(lower.slice(lower.lastIndexOf('.', dotIdx - 1)))) {
+      // double extension pattern: song.mp3.lrc
+      isLyricsFile = true
+    }
+    if (!isLyricsFile) continue
+    candidates.push({ filename: entry, nameWithoutExt: entryName, ext: entryExt })
+  }
+  if (candidates.length === 0) return null
+
+  // 1. Exact name match
+  for (const c of candidates) {
+    if (c.nameWithoutExt === audioNameWithoutExt || c.nameWithoutExt === audioNameWithoutExt + audioExt) return c
+  }
+
+  // 2. Match by track suffix
+  const audioSuffix = _extractTrackSuffix(audioNameWithoutExt)
+  if (audioSuffix) {
+    let bestMatch = null
+    let bestScore = 0
+    for (const c of candidates) {
+      if (c.nameWithoutExt.endsWith(audioSuffix)) {
+        // Score by length of common suffix (longer = better match)
+        const score = audioSuffix.length
+        if (score > bestScore) { bestScore = score; bestMatch = c }
+      }
+    }
+    if (bestMatch) return bestMatch
+  }
+
+  // 3. Longest common suffix matching (for different-language titles with same suffix)
+  let bestMatch = null
+  let bestCommonLen = 0
+  for (const c of candidates) {
+    // Compute common suffix length
+    let commonLen = 0
+    const a = audioNameWithoutExt.toLowerCase()
+    const b = c.nameWithoutExt.toLowerCase()
+    for (let i = 1; i <= Math.min(a.length, b.length); i++) {
+      if (a[a.length - i] === b[b.length - i]) commonLen = i
+      else break
+    }
+    // Require at least 5 chars of common suffix and it should start at a separator
+    if (commonLen >= 5 && commonLen > bestCommonLen) {
+      const suffixStart = audioNameWithoutExt.length - commonLen
+      if (suffixStart > 0 && /[_\-]/.test(audioNameWithoutExt[suffixStart])) {
+        bestCommonLen = commonLen
+        bestMatch = c
+      }
+    }
+  }
+  if (bestMatch) return bestMatch
+
+  // 4. If only one lyrics file and only one audio-like file, match them
+  if (candidates.length === 1) {
+    const audioExts = new Set(['.mp3','.flac','.wav','.ogg','.m4a','.aac','.wma','.opus','.ape','.wv','.aiff','.dsf','.dff','.mp4','.mkv'])
+    const audioFiles = dirEntries.filter(e => audioExts.has(e.slice(e.lastIndexOf('.')).toLowerCase()))
+    if (audioFiles.length === 1) return candidates[0]
+  }
+
+  return null
+}
+
 async function loadLrcForTrack(t) {
   lrc = []
   _lastLrcActiveIdx = -1
@@ -781,23 +984,41 @@ async function loadLrcForTrack(t) {
     let lyricsContent = null
     let subtitleFormat = null // null = LRC, 'vtt', 'srt'
 
+    // 1. Try exact name match first (fast path)
     const lrcPath = dir + sep + nameWithoutExt + '.lrc'
     if (await api.fileExists(lrcPath)) {
       lyricsContent = await api.readTextFile(lrcPath)
     }
 
-    // If no LRC, try VTT and SRT files
+    // 2. If no exact match, use smart fuzzy matching by listing directory
+    if (!lyricsContent) {
+      const dirEntries = await api.listDir(dir)
+      if (dirEntries && dirEntries.length > 0) {
+        const match = _findBestLyricsMatch(nameWithoutExt, ext, dirEntries)
+        if (match) {
+          const matchPath = dir + sep + match.filename
+          const matchLower = match.filename.toLowerCase()
+          const matchExt = matchLower.slice(matchLower.lastIndexOf('.'))
+          if (matchExt === '.lrc') {
+            lyricsContent = await api.readTextFile(matchPath)
+          } else if (matchExt === '.vtt' || matchExt === '.srt') {
+            lyricsContent = await api.readTextFile(matchPath)
+            subtitleFormat = matchExt.slice(1)
+          }
+        }
+      }
+    }
+
+    // 3. If still no LRC, try VTT and SRT with exact name
     if (!lyricsContent) {
       const subtitleExts = ['.vtt', '.srt']
       for (const subExt of subtitleExts) {
-        // For audio files like song.mp3, try song.mp3.vtt (double extension pattern)
         const doublePath = dir + sep + baseName + subExt
         if (await api.fileExists(doublePath)) {
           lyricsContent = await api.readTextFile(doublePath)
-          subtitleFormat = subExt.slice(1) // 'vtt' or 'srt'
+          subtitleFormat = subExt.slice(1)
           break
         }
-        // Also try song.vtt (single extension)
         const singlePath = dir + sep + nameWithoutExt + subExt
         if (await api.fileExists(singlePath)) {
           lyricsContent = await api.readTextFile(singlePath)
@@ -953,6 +1174,7 @@ function updPlayBtn() { $('icon-play').style.display = S.playing ? 'none' : ''; 
 function renderAll() {
   invalidateFavCache()
   renderSB(); renderContent()
+  requestAnimationFrame(() => _initColumnHandlers($('content-area')))
   renderPanel(); updPlayBtn(); syncAllListsPlaying(); schedSave()
 }
 
@@ -1092,11 +1314,13 @@ function renderFolderAll() {
     const html = isList ? validRoots.map(n => folderListRowHTML(n)).join('') : validRoots.map(n => folderCardHTML(n)).join('')
     const containerCls = isList ? 'folder-list' : 'artist-grid'
     ca.innerHTML = `<div class="section-title">\u6587\u4ef6\u5939<span>${validRoots.length} \u4e2a\u6587\u4ef6\u5939</span></div>${folderSortBtnHTML()}<div class="${containerCls}">${html}</div>`
+    _restoreFolderScroll()
     return
   }
   const node = findNodeByPath(tree, S.folderStack[S.folderStack.length - 1])
   if (!node) { S.folderStack = []; renderFolderAll(); return }
   renderFolderNode(node)
+  _restoreFolderScroll()
 }
 
 function findCoverInNode(n) {
@@ -1118,19 +1342,14 @@ function folderCardHTML(n) {
 }
 
 function tableH(tracks) {
-  const cols = S.selMode ? '32px 40px 1.2fr 0.9fr 0.9fr 40px 60px 48px' : '40px 1.2fr 0.9fr 0.9fr 40px 60px 48px'
-  const checks = `<div class="song-row-header" style="grid-template-columns:${cols}">${S.selMode ? '<div class="song-row-check"></div>' : ''}<div>#</div><div>\u6587\u4ef6\u540d</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div>`
-  const items = tracks.map((t, i) => {
-    const isPlaying = S.playingTid && t.id === S.playingTid
-    const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
-    const isVid = isVideoFile(t)
-    const liked = isDefaultFavTrack(t.id)
-    return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}">${S.selMode ? `<div class="song-row-check"><input type="checkbox" data-tid="${t.id}" /></div>` : ''}<div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(nName(t))}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
-  }).join('')
-  return `<div class="song-table">${checks}${items}</div>`
+  const cols = _buildColString()
+  const header = _tableHeaderHTML()
+  const items = tracks.map((t, i) => _trackRowHTML(t, i, cols)).join('')
+  return `<div class="song-table">${header}${items}</div>`
 }
 
 function _trackRowHTML(t, i, cols) {
+  if (!cols) cols = _buildColString()
   const isPlaying = S.playingTid && t.id === S.playingTid
   const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
   const isVid = isVideoFile(t)
@@ -1139,8 +1358,8 @@ function _trackRowHTML(t, i, cols) {
 }
 
 function tableVT(containerId, tracks, onClick) {
-  const cols = S.selMode ? '32px 40px 1.2fr 0.9fr 0.9fr 40px 60px 48px' : '40px 1.2fr 0.9fr 0.9fr 40px 60px 48px'
-  const header = `<div class="song-row-header" style="grid-template-columns:${cols}">${S.selMode ? '<div class="song-row-check"></div>' : ''}<div>#</div><div>\u6587\u4ef6\u540d</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div>`
+  const cols = _buildColString()
+  const header = _tableHeaderHTML()
   const html = `<div class="song-table">${header}<div class="vl-container" id="${containerId}"></div></div>`
   requestAnimationFrame(() => {
     if (!tracks.length) {
@@ -1199,12 +1418,15 @@ function renderFolderNode(node) {
   if (node.tracks.length > 0) {
     const allTracks = [...node.tracks]
     pl = allTracks
-    html += `<div class="section-title" style="margin-top:${validChildren.length > 0 ? '24px' : '0'}">\u97f3\u4e50<span>${allTracks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pfolder="${esc(node.path)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><div class="song-table"><div class="song-row-header" style="grid-template-columns:40px 1.2fr 0.9fr 0.9fr 40px 60px 48px"><div>#</div><div>\u6587\u4ef6\u540d</div><div>\u827a\u672f\u5bb6</div><div>\u4e13\u8f91</div><div></div><div>\u65f6\u957f</div><div></div></div><div id="vl-songs"></div></div>`
+    const fCols = _buildColString()
+    const fHeader = _tableHeaderHTML()
+    html += `<div class="section-title" style="margin-top:${validChildren.length > 0 ? '24px' : '0'}">\u97f3\u4e50<span>${allTracks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pfolder="${esc(node.path)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><div class="song-table">${fHeader}<div id="vl-songs"></div></div>`
   }
   $('content-area').innerHTML = html || '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u7a7a\u6587\u4ef6\u5939</h3></div>'
   if (node.tracks.length > 0) {
+    const fCols = _buildColString()
     virtualList('vl-songs', [...node.tracks], 46, (t, i) => {
-      const cols = '40px 1.2fr 0.9fr 0.9fr 40px 60px 48px'
+      const cols = fCols
       const isPlaying = S.playingTid && t.id === S.playingTid
       const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
       const isVid = isVideoFile(t)
@@ -1214,21 +1436,38 @@ function renderFolderNode(node) {
   }
 }
 
+// Remember scroll position per folder level so going back restores it
+const _folderScrollPos = new Map()
+function _folderScrollKey() { return S.folderStack.join('\x00') }
+function _saveFolderScroll() {
+  const ca = $('content-area')
+  if (ca) _folderScrollPos.set(_folderScrollKey(), ca.scrollTop)
+}
+function _restoreFolderScroll() {
+  const ca = $('content-area')
+  if (!ca) return
+  const saved = _folderScrollPos.get(_folderScrollKey())
+  if (saved !== undefined) { ca.scrollTop = saved }
+}
+
 function navigateFolder(path) {
   const node = findNodeByPath(S.folderTree, path)
   if (!node) return
+  _saveFolderScroll()
   S.activeFp = node.path
   if (S.folderStack[S.folderStack.length - 1] !== node.path) S.folderStack.push(node.path)
   S.view = 'all'; renderAll(); schedSave()
 }
 
 function navigateFolderUp() {
+  _saveFolderScroll()
   if (S.folderStack.length <= 1) { S.folderStack = []; S.activeFp = null }
   else { S.folderStack.pop() }
   S.view = 'all'; renderAll(); schedSave()
 }
 
 function navigateFolderTo(path) {
+  _saveFolderScroll()
   if (!path) { S.folderStack = []; S.activeFp = null }
   else {
     const idx = S.folderStack.indexOf(path)
@@ -1341,6 +1580,23 @@ function markLyricsManualScroll(ms = 2200) {
 
 function isLyricsManualScrolling() {
   return Date.now() < lyricsManualScrollUntil
+}
+
+function _scrollLyricToCenter(lineEl, behavior = 'smooth') {
+  const scroll = $('lyrics-lines-scroll')
+  if (!scroll || !lineEl) return
+  const containerH = scroll.clientHeight
+  const lineH = lineEl.clientHeight
+  const layout = scroll.closest('.lyrics-content-layout')
+  const layoutH = layout ? layout.clientHeight : containerH
+  const layoutCY = layoutH / 2
+  const scrollRect = scroll.getBoundingClientRect()
+  const layoutRect = layout ? layout.getBoundingClientRect() : scrollRect
+  const scrollTopOffset = scrollRect.top - layoutRect.top
+  const scrollTarget = lineEl.offsetTop + (lineH / 2) + scrollTopOffset - layoutCY
+  const maxScroll = scroll.scrollHeight - containerH
+  const finalScroll = Math.max(0, Math.min(scrollTarget, maxScroll))
+  scroll.scrollTo({ top: finalScroll, behavior })
 }
 
 function clearRecents() {
@@ -1601,8 +1857,10 @@ async function importFolder() {
   finally { _scanRunning = false; removeProgress?.() }
 }
 
+let _scanGeneration = 0
 async function rescan() {
-  if (_scanRunning) { _pendingRescan = true; return }
+  // If a scan is already running, bump generation to invalidate it and start fresh
+  if (_scanRunning) { _scanGeneration++; _pendingRescan = true; return }
   if (!fp.length) {
     S.all = []; S.folderTree = []; S.folderStack = []; S._folderMeta = null
     pl = []; S.playingTid = null; S.tI = -1; audio.pause()
@@ -1610,17 +1868,26 @@ async function rescan() {
     renderAll(); schedSave()
     return
   }
-  const tid = addT(_watcherTriggered ? '\u6587\u4ef6\u53d8\u52a8\uff0c\u66f4\u65b0\u4e2d...' : '\u91cd\u65b0\u626b\u63cf...')
+  const isWatchTriggered = _watcherTriggered
+  const tid = addT(isWatchTriggered ? '\u6587\u4ef6\u53d8\u52a8\uff0c\u66f4\u65b0\u4e2d...' : '\u91cd\u65b0\u626b\u63cf...')
   _watcherTriggered = false
+  _scanRunning = true
+  const thisGen = ++_scanGeneration
   api.removeScanProgressListener()
-  const removeProgress = api.onScannerProgress((data) => { updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
-  const removeStage = api.onScannerStage((stage) => { const e = document.getElementById(tid + '-status'); if (e) e.textContent = stage })
+  const removeProgress = api.onScannerProgress((data) => { if (_scanGeneration === thisGen) updT(tid, `${data.stage || '\u89e3\u6790\u4e2d...'}`, Math.round((data.completed / data.total) * 100), `${data.completed}/${data.total}`) })
+  const removeStage = api.onScannerStage((stage) => { if (_scanGeneration === thisGen) { const e = document.getElementById(tid + '-status'); if (e) e.textContent = stage } })
   try {
     const currentTrackId = pl.length > 0 && S.tI >= 0 ? pl[S.tI]?.id : null
     console.time('[total] scan->show')
     console.time('[scan] IPC wait')
-    const r = await api.scanFoldersWithProgress(fp)
+    // Use incremental scan for watcher-triggered changes, full scan for manual rescan
+    const r = isWatchTriggered ? await api.scanFoldersIncremental(fp) : await api.scanFoldersWithProgress(fp)
     console.timeEnd('[scan] IPC wait')
+    // Check if this scan was superseded by a newer one
+    if (_scanGeneration !== thisGen) {
+      console.log('[scan] generation mismatch, discarding stale results')
+      return
+    }
     console.time('[scan] applyAndRender')
     const at = applyScanResult(r)
     const allIds = new Set(at.map(t => t.id))
@@ -1644,8 +1911,12 @@ async function rescan() {
     renderAll()
     console.timeEnd('[scan] applyAndRender')
     console.timeEnd('[total] scan->show')
-  } catch (e) { updT(tid, '\u5931\u8d25', 0, e.message) }
-  finally { _scanRunning = false; removeProgress?.(); removeStage?.(); if (_pendingRescan) { _pendingRescan = false; rescan() } }
+  } catch (e) { if (_scanGeneration === thisGen) updT(tid, '\u5931\u8d25', 0, e.message) }
+  finally {
+    _scanRunning = false; removeProgress?.(); removeStage?.()
+    if (_pendingRescan && _scanGeneration === thisGen) { _pendingRescan = false; rescan() }
+    else { _pendingRescan = false }
+  }
 }
 
 // === Panel ===
@@ -2088,6 +2359,9 @@ $('content-area').addEventListener('click', e => {
       } else {
         audio.currentTime = time.time
       }
+      // Immediately scroll clicked lyric line to center (no delay)
+      lyricsManualScrollUntil = 0
+      _scrollLyricToCenter(lcl, 'auto')
     }
     return
   }
@@ -2542,25 +2816,25 @@ audio.addEventListener('timeupdate', () => {
     if (activeIdx >= 0 && scroll && !isLyricsManualScrolling()) {
       requestAnimationFrame(() => {
         const activeLine = scroll.querySelector(`.lc-line[data-lidx="${activeIdx}"]`)
-        if (activeLine) {
-          const containerH = scroll.clientHeight
-          const lineH = activeLine.clientHeight
-          const layout = scroll.closest('.lyrics-content-layout')
-          const layoutH = layout ? layout.clientHeight : containerH
-          const layoutCY = layoutH / 2
-          const scrollRect = scroll.getBoundingClientRect()
-          const layoutRect = layout ? layout.getBoundingClientRect() : scrollRect
-          const scrollTopOffset = scrollRect.top - layoutRect.top
-          const scrollTarget = activeLine.offsetTop + (lineH / 2) + scrollTopOffset - layoutCY
-          const maxScroll = scroll.scrollHeight - containerH
-          const finalScroll = Math.max(0, Math.min(scrollTarget, maxScroll))
-          scroll.scrollTo({ top: finalScroll, behavior: 'smooth' })
-        }
+        if (activeLine) _scrollLyricToCenter(activeLine, 'smooth')
       })
     }
   }
 })
-audio.addEventListener('loadedmetadata', () => { S.dur = audio.duration; _progressDuration.textContent = fmtTime(S.dur) })
+audio.addEventListener('loadedmetadata', () => {
+  S.dur = audio.duration
+  _progressDuration.textContent = fmtTime(S.dur)
+  // Write back real duration to track object (fixes video files showing 0:00 in list)
+  if (pl.length > 0 && S.tI >= 0) {
+    const ct = pl[S.tI]
+    if (ct && !ct.duration && audio.duration > 0) {
+      ct.duration = Math.round(audio.duration)
+      // Update the duration cell in the visible list row
+      const row = document.querySelector(`.song-row[data-tid="${ct.id}"] .song-row-duration`)
+      if (row) row.textContent = fmtTime(ct.duration)
+    }
+  }
+})
 audio.addEventListener('ended', () => { if (!dsdState.active) hEnd() })
 audio.addEventListener('error', () => { if (!dsdState.active) { S.playing = false; updPlayBtn() } })
 
@@ -2915,6 +3189,40 @@ async function init() {
           _resizeRAF = null
         })
       }
+    })
+    // When window becomes visible again, force-update all UI components
+    // so user doesn't see stale state (progress bar, lyrics, etc.)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return
+      // Update progress bar from current audio state
+      if (!dsdState.active && audio.duration) {
+        S.cTime = audio.currentTime
+        const p = S.dur ? (S.cTime / S.dur) * 100 : 0
+        _progressFill.style.width = p + '%'
+        _progressHandle.style.left = p + '%'
+        _progressCurrent.textContent = fmtTime(S.cTime)
+      }
+      // Re-render lyrics if visible
+      if (S.view === 'lyrics' && activeLrcTab === 'lyrics' && lrc.length) {
+        const scroll = $('lyrics-lines-scroll')
+        if (scroll) {
+          const lines = scroll.querySelectorAll('.lc-line')
+          let activeIdx = -1
+          for (let i = lrc.length - 1; i >= 0; i--) {
+            if (S.cTime >= lrc[i].time) { activeIdx = i; break }
+          }
+          // Update active class
+          lines.forEach((l, i) => l.classList.toggle('active', i === activeIdx))
+          _lastLrcActiveIdx = activeIdx
+          // Scroll to center
+          if (activeIdx >= 0) {
+            const activeLine = scroll.querySelector(`.lc-line[data-lidx="${activeIdx}"]`)
+            if (activeLine) _scrollLyricToCenter(activeLine, 'auto')
+          }
+        }
+      }
+      // Sync playing state visuals
+      syncPlayingState()
     })
     if (S.all.length) pl = S.all
     syncPlayingState()

@@ -1,6 +1,6 @@
 {
   "name": "kx-music-player",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "KX音乐播放器 - 本地桌面音乐播放器",
   "main": "dist-electron/main.js",
   "scripts": {
