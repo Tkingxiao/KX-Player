@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   readAsDataURL: (filePath: string) => ipcRenderer.invoke('file:readAsDataURL', filePath),
   readTextFile: (filePath: string) => ipcRenderer.invoke('file:readTextFile', filePath),
   fileExists: (filePath: string) => ipcRenderer.invoke('file:exists', filePath),
+  listDir: (dirPath: string) => ipcRenderer.invoke('file:listDir', dirPath),
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings: unknown) => ipcRenderer.invoke('settings:save', settings),
   syncSaveSettings: (settings: unknown) => ipcRenderer.send('settings:syncSave', settings),

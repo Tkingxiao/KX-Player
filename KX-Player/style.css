@@ -131,6 +131,12 @@ button:active { transform: scale(0.96); }
 
 .song-table { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 .song-row-header { display: grid; gap: 6px; padding: 10px 16px; background: transparent; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-sub); align-items: center; }
+.col-hdr { position: relative; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
+.col-hdr-sort { cursor: pointer; transition: color 0.15s; }
+.col-hdr-sort:hover { color: var(--text); }
+.sort-arrow { font-size: 9px; vertical-align: middle; margin-left: 2px; }
+.col-resize-handle { position: absolute; right: -4px; top: -6px; bottom: -6px; width: 8px; cursor: col-resize; z-index: 2; }
+.col-resize-handle:hover { background: var(--accent); opacity: 0.3; border-radius: 2px; }
 .song-row { display: grid; gap: 6px; padding: 8px 16px; align-items: center; cursor: pointer; transition: background 0.15s; border-bottom: 1px solid var(--border); }
 .song-row:last-child { border-bottom: none; }
 .song-row:nth-child(even) { background: rgba(0,0,0,0.03); }
