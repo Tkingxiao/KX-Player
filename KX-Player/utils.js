@@ -5,21 +5,49 @@ export const VIDEO_EXTS = new Set(['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'w
 
 // === Fuzzy Search ===
 let _sify = null, _pinyinFn = null
+const _normCache = new Map()
+const _initialsCache = new Map()
+const MAX_SEARCH_CACHE = 20000
+
+function _clearSearchCaches() {
+  _normCache.clear()
+  _initialsCache.clear()
+}
+
+function _cacheValue(cache, key, compute) {
+  if (cache.has(key)) {
+    const value = cache.get(key)
+    cache.delete(key)
+    cache.set(key, value)
+    return value
+  }
+  const value = compute()
+  cache.set(key, value)
+  if (cache.size > MAX_SEARCH_CACHE) cache.delete(cache.keys().next().value)
+  return value
+}
+
 export async function _loadSearchLibs() {
   try { const m = await import('chinese-conv'); _sify = m.sify } catch { _sify = (s) => s }
   try { const m = await import('pinyin-pro'); _pinyinFn = m.pinyin } catch { _pinyinFn = null }
+  _clearSearchCaches()
 }
 _loadSearchLibs()
 
 function _normalizeForSearch(s) {
   if (!s) return ''
-  return (_sify ? _sify(s) : s).toLowerCase()
+  const raw = String(s)
+  return _cacheValue(_normCache, raw, () => (_sify ? _sify(raw) : raw).toLowerCase())
 }
 
 function _getPinyinInitials(s) {
-  if (!s || !_pinyinFn) return s ? s.toLowerCase() : ''
-  const simplified = _sify ? _sify(s) : s
-  return _pinyinFn(simplified, { pattern: 'first', toneType: 'none', type: 'array' }).join('')
+  if (!s) return ''
+  const raw = String(s)
+  return _cacheValue(_initialsCache, raw, () => {
+    if (!_pinyinFn) return raw.toLowerCase()
+    const simplified = _sify ? _sify(raw) : raw
+    return _pinyinFn(simplified, { pattern: 'first', toneType: 'none', type: 'array' }).join('')
+  })
 }
 
 /** Fuzzy match: returns true if query matches text via direct substring or pinyin initials. */
@@ -28,9 +56,9 @@ export function fuzzyMatch(text, query) {
   const nt = _normalizeForSearch(text)
   const nq = _normalizeForSearch(query)
   if (nt.includes(nq)) return true
-  const textInitials = _getPinyinInitials(nt)
   const queryInitials = _getPinyinInitials(nq)
   if (!queryInitials) return false
+  const textInitials = _getPinyinInitials(nt)
   if (textInitials.startsWith(queryInitials)) return true
   let ti = 0
   for (let qi = 0; qi < queryInitials.length && ti < textInitials.length; qi++) {

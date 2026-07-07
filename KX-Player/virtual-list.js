@@ -18,45 +18,72 @@ export function virtualList(containerId, items, rowHeight, renderItem, onClick) 
   if (!c) return
   // Remove previous listeners and observer to prevent accumulation
   if (c._vlRO) { c._vlRO.disconnect(); c._vlRO = null }
+  if (c._vlRAF) { cancelAnimationFrame(c._vlRAF); c._vlRAF = 0 }
+  if (c._vlResizeTimer) { clearTimeout(c._vlResizeTimer); c._vlResizeTimer = null }
   if (c._vlScrollFn) { c.removeEventListener('scroll', c._vlScrollFn) }
   if (c._vlClickFn) { c.removeEventListener('click', c._vlClickFn) }
   if (c._vlDblClickFn) { c.removeEventListener('dblclick', c._vlDblClickFn) }
   c.innerHTML = ''
-  if (!items.length) { c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">♪</div><h3>暂无内容</h3></div>'; return }
+  if (!items.length) { c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u6682\u65e0\u5185\u5bb9</h3></div>'; return }
   const totalH = items.length * rowHeight
   const spacer = document.createElement('div'); spacer.style.height = totalH + 'px'; spacer.style.position = 'relative'
   const view = document.createElement('div'); view.style.position = 'absolute'; view.style.top = '0'; view.style.left = '0'; view.style.right = '0'
   spacer.appendChild(view); c.appendChild(spacer)
   const buffer = 10
-  function render() {
+  let lastStart = -1
+  let lastEnd = -1
+
+  function render(force = false) {
     if (_resizeActive) return
     const scrollTop = c.scrollTop, clientH = c.clientHeight || 600
     const start = Math.max(0, Math.floor(scrollTop / rowHeight) - buffer)
     const end = Math.min(items.length, Math.ceil((scrollTop + clientH) / rowHeight) + buffer)
+    if (!force && start === lastStart && end === lastEnd) return
+    lastStart = start
+    lastEnd = end
     view.style.top = (start * rowHeight) + 'px'
     let html = ''
     for (let i = start; i < end; i++) html += renderItem(items[i], i)
     view.innerHTML = html
   }
-  c._vlRender = render; c._vlItems = items; render()
-  const scrollFn = () => render()
+
+  function scheduleRender(force = false) {
+    if (c._vlRAF) return
+    c._vlRAF = requestAnimationFrame(() => {
+      c._vlRAF = 0
+      render(force)
+    })
+  }
+
+  c._vlRender = () => render(true)
+  c._vlItems = items
+  render(true)
+  const scrollFn = () => scheduleRender(false)
   c._vlScrollFn = scrollFn
   c.addEventListener('scroll', scrollFn, { passive: true })
-  let resizeTimer
   const ro = new ResizeObserver(() => {
     if (_resizeActive) return
-    clearTimeout(resizeTimer)
-    resizeTimer = setTimeout(render, 200)
+    clearTimeout(c._vlResizeTimer)
+    c._vlResizeTimer = setTimeout(() => render(true), 200)
   })
   ro.observe(c); c._vlRO = ro
   if (onClick) {
     const clickFn = e => {
       const playBtn = e.target.closest('.idx-play-btn')
-      if (playBtn) { const row = e.target.closest('.song-row'); if (row && row.dataset.tid) onClick(row.dataset.tid, true) }
+      if (playBtn) {
+        const row = e.target.closest('.song-row')
+        if (row && row.dataset.tid) {
+          e.stopPropagation()
+          onClick(row.dataset.tid, true)
+        }
+      }
     }
     const dblClickFn = e => {
       const row = e.target.closest('.song-row')
-      if (row && row.dataset.tid) onClick(row.dataset.tid, true)
+      if (row && row.dataset.tid) {
+        e.stopPropagation()
+        onClick(row.dataset.tid, true)
+      }
     }
     c._vlClickFn = clickFn; c._vlDblClickFn = dblClickFn
     c.addEventListener('click', clickFn)
