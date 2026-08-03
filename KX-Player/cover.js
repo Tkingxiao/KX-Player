@@ -117,7 +117,7 @@ export function _loadCoversForTrackIds(trackIds) {
 
 export function _preloadVisibleCovers(tracks) {
   if (!tracks || !tracks.length) return
-  const visible = tracks.slice(0, Math.min(300, tracks.length))
+  const visible = tracks.slice(0, Math.min(80, tracks.length))
   const ids = visible.filter(t => t && t.id && !_coverCache.has(t.id) && !t.coverData && !t.albumCoverData).map(t => t.id)
   if (ids.length) _loadCoversForTrackIds(ids)
 }

@@ -1,4 +1,4 @@
-import fs from 'node:fs'
+﻿import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
@@ -51,15 +51,15 @@ async function discoverFiles(folderPaths: string[]): Promise<string[]> {
   return results
 }
 
-const SCAN_TIMEOUT_MS = 15000 // 15s per file (up from 5s — some files need longer parsing)
+const SCAN_TIMEOUT_MS = 15000 // 15s per file (up from 5s 鈥?some files need longer parsing)
 const LARGE_FILE_SCAN_TIMEOUT_MS = 30000 // 30 seconds for large files
 const CHOKIDAR_DELAY = 1000
 const YIELD_INTERVAL = 500 // yield to event loop every N iterations to keep main process responsive
 
 const COVER_FILE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'])
 const MAX_COVER_BYTES = 15 * 1024 * 1024
-const COVER_NAME_HINTS = ['cover', 'folder', 'front', 'albumart', 'album', 'art', 'jacket', 'ジャケット', '封面', '专辑封面', '专辑图']
-const NON_COVER_HINTS = ['ui', '说明', 'screenshot', 'screen', 'manual', 'readme', 'player', 'capture', 'shot', 'ss', 'banner', 'icon', 'thumb', 'thumbnail', 'small', 'icon']
+const COVER_NAME_HINTS = ['cover', 'folder', 'front', 'albumart', 'album', 'art', 'jacket', '\u30b8\u30e3\u30b1\u30c3\u30c8', '\u5c01\u9762', '\u4e13\u8f91\u5c01\u9762', '\u4e13\u8f91\u56fe']
+const NON_COVER_HINTS = ['ui', '璇存槑', 'screenshot', 'screen', 'manual', 'readme', 'player', 'capture', 'shot', 'ss', 'banner', 'icon', 'thumb', 'thumbnail', 'small', 'icon']
 
 function normalizeImageMime(format: string): string {
   let f = format.toLowerCase().trim()
@@ -564,7 +564,7 @@ async function enrichWithWorkers(
       chunkTimer = setTimeout(handleTimeout, chunkTimeout)
 
       // Workers are created fresh with workerData for each scan.
-      // No need to send postMessage — workerData is available at worker startup.
+      // No need to send postMessage 鈥?workerData is available at worker startup.
       // The worker will process it and respond via parentPort.postMessage.
       })
   })
@@ -656,7 +656,7 @@ async function groupTracksByFolder(
       name: (meta.title && meta.title.trim()) ? meta.title.trim() : normalizeName(fp),
       path: nfp,
       duration: meta.duration,
-      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '佚名',
+      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '浣氬悕',
       album: albumName,
       format: trackExt.replace('.', ''),
       isVideo: VIDEO_EXTS.has(trackExt),
@@ -743,7 +743,7 @@ async function buildFolderTree(
       name: (meta.title && meta.title.trim()) ? meta.title.trim() : normalizeName(fp),
       path: nfp,
       duration: meta.duration,
-      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '佚名',
+      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '浣氬悕',
       album: dirName,
       format: trackExt.replace('.', ''),
       isVideo: VIDEO_EXTS.has(trackExt),
@@ -844,31 +844,43 @@ async function buildFolderTree(
 
 // For albums that still have no cover after scanning, find covers using a
 // three-tier strategy ordered by speed:
-//   1. Filesystem cache check — O(1) per track, reuses covers from previous scans
-//   2. External cover files  — reads small image files from disk
-//   3. Embedded extraction   — last resort, parses audio metadata (slowest)
+//   1. Filesystem cache check 鈥?O(1) per track, reuses covers from previous scans
+//   2. External cover files  鈥?reads small image files from disk
+//   3. Embedded extraction   鈥?last resort, parses audio metadata (slowest)
 const COVER_EXTRACT_TIMEOUT = 3000 // 3s per album cover extraction
-async function fillAlbumCovers(artists: ScannedArtist[]): Promise<void> {
+async function fillAlbumCovers(
+  artists: ScannedArtist[],
+  options: { loadCachedCovers?: boolean; onlyTrackPaths?: Set<string> } = {}
+): Promise<void> {
+  const loadCachedCovers = options.loadCachedCovers !== false
+  const onlyTrackPaths = options.onlyTrackPaths
   // Build set of track IDs that already have cover files on disk (fast, one readdir)
   let existingCovers = new Set<string>()
+  if (loadCachedCovers) {
   try {
     const coversDir = getCoversDir()
     if (fs.existsSync(coversDir)) {
       const files = fs.readdirSync(coversDir)
       for (const f of files) {
         if (f.startsWith('folder_') || !f.endsWith('.jpg')) continue
-        existingCovers.add(f.slice(0, -4)) // strip .jpg → trackId
+        existingCovers.add(f.slice(0, -4)) // strip .jpg 鈫?trackId
       }
     }
   } catch { /* ignore */ }
+  }
 
   for (const artist of artists) {
     for (const album of artist.albums) {
+      if (onlyTrackPaths) {
+        const hasChangedTrack = album.tracks.some(track => onlyTrackPaths.has(track.path) || onlyTrackPaths.has(track.path.replace(/\\/g, '/')))
+        if (!hasChangedTrack) continue
+      }
       if (album.coverData) continue
 
-      // --- Tier 1: Filesystem cache (fastest — no audio parsing) ---
+      // --- Tier 1: Filesystem cache (fastest 鈥?no audio parsing) ---
       // Check if any track in this album already has a saved cover file
       let foundCached = false
+      if (loadCachedCovers) {
       for (const track of album.tracks) {
         const trackId = hashPath(track.path)
         if (existingCovers.has(trackId)) {
@@ -885,9 +897,10 @@ async function fillAlbumCovers(artists: ScannedArtist[]): Promise<void> {
           } catch { /* skip */ }
         }
       }
+      }
       if (foundCached) continue
 
-      // --- Tier 2: External cover files (fast — reads small image) ---
+      // --- Tier 2: External cover files (fast 鈥?reads small image) ---
       if (album.dirPath) {
         const externalCover = findExternalCover(album.dirPath, 1)
         if (externalCover) {
@@ -901,7 +914,7 @@ async function fillAlbumCovers(artists: ScannedArtist[]): Promise<void> {
         }
       }
 
-      // --- Tier 3: Embedded cover extraction (slowest — parses audio file) ---
+      // --- Tier 3: Embedded cover extraction (slowest 鈥?parses audio file) ---
       const targetTrack = album.tracks[0]
       if (targetTrack) {
         try {
@@ -936,19 +949,19 @@ export async function scanFoldersWithProgress(
   onStage?: (stage: string) => void
 ): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number }> {
   console.time('[scan] total')
-  onStage?.('发现文件...')
+  onStage?.('鍙戠幇鏂囦欢...')
   console.time('[scan] discoverFiles')
   const files = await discoverFiles(folderPaths)
   console.timeEnd('[scan] discoverFiles')
   const totalFiles = files.length
   onProgress?.(0, totalFiles)
-  onStage?.(`解析元数据... (${totalFiles} 个文件)`)
+  onStage?.(`瑙ｆ瀽鍏冩暟鎹?.. (${totalFiles} 涓枃浠?`)
 
   console.time('[scan] enrichWithWorkers')
   const metaResults = await enrichWithWorkers(files, existingMeta, onProgress)
   console.timeEnd('[scan] enrichWithWorkers')
 
-  onStage?.('整理结构...')
+  onStage?.('鏁寸悊缁撴瀯...')
   console.time('[scan] groupTracksByFolder')
   const artists = await groupTracksByFolder(files, metaResults, folderPaths)
   console.timeEnd('[scan] groupTracksByFolder')
@@ -1035,37 +1048,6 @@ export async function scanFoldersIncremental(
 ): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number; changedPaths: Set<string> }> {
   console.time('[scan-incr] total')
 
-  // Load cover data from filesystem for existing cached files
-  // Build reverse map: trackId → filePath for O(1) lookup instead of O(n*m)
-  console.time('[scan-incr] loadCovers')
-  try {
-    const coversDir = getCoversDir()
-    if (fs.existsSync(coversDir)) {
-      const idToPath = new Map<string, string>()
-      for (const [filePath] of existingMeta) {
-        idToPath.set(hashPath(filePath), filePath)
-      }
-      const coverFiles = fs.readdirSync(coversDir)
-      for (const cf of coverFiles) {
-        if (cf.startsWith('folder_') || !cf.endsWith('.jpg')) continue
-        const trackId = cf.slice(0, -4)
-        const filePath = idToPath.get(trackId)
-        if (filePath) {
-          const meta = existingMeta.get(filePath)
-          if (meta) {
-            try {
-              const buffer = fs.readFileSync(path.join(coversDir, cf))
-              if (buffer.length > 0) {
-                meta.coverData = `data:image/jpeg;base64,${buffer.toString('base64')}`
-              }
-            } catch { /* skip */ }
-          }
-        }
-      }
-    }
-  } catch { /* ignore */ }
-  console.timeEnd('[scan-incr] loadCovers')
-
   // Discover files in ALL folders (to get complete file list)
   console.time('[scan-incr] discoverFiles')
   const files = await discoverFiles(allFolderPaths)
@@ -1112,7 +1094,7 @@ export async function scanFoldersIncremental(
 
   // Process only new/changed files via workers
   if (changedFiles.length > 0) {
-    onStage?.('解析新文件元数据...')
+    onStage?.('瑙ｆ瀽鏂版枃浠跺厓鏁版嵁...')
     const workerResults = await enrichWithWorkers(changedFiles, existingMeta, (completed, total) => {
       onProgress?.(completed, total)
     })
@@ -1124,7 +1106,7 @@ export async function scanFoldersIncremental(
   }
 
   // Build structures (same as full scan)
-  onStage?.('构建音乐库...')
+  onStage?.('鏋勫缓闊充箰搴?..')
 
   console.time('[scan-incr] groupTracksByFolder')
   const artists = await groupTracksByFolder(files, metaResults, allFolderPaths)
@@ -1134,7 +1116,7 @@ export async function scanFoldersIncremental(
   const folderTree = await buildFolderTree(files, metaResults, allFolderPaths)
   console.timeEnd('[scan-incr] buildFolderTree')
 
-  await fillAlbumCovers(artists)
+  await fillAlbumCovers(artists, { loadCachedCovers: false, onlyTrackPaths: changedFileSet })
 
   console.time('[scan-incr] assembleAllTracks')
   const allTracks: ScannedTrack[] = []

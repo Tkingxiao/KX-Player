@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loadLibrary: () => ipcRenderer.invoke('library:load'),
   loadLibraryFast: () => ipcRenderer.invoke('library:loadFast'),
   getTrackCovers: (trackIds: string[]) => ipcRenderer.invoke('library:getCovers', trackIds),
+  getFolderCovers: (folderPaths: string[]) => ipcRenderer.invoke('library:getFolderCovers', folderPaths),
   loadFolderCovers: () => ipcRenderer.invoke('library:loadFolderCovers'),
   readAsDataURL: (filePath: string) => ipcRenderer.invoke('file:readAsDataURL', filePath),
   readTextFile: (filePath: string) => ipcRenderer.invoke('file:readTextFile', filePath),

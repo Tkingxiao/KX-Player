@@ -16,6 +16,7 @@ export const api={
   loadLibrary:()=>e.loadLibrary?e.loadLibrary():null,
   loadLibraryFast:()=>e.loadLibraryFast?e.loadLibraryFast():null,
   getTrackCovers:ids=>e.getTrackCovers?e.getTrackCovers(ids):{},
+  getFolderCovers:paths=>e.getFolderCovers?e.getFolderCovers(paths):{},
   loadFolderCovers:()=>e.loadFolderCovers?e.loadFolderCovers():{},
   readAsDataURL:p=>e.readAsDataURL?e.readAsDataURL(p):null,
   readTextFile:p=>e.readTextFile?e.readTextFile(p):null,

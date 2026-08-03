@@ -51,6 +51,28 @@ function _getPinyinInitials(s) {
 }
 
 /** Fuzzy match: returns true if query matches text via direct substring or pinyin initials. */
+/** Fuzzy match score: returns a relevance score >= 0 if it matches, or -1 if not. */
+export function fuzzyMatchScore(text, query) {
+  if (!text || !query) return -1
+  const nt = _normalizeForSearch(text)
+  const nq = _normalizeForSearch(query)
+  if (!nt || !nq) return -1
+  // Direct text match (higher for exact / prefix / earlier substring)
+  if (nt === nq) return 100
+  if (nt.startsWith(nq)) return 90 - Math.min(nt.length, 20)
+  const idx = nt.indexOf(nq)
+  if (idx >= 0) return 70 - Math.min(idx, 30) - Math.min(nt.length - nq.length, 20) * 0.5
+  // Pinyin initials match: only for queries containing latin letters, and only
+  // as a consecutive prefix of the field initials. This avoids loose
+  // subsequence false positives (e.g. "ld" matching "艾琳的"/"ald").
+  if (!/[a-z]/.test(nq)) return -1
+  const queryInitials = _getPinyinInitials(nq)
+  const textInitials = _getPinyinInitials(nt)
+  if (!queryInitials || !textInitials) return -1
+  if (textInitials.startsWith(queryInitials)) return 45 - Math.min(textInitials.length - queryInitials.length, 15)
+  return -1
+}
+
 export function fuzzyMatch(text, query) {
   if (!text || !query) return false
   const nt = _normalizeForSearch(text)
