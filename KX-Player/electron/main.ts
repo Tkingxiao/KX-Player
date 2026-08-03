@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu, nativeImage, protocol, net } from 'electron'
+ import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu, nativeImage, protocol, net } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import fs from 'node:fs'
@@ -6,8 +6,7 @@ import fsp from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { scanFoldersWithProgress, scanFoldersIncremental, startWatching, stopWatching, terminateWorkerPool } from './fileScanner'
 import { loadLibrarySnapshot, loadTrackListSnapshot, loadTrackMetadataIndex, loadFullMetadataIndex, saveLibrarySnapshot } from './libraryDb'
-import { initCoverDir, loadFolderCoverMap, saveTrackCover, saveFolderCover, saveExternalCover, setFolderCoverMapping, getTrackCoverDataUrl, getTrackCoversBatchAsync, getFolderCoversBatchAsync, getFolderCoverByMapping, getFolderCoverPathByMapping, getAllFolderCoversFromMapAsync, findExternalCoverInDir, getCoversDir, getTrackCoverPath } from './coverService'
-import { initMemoryMonitor, markMain, reportRendererSample, bindMainWindow, sampleRendererFromMain, readRendererMemoryFromWebContents } from './memMonitor'
+import { initCoverDir, loadFolderCoverMap, saveTrackCover, saveFolderCover, saveExternalCover, setFolderCoverMapping, getTrackCoverDataUrl, getTrackCoversBatchAsync, getFolderCoversBatchAsync, getFolderCoverByMapping, getFolderCoverPathByMapping, getAllFolderCoversFromMapAsync, findExternalCoverInDir, getCoversDir, getTrackCoverPath, migrateOversizedCovers } from './coverService'
 
 // Shared MIME type mapping for image files
 const IMG_MIME: Record<string, string> = { jpg: 'jpeg', jpeg: 'jpeg', png: 'png', bmp: 'bmp', webp: 'webp', gif: 'gif' }
@@ -39,11 +38,13 @@ app.commandLine.appendSwitch('disable-crashpad')
 app.commandLine.appendSwitch('disable-breakpad')
 app.commandLine.appendSwitch('disable-gpu-shader-disk-cache')
 app.commandLine.appendSwitch('disable-extensions')
-// Expose `performance.memory.usedJSHeapSize` / `totalJSHeapSize` to the renderer
-// with real (non-zero) values instead of Chromium's default placeholder.
-// Both Chromium switch and V8 flag are needed in Electron:
-app.commandLine.appendSwitch('enable-precise-memory-info')
-app.commandLine.appendSwitch('js-flags', '--expose-gc --enable-precise-memory-info')
+// Trim Chromium services a local music player never uses; each disabled
+// feature avoids background work and small resident allocations.
+app.commandLine.appendSwitch('disable-features', 'MediaRouter,Translate,OptimizationHints')
+app.commandLine.appendSwitch('disable-background-networking')
+app.commandLine.appendSwitch('disable-component-update')
+app.commandLine.appendSwitch('disable-domain-reliability')
+app.commandLine.appendSwitch('disable-sync')
 
 let mainWindow: BrowserWindow | null = null
 
@@ -62,6 +63,30 @@ function getLibraryDbPath(): string {
 function getBgImagePath(): string {
   // Keep background image in userData so it survives version upgrades
   return path.join(getUserDataDir(), 'kx-player-bg.png')
+}
+
+// Decoded bitmap ceiling for the wallpaper: it is always on screen, so its
+// decoded cost (w*h*4 bytes) is permanent. 2560px covers any normal monitor.
+const MAX_BG_DIM = 2560
+
+// One-time migration: compress an existing oversized wallpaper written by an
+// older version (files were copied verbatim back then).
+async function migrateOversizedBgImage(): Promise<void> {
+  try {
+    const bgPath = getBgImagePath()
+    if (!fs.existsSync(bgPath)) return
+    const sharp = (await import('sharp')).default
+    const buffer = fs.readFileSync(bgPath)
+    const meta = await sharp(buffer).metadata()
+    if ((meta.width || 0) <= MAX_BG_DIM && (meta.height || 0) <= MAX_BG_DIM) return
+    const out = await sharp(buffer)
+      .resize(MAX_BG_DIM, MAX_BG_DIM, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 82 })
+      .toBuffer()
+    fs.writeFileSync(bgPath + '.tmp', out)
+    fs.renameSync(bgPath + '.tmp', bgPath)
+    console.log(`[bg] migrated oversized wallpaper ${meta.width}x${meta.height} -> <=${MAX_BG_DIM}px`)
+  } catch { /* ignore */ }
 }
 
 function stripCoverPayloadForRenderer(snapshot: any) {
@@ -87,11 +112,6 @@ function stripCoverPayloadForRenderer(snapshot: any) {
   }
   stripFolders(snapshot.folderTree || [])
   return snapshot
-}
-
-// Project root (one level above `electron/`) — used for memory.log etc.
-function getProjectRoot(): string {
-  return path.resolve(__dirname, '..')
 }
 
 function createWindow() {
@@ -140,7 +160,7 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Set cache to userData subdirectory to avoid access-denied errors
   app.setPath('cache', path.join(getUserDataDir(), 'Cache'))
 
@@ -148,55 +168,17 @@ app.whenReady().then(() => {
   initCoverDir(getUserDataDir())
   loadFolderCoverMap(getUserDataDir())
 
-  // Initialize memory monitor — log lives in KX-Player/memory.log so it's
-  // easy to inspect during development and postmortem analysis.
-  initMemoryMonitor(getProjectRoot())
-  markMain('main:appReady')
+  // Downscale a legacy oversized wallpaper BEFORE the renderer loads it —
+  // once the renderer decodes a 6000px image the bitmap (~100MB) stays
+  // resident. One file, so blocking startup briefly is acceptable.
+  await migrateOversizedBgImage()
+
+  // Downscale legacy oversized cover files in the background. Deferred so it
+  // never competes with the startup library load / incremental scan for CPU.
+  setTimeout(() => { migrateOversizedCovers().catch(() => { /* ignore */ }) }, 8000)
 
   createWindow()
-  if (mainWindow) bindMainWindow(mainWindow)
   createTray() // Create system tray icon at startup
-
-  // Diagnostic: write Electron process metrics every 10s.
-  // Also, for the Renderer (Tab) process, getProcessMemoryInfo() returns more
-  // detail (privateBytes, sharedBytes, workingSetSize + V8 heap stats via
-  // `pid`. We aggregate the top consumers so we can attribute RSS growth.
-  setInterval(() => {
-    try {
-      const metrics = app.getAppMetrics?.() || []
-      const summary = metrics.map((m: any) => {
-        const mem = m.memory || {}
-        const ws = mem.workingSetSize || mem.privateBytes || 0
-        const cpu = m.cpu ? (m.cpu.percentCPUUsage || 0).toFixed(1) : '0'
-        return `${m.type}:${m.pid}:${Math.round(ws / 1024)}MB/cpu=${cpu}`
-      }).join(' | ')
-      markMain('main:metrics', `procs=${metrics.length} ${summary}`)
-      // For the renderer process, get a separate detailed readout.
-      try {
-        for (const m of metrics) {
-          if (m.type === 'Tab' || m.type === 'Renderer') {
-            const info = (process as any).getProcessMemoryInfo?.() || null
-            // process.getProcessMemoryInfo is for the current process; for other
-            // processes we use app.getProcessMemoryInfo (Electron 28+).
-            const fullInfo = (app as any).getProcessMemoryInfo?.(m.pid) || null
-            const ws = (m.memory?.workingSetSize || 0) / 1024
-            const priv = (m.memory?.privateBytes || 0) / 1024
-            const shared = (m.memory?.sharedBytes || 0) / 1024
-            markMain('main:procDetail',
-              `type=${m.type} pid=${m.pid}`
-              + ` ws=${ws.toFixed(0)}MB priv=${priv.toFixed(0)}MB shared=${shared.toFixed(0)}MB`
-              + (fullInfo ? ` peak=${(fullInfo.peakWorkingSetSize || 0) / 1024 | 0}MB` : '')
-            )
-          }
-        }
-      } catch {}
-    } catch {}
-  }, 10000).unref?.()
-
-  // Periodically sample renderer memory directly from Electron APIs.
-  setInterval(() => {
-    sampleRendererFromMain('renderer-pull').catch(() => {})
-  }, 10000).unref?.()
 
   // Intercept window close to hide to tray instead (catches Alt+F4, taskbar close, etc.)
   mainWindow?.on('close', (event) => {
@@ -256,48 +238,16 @@ ipcMain.handle('dialog:openAudioFiles', async () => {
   return result.canceled ? [] : result.filePaths
 })
 
-ipcMain.on('mem:report', (_event, sample: any) => {
-  try { reportRendererSample(sample || {}) } catch { /* ignore */ }
-})
-
-// Pull renderer-side memory from Electron's process APIs. performance.memory
-// is zero on some Electron builds, so the shared monitor probes
-// process.getProcessMemoryInfo()/getHeapStatistics() first and falls back to
-// app.getAppMetrics() when the renderer API is unavailable.
-ipcMain.handle('mem:getRendererMemory', async (event) => {
-  try {
-    const sender = event.sender
-    if (!sender || sender.isDestroyed()) return null
-    return await readRendererMemoryFromWebContents(sender)
-  } catch {
-    return null
-  }
-})
-
 ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: string[]) => {
   const sender = event.sender
-  const t0 = Date.now()
-  markMain('main:scanFolders:start', `paths=${folderPaths.length}`)
   try {
     console.time('[scan] loadMetadataIndex')
     const metadataIndex = await loadTrackMetadataIndex(getLibraryDbPath())
     console.timeEnd('[scan] loadMetadataIndex')
-    markMain('main:scanFolders:metaIndexLoaded', `indexSize=${metadataIndex?.size ?? 0}`)
     const result = await scanFoldersWithProgress(folderPaths, metadataIndex,
       (completed, total) => {
         if (!sender.isDestroyed()) {
           sender.send('scanner:progress', { completed, total, stage: '解析元数据...' })
-          // Mark at 10/50/100% checkpoints so we can correlate memory peaks.
-          if (total > 0) {
-            const pct = (completed / total) * 100
-            if (pct >= 100 && (sender as any)._markScan100 !== true) {
-              ;(sender as any)._markScan100 = true
-              markMain('main:scanFolders:progress=100%', `files=${total}`)
-            } else if (pct >= 50 && (sender as any)._markScan50 !== true) {
-              ;(sender as any)._markScan50 = true
-              markMain('main:scanFolders:progress=50%', `files=${Math.floor(total / 2)}`)
-            }
-          }
         }
       },
       (stage) => {
@@ -306,7 +256,6 @@ ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: str
         }
       }
     )
-    ;(sender as any)._markScan50 = false; (sender as any)._markScan100 = false
     // Save scan results to library database (no cover data in SQLite)
     console.time('[scan] saveLibrary')
     try {
@@ -330,21 +279,16 @@ ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: str
       console.error('[scan] saveCovers failed:', e)
     }
     stripCoverPayloadForRenderer(result)
-    markMain('main:scanFolders:done', `tracks=${result.fileCount} dt=${Date.now() - t0}ms`)
-    try { if (typeof global.gc === 'function') global.gc() } catch { /* ignore */ }
     return result
   } catch (err: any) {
     console.error('[scan] Fatal error:', err?.message || err)
-    markMain('main:scanFolders:error', err?.message || String(err))
     return { artists: [], folderTree: [], allTracks: [], fileCount: 0 }
   }
 })
 
 ipcMain.handle('library:load', async () => {
   try {
-    const t0 = Date.now()
     const snap = await loadLibrarySnapshot(getLibraryDbPath())
-    markMain('main:library:load', `dt=${Date.now() - t0}ms tracks=${snap?.fileCount ?? 0}`)
     return stripCoverPayloadForRenderer(snap)
   } catch {
     return null
@@ -354,9 +298,7 @@ ipcMain.handle('library:load', async () => {
 // Lightweight load without cover data for faster startup
 ipcMain.handle('library:loadFast', async () => {
   try {
-    const t0 = Date.now()
     const snap = await loadTrackListSnapshot(getLibraryDbPath())
-    markMain('main:library:loadFast', `dt=${Date.now() - t0}ms tracks=${snap?.fileCount ?? 0}`)
     return snap
   } catch {
     return null
@@ -372,7 +314,6 @@ ipcMain.handle('library:getCovers', async (_event, trackIds: string[]) => {
   try {
     if (!trackIds || !trackIds.length) return {}
     const result: Record<string, string> = {}
-    const covers = getCoversDir()
     for (const id of trackIds) {
       const p = getTrackCoverPath(id)
       if (!p) continue
@@ -414,14 +355,10 @@ ipcMain.handle('library:loadFolderCovers', async () => {
   try {
     const allCovers = await getAllFolderCoversFromMapAsync()
     const result: Record<string, string> = {}
-    for (const [folderPath, dataUrl] of Object.entries(allCovers || {})) {
+    for (const folderPath of Object.keys(allCovers || {})) {
       const fp = getFolderCoverPathByMapping(folderPath)
       if (fp && fs.existsSync(fp)) {
         result[folderPath] = pathToFileURL(fp).href
-      }
-      // Data URL fallback for any pre-existing mapping that wasn't on disk
-      else if (typeof dataUrl === 'string') {
-        // keep consumer contract: drop these; UI uses fallback icon
       }
     }
     return result
@@ -434,8 +371,6 @@ ipcMain.handle('library:loadFolderCovers', async () => {
 ipcMain.handle('library:scanIncremental', async (event, folderPaths: string[]) => {
   const sender = event.sender
   let fullMeta: Map<string, any> | null = null
-  const t0 = Date.now()
-  markMain('main:scanIncremental:start', `paths=${folderPaths.length}`)
   try {
     console.time('[scan-incr] loadFullMeta')
     fullMeta = await loadFullMetadataIndex(getLibraryDbPath())
@@ -473,13 +408,9 @@ ipcMain.handle('library:scanIncremental', async (event, folderPaths: string[]) =
       console.error('[scan-incr] saveCovers failed:', e)
     }
     stripCoverPayloadForRenderer(result)
-    markMain('main:scanIncremental:done', `tracks=${result.fileCount} dt=${Date.now() - t0}ms`)
-    // Hint V8 (when --expose-gc is enabled) to reclaim worker-held buffers
-    try { if (typeof global.gc === 'function') global.gc() } catch { /* ignore */ }
     return result
   } catch (err: any) {
     console.error('[scan-incr] Fatal error:', err?.message || err)
-    markMain('main:scanIncremental:error', err?.message || String(err))
     return { artists: [], folderTree: [], allTracks: [], fileCount: 0 }
   } finally {
     fullMeta?.clear()
@@ -488,8 +419,6 @@ ipcMain.handle('library:scanIncremental', async (event, folderPaths: string[]) =
 
 // Remove a folder from the library without full rescan
 ipcMain.handle('library:removeFolder', async (_event, folderPath: string, remainingPaths: string[]) => {
-  const t0 = Date.now()
-  markMain('main:removeFolder:start', `path=${folderPath}`)
   try {
     const dbPath = getLibraryDbPath()
     const snapshot = await loadLibrarySnapshot(dbPath)
@@ -615,11 +544,9 @@ ipcMain.handle('library:removeFolder', async (_event, folderPath: string, remain
       }
     } catch { /* ignore */ }
 
-    markMain('main:removeFolder:done', `kept=${keptTracks.length} dt=${Date.now() - t0}ms`)
     return stripCoverPayloadForRenderer({ folderTree: roots, allTracks: keptTracks, fileCount: keptTracks.length, folderPaths: remainingPaths })
   } catch (err: any) {
     console.error('[removeFolder] Error:', err?.message || err)
-    markMain('main:removeFolder:error', err?.message || String(err))
     return { folderTree: [], allTracks: [], fileCount: 0, folderPaths: remainingPaths }
   }
 })
@@ -774,14 +701,12 @@ async function saveCoversIncremental(result: any, changedPaths: Set<string>) {
 
 ipcMain.handle('scanner:startWatching', async (_event, folderPaths: string[]) => {
   if (!mainWindow) return
-  markMain('main:watching:start', `paths=${folderPaths.length}`)
   await startWatching(folderPaths, () => {
     mainWindow?.webContents.send('scanner:fsChanged')
   })
 })
 
 ipcMain.handle('scanner:stopWatching', async () => {
-  markMain('main:watching:stop')
   stopWatching()
 })
 
@@ -898,11 +823,22 @@ ipcMain.handle('dialog:selectBgImage', async () => {
   // Copy the chosen image into userData so it survives across machines
   // (and so we have a stable file path the renderer can reference via
   // file:// without re-reading base64 into the renderer process).
+  // Downscale + re-encode first: a raw wallpaper can be 6000px+ and its
+  // decoded bitmap (w*h*4 bytes) stays resident in the renderer forever.
   try {
     const bgPath = getBgImagePath()
     const dir = path.dirname(bgPath)
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-    fs.copyFileSync(filePath, bgPath)
+    try {
+      const sharp = (await import('sharp')).default
+      const out = await sharp(filePath)
+        .resize(MAX_BG_DIM, MAX_BG_DIM, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 82 })
+        .toBuffer()
+      fs.writeFileSync(bgPath, out)
+    } catch {
+      fs.copyFileSync(filePath, bgPath)
+    }
     const mtime = fs.statSync(bgPath).mtimeMs
     return { path: bgPath, mtime }
   } catch {
@@ -1011,7 +947,7 @@ ipcMain.handle('shell:showItemInFolder', async (_event, filePath: string) => {
   }
 })
 
-// ffmpeg.exe path helper 鈥?returns path to bundled ffmpeg.exe
+// Returns path to bundled ffmpeg.exe
 function getFfmpegExe(): string {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   if (isDev) {
@@ -1132,8 +1068,6 @@ function createTray() {
   })
 }
 
-// Note: settings:syncSave is handled by ipcMain.on above (line 357)
-
 ipcMain.handle('window:close', () => {
   if (!mainWindow) return
   // Hide to system tray instead of closing
@@ -1163,5 +1097,3 @@ app.on('before-quit', async () => {
     } catch { /* ignore */ }
   }
 })
-
-// --- ffmpeg WASM runs entirely in renderer, no system ffmpeg needed ---

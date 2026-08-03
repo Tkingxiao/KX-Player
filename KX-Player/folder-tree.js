@@ -1,7 +1,5 @@
 // === Folder Tree Helpers ===
 
-import { mark as markMem } from './mem-monitor.js'
-
 export function hasMusicRecursive(node) {
   if (!node) return false
   if (node.tracks && node.tracks.length > 0) return true
@@ -10,7 +8,6 @@ export function hasMusicRecursive(node) {
 }
 
 export function buildFolderMeta(tree) {
-  markMem('renderer:buildFolderMeta:start')
   const meta = {}
   function walk(node) {
     const p = node.path
@@ -34,7 +31,6 @@ export function buildFolderMeta(tree) {
     meta[p] = { trackCount, hasMusic, validChildCount, coverData }
   }
   for (const n of (tree || [])) walk(n)
-  markMem('renderer:buildFolderMeta:done', `entries=${Object.keys(meta).length}`)
   return meta
 }
 
