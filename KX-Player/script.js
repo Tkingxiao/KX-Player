@@ -1,7 +1,13 @@
 import { api } from './api.js'
-import { $, esc, pathJoin, isChildPath, arrayMatchSorted, hashPath, fmtTime, isVideoFile, nName, fuzzyMatch, fmtFSize, collectAllTracks, collectAllTracksInto } from './utils.js'
+import { $, esc, arrayMatchSorted, fmtTime, isVideoFile, nName, fuzzyMatch, collectAllTracks } from './utils.js'
 import { virtualList, invalidateVL, _startResizeThrottle } from './virtual-list.js'
 import { _getCoverData, _loadCoversForTrackIds, _preloadVisibleCovers, _updateFolderTreeCovers, _clearCoverCache, _onCoversLoaded } from './cover.js'
+import { createTrackIndex } from './track-index.js'
+import { showConfirm, addT, updT, rmT } from './ui-feedback.js'
+import { idbGet, idbSet } from './idb-store.js'
+import { hex2rgb, h2hsl, hsvToRgb } from './color-utils.js'
+import { findBestLyricsMatch } from './lyrics-matcher.js'
+import { buildFolderMeta, findNodeByPath, hasMusicRecursive } from './folder-tree.js'
 
 const S = {
   all: [], aI: -1, alI: -1, tI: -1,
@@ -25,17 +31,10 @@ const S = {
 }
 
 let fp = [], audio = new Audio(), lrc = [], pl = [], nI = 0
-let _trackById = new Map()
-function rebuildTrackIndex() { _trackById = new Map(S.all.map(t => [t.id, t])) }
-function getTrackById(id) { return id ? _trackById.get(id) || null : null }
-function tracksFromIds(ids) {
-  const out = []
-  for (const id of (ids || [])) {
-    const t = _trackById.get(id)
-    if (t) out.push(t)
-  }
-  return out
-}
+const trackIndex = createTrackIndex()
+function rebuildTrackIndex() { trackIndex.rebuild(S.all) }
+function getTrackById(id) { return trackIndex.get(id) }
+function tracksFromIds(ids) { return trackIndex.fromIds(ids) }
 let _lastLrcActiveIdx = -1
 let _idCounter = 0
 let _scanRunning = false
@@ -207,6 +206,38 @@ function syncAllListsPlaying() {
   })
 }
 
+function _setTrackDurationById(tid, seconds) {
+  const duration = Math.round(Number(seconds) || 0)
+  if (!tid || duration <= 0) return false
+  let changed = false
+  const update = (track) => {
+    if (!track || track.id !== tid) return
+    const oldDuration = Math.round(Number(track.duration) || 0)
+    if (!oldDuration || Math.abs(oldDuration - duration) > 1) {
+      track.duration = duration
+      changed = true
+    }
+  }
+  update(getTrackById(tid))
+  for (const track of pl) update(track)
+  const walk = (nodes) => {
+    for (const node of (nodes || [])) {
+      for (const track of (node.tracks || [])) update(track)
+      walk(node.children)
+    }
+  }
+  walk(S.folderTree)
+  return changed
+}
+
+function _updateVisibleDurationCells(tid, duration) {
+  document.querySelectorAll('.song-row').forEach(row => {
+    if (row.dataset.tid !== tid) return
+    const cell = row.querySelector('.song-row-duration')
+    if (cell) cell.textContent = fmtTime(duration)
+  })
+}
+
 // === Cleanup Stale Track References ===
 function cleanupStale(allIds) {
   S.recents = S.recents.filter(id => allIds.has(id))
@@ -216,79 +247,6 @@ function cleanupStale(allIds) {
   for (const p of S.pls) {
     p.trackIds = p.trackIds.filter(id => allIds.has(id))
   }
-}
-
-// === Custom Confirm ===
-function showConfirm(title, message) {
-  return new Promise(resolve => {
-    $('confirm-title').textContent = title
-    $('confirm-message').textContent = message
-    $('confirm-modal').classList.remove('hidden')
-    const okBtn = $('confirm-ok-btn')
-    const cancelBtn = $('confirm-cancel-btn')
-    const cleanup = () => {
-      $('confirm-modal').classList.add('hidden')
-      okBtn.removeEventListener('click', okHandler)
-      cancelBtn.removeEventListener('click', cancelHandler)
-      document.removeEventListener('keydown', keyHandler)
-    }
-    const okHandler = () => { cleanup(); resolve(true) }
-    const cancelHandler = () => { cleanup(); resolve(false) }
-    const keyHandler = (e) => { if (e.key === 'Escape') { e.preventDefault(); cancelHandler() } if (e.key === 'Enter') { e.preventDefault(); okHandler() } }
-    okBtn.addEventListener('click', okHandler)
-    cancelBtn.addEventListener('click', cancelHandler)
-    document.addEventListener('keydown', keyHandler)
-    okBtn.focus()
-  })
-}
-
-// === Toast ===
-let tC = 0
-function addT(fn) {
-  const id = 'toast-' + ++tC; $('import-toasts').insertAdjacentHTML('beforeend',
-  `<div class="import-toast" id="${id}"><div class="toast-header"><span class="toast-name">${esc(fn)}</span><span class="toast-status" id="${id}-status">\u626b\u63cf\u4e2d...</span></div><div class="toast-progress-bar"><div class="toast-progress-fill" id="${id}-bar" style="width:0%"></div></div><div class="toast-detail" id="${id}-detail"></div></div>`)
-  return id
-}
-function updT(id, status, pct, detail) {
-  const s = $(`${id}-status`), b = $(`${id}-bar`), d = $(`${id}-detail`)
-  if (s) s.textContent = status
-  if (b) { b.style.width = pct + '%'; if (pct > 0) b.closest('.toast-progress-bar').style.display = 'block' }
-  if (d) d.textContent = detail || ''
-}
-function rmT(id) { const t = $(id); if (t) { setTimeout(() => { t.classList.add('toast-exit'); setTimeout(() => t.remove(), 500) }, 1500) } }
-
-// === IndexedDB Storage ===
-let idb = null
-function openIDB() {
-  return new Promise((resolve, reject) => {
-    if (idb) return resolve(idb)
-    const req = indexedDB.open('kx-player-db', 1)
-    req.onupgradeneeded = () => {
-      const db = req.result
-      if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings')
-      if (!db.objectStoreNames.contains('cache')) db.createObjectStore('cache')
-    }
-    req.onsuccess = () => { idb = req.result; resolve(idb) }
-    req.onerror = () => reject(req.error)
-  })
-}
-async function idbSet(store, key, val) {
-  const db = await openIDB()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite')
-    tx.objectStore(store).put(val, key)
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
-}
-async function idbGet(store, key) {
-  const db = await openIDB()
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly')
-    const req = tx.objectStore(store).get(key)
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
-  })
 }
 
 function applyScanResult(result) {
@@ -409,10 +367,12 @@ async function loadLibraryData() {
     // Use fast load (no cover data) to avoid loading 200MB+ of base64 at startup.
     // Covers are loaded on demand from SQLite (already compressed to 400px thumbnails).
     let library = await api.loadLibraryFast()
+    let cacheUsed = false
     if (library && Array.isArray(library.folderPaths)) {
       const libraryPaths = library.folderPaths.map(p => p.replace(/\\/g, '/').replace(/\/+$/, ''))
       if (arrayMatchSorted(fp, libraryPaths)) {
         applyScanResult(library)
+        cacheUsed = true
       } else {
         library = null
       }
@@ -435,6 +395,32 @@ async function loadLibraryData() {
     // Preload covers for visible tracks
     _preloadVisibleCovers(S.all)
     console.timeEnd('[startup] total')
+
+    // If we used cached data, run an incremental scan to pick up any file
+    // changes that happened while the app was not running (additions,
+    // deletions, modifications). This is fast when nothing changed (only
+    // file discovery, no re-parsing) and correctly syncs the library.
+    if (cacheUsed) {
+      const bgGen = ++_scanGeneration
+      api.scanFoldersIncremental(fp).then(r => {
+        // If a watcher-triggered rescan has already run, discard stale result
+        if (_scanGeneration !== bgGen || !r) return
+        applyScanResult(r)
+        const newIds = new Set(S.all.map(t => t.id))
+        cleanupStale(newIds)
+        // Reload covers after incremental scan may have changed the library
+        api.loadFolderCovers().then(fc => {
+          if (fc && S._folderMeta) {
+            for (const [p, cd] of Object.entries(fc)) {
+              if (S._folderMeta[p]) S._folderMeta[p].coverData = cd
+            }
+          }
+          _updateFolderTreeCovers(S.folderTree, fc || {})
+          _preloadVisibleCovers(S.all)
+        }).catch(() => {})
+        renderAll()
+      }).catch(() => {})
+    }
   } catch (e) { /* ignore */ }
   // Start file watcher (separate from library loading so failures don't block each other)
   try { await restartWatching() } catch (e) { console.warn('[watcher] init failed:', e) }
@@ -642,35 +628,6 @@ function apMode() {
   $('btn-mode').title = cfg.name
   cfg.show.forEach(id => { $(id).style.display = '' })
   cfg.hide.forEach(id => { $(id).style.display = 'none' })
-}
-
-// === Color ===
-function hex2rgb(h) { const v = parseInt(h.slice(1), 16); return [(v >> 16) & 255, (v >> 8) & 255, v & 255] }
-function rgb2hsl(r, g, b) {
-  r /= 255; g /= 255; b /= 255; const M = Math.max(r, g, b), m = Math.min(r, g, b), d = M - m, l = (M + m) / 2
-  let h = 0, s = d === 0 ? 0 : l > 0.5 ? d / (2 - M - m) : d / (M + m)
-  if (d !== 0) { if (M === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60; else if (M === g) h = ((b - r) / d + 2) * 60; else h = ((r - g) / d + 4) * 60 }
-  return { h: Math.round(h), s: Math.round(s * 100), l: Math.round(l * 100) }
-}
-function h2hsl(hex) { const [r, g, b] = hex2rgb(hex); return rgb2hsl(r, g, b) }
-
-function hsvToRgb(h, s, v) {
-  s /= 100; v /= 100;
-  const c = v * s;
-  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
-  const m = v - c;
-  let r, g, b;
-  if (h < 60)       [r, g, b] = [c, x, 0];
-  else if (h < 120) [r, g, b] = [x, c, 0];
-  else if (h < 180) [r, g, b] = [0, c, x];
-  else if (h < 240) [r, g, b] = [0, x, c];
-  else if (h < 300) [r, g, b] = [x, 0, c];
-  else              [r, g, b] = [c, 0, x];
-  return [
-    Math.round((r + m) * 255),
-    Math.round((g + m) * 255),
-    Math.round((b + m) * 255)
-  ];
 }
 
 // === Canvas Color Picker (HSV ring+square, following zhling.html) ===
@@ -886,96 +843,6 @@ async function loadT(idx) {
   S.tI = idx; S.playing = true
 }
 
-// Extract trailing track identifier suffix from a filename
-// e.g. "H!! 啊宇佐美酱_DAY01_trk01" → "_DAY01_trk01"
-// e.g. "song_track03" → "_track03", "audio_02" → "_02"
-function _extractTrackSuffix(name) {
-  // Match patterns like _trk01, _track01, _DAY01_trk01, _Disc1_Track02, _01 etc.
-  const m = name.match(/((?:[_\-](?:DAY|Disc|CD|Track|trk|part|vol|No|No\.|P)\w*)*[_\-](?:trk|track|Disc|CD|DAY|part|vol|No\.?|P)\w*[_\w]*?)$/i)
-  if (m) return m[1]
-  // Fallback: trailing _NNN or -NNN pattern
-  const m2 = name.match(/([_\-]\d{2,4})$/)
-  if (m2) return m2[1]
-  return ''
-}
-
-// Find the best matching lyrics file in a directory listing
-// Returns the filename (without directory) of the best match, or null
-function _findBestLyricsMatch(audioNameWithoutExt, audioExt, dirEntries) {
-  const lrcExts = new Set(['.lrc', '.vtt', '.srt'])
-  const candidates = []
-  for (const entry of dirEntries) {
-    const lower = entry.toLowerCase()
-    const dotIdx = lower.lastIndexOf('.')
-    if (dotIdx < 0) continue
-    const entryExt = lower.slice(dotIdx)
-    const entryName = entry.slice(0, dotIdx)
-    // Check for lyrics file extensions (including double-ext like .mp3.lrc)
-    let isLyricsFile = false
-    if (lrcExts.has(entryExt)) {
-      isLyricsFile = true
-    } else if (lrcExts.has(lower.slice(lower.lastIndexOf('.', dotIdx - 1)))) {
-      // double extension pattern: song.mp3.lrc
-      isLyricsFile = true
-    }
-    if (!isLyricsFile) continue
-    candidates.push({ filename: entry, nameWithoutExt: entryName, ext: entryExt })
-  }
-  if (candidates.length === 0) return null
-
-  // 1. Exact name match
-  for (const c of candidates) {
-    if (c.nameWithoutExt === audioNameWithoutExt || c.nameWithoutExt === audioNameWithoutExt + audioExt) return c
-  }
-
-  // 2. Match by track suffix
-  const audioSuffix = _extractTrackSuffix(audioNameWithoutExt)
-  if (audioSuffix) {
-    let bestMatch = null
-    let bestScore = 0
-    for (const c of candidates) {
-      if (c.nameWithoutExt.endsWith(audioSuffix)) {
-        // Score by length of common suffix (longer = better match)
-        const score = audioSuffix.length
-        if (score > bestScore) { bestScore = score; bestMatch = c }
-      }
-    }
-    if (bestMatch) return bestMatch
-  }
-
-  // 3. Longest common suffix matching (for different-language titles with same suffix)
-  let bestMatch = null
-  let bestCommonLen = 0
-  for (const c of candidates) {
-    // Compute common suffix length
-    let commonLen = 0
-    const a = audioNameWithoutExt.toLowerCase()
-    const b = c.nameWithoutExt.toLowerCase()
-    for (let i = 1; i <= Math.min(a.length, b.length); i++) {
-      if (a[a.length - i] === b[b.length - i]) commonLen = i
-      else break
-    }
-    // Require at least 5 chars of common suffix and it should start at a separator
-    if (commonLen >= 5 && commonLen > bestCommonLen) {
-      const suffixStart = audioNameWithoutExt.length - commonLen
-      if (suffixStart > 0 && /[_\-]/.test(audioNameWithoutExt[suffixStart])) {
-        bestCommonLen = commonLen
-        bestMatch = c
-      }
-    }
-  }
-  if (bestMatch) return bestMatch
-
-  // 4. If only one lyrics file and only one audio-like file, match them
-  if (candidates.length === 1) {
-    const audioExts = new Set(['.mp3','.flac','.wav','.ogg','.m4a','.aac','.wma','.opus','.ape','.wv','.aiff','.dsf','.dff','.mp4','.mkv'])
-    const audioFiles = dirEntries.filter(e => audioExts.has(e.slice(e.lastIndexOf('.')).toLowerCase()))
-    if (audioFiles.length === 1) return candidates[0]
-  }
-
-  return null
-}
-
 async function loadLrcForTrack(t) {
   lrc = []
   _lastLrcActiveIdx = -1
@@ -1002,7 +869,7 @@ async function loadLrcForTrack(t) {
     if (!lyricsContent) {
       const dirEntries = await api.listDir(dir)
       if (dirEntries && dirEntries.length > 0) {
-        const match = _findBestLyricsMatch(nameWithoutExt, ext, dirEntries)
+        const match = findBestLyricsMatch(nameWithoutExt, ext, dirEntries)
         if (match) {
           const matchPath = dir + sep + match.filename
           const matchLower = match.filename.toLowerCase()
@@ -1181,7 +1048,7 @@ function updPlayBtn() { $('icon-play').style.display = S.playing ? 'none' : ''; 
 // === Render ===
 function renderAll() {
   invalidateFavCache()
-  renderSB(); renderContent()
+  renderSB(); renderContent(); syncPlayingState()
   requestAnimationFrame(() => _initColumnHandlers($('content-area')))
   renderPanel(); updPlayBtn(); syncAllListsPlaying(); schedSave()
 }
@@ -1226,8 +1093,7 @@ function renderContent() {
     const fav = S.favs.find(f => f.id === S.aF)
     if (fav) {
       bc.innerHTML = `<button class="btn-breadcrumb-back" id="btn-fav-back">← 返回</button><span class="breadcrumb-sep">|</span><button class="breadcrumb-item current">${esc(fav.name)}</button>`
-      const tks = tracksFromIds(fav.trackIds)
-      pl = tks
+      const tks = _setViewPlaylist(tracksFromIds(fav.trackIds))
       ca.innerHTML = renderFContent(fav, tks); return
     }
   }
@@ -1235,8 +1101,7 @@ function renderContent() {
     const plObj = S.pls.find(p => p.id === S.aPl)
     if (plObj) {
       bc.innerHTML = `<button class="btn-breadcrumb-back" id="btn-pl-back">← 返回</button><span class="breadcrumb-sep">|</span><button class="breadcrumb-item current">${esc(plObj.name)}</button>`
-      const tks = tracksFromIds(plObj.trackIds)
-      pl = tks
+      const tks = _setViewPlaylist(tracksFromIds(plObj.trackIds))
       ca.innerHTML = renderPContent(plObj, tks); return
     }
   }
@@ -1273,6 +1138,12 @@ function sortFolders(arr) {
   return sorted
 }
 
+function _setViewPlaylist(tracks) {
+  pl = _applySortToTracks(tracks || [])
+  if (S.playingTid) syncPlayingState()
+  return pl
+}
+
 function folderSortBtnHTML() {
   const modes = [['name', '名称'], ['time', '最近修改'], ['tracks', '曲目数']]
   const isList = S.folderView === 'list'
@@ -1303,7 +1174,8 @@ function renderFolderAll() {
     }
     if (pl.length) {
       if (html) html += '<div style="height:20px"></div>'
-      html += `<div class="section-title">音乐<span>${pl.length} 首</span></div><button class="btn-primary" style="margin-bottom:12px" data-pall="search"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>播放全部</button>${tableVT('vl-search', pl, (idx) => playT(idx, true))}`
+      const tks = _setViewPlaylist(pl)
+      html += `<div class="section-title">音乐<span>${tks.length} 首</span></div><button class="btn-primary" style="margin-bottom:12px" data-pall="search"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>播放全部</button>${tableVT('vl-search', tks, (idx) => playT(idx, true))}`
     }
     ca.innerHTML = html
     return
@@ -1349,12 +1221,6 @@ function folderCardHTML(n) {
   return `<div class="card folder-card" data-fp="${esc(n.path)}"><div class="card-cover folder-card-cover">${coverBg ? `<img src="${coverBg}" alt="" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></div>'}</div><div class="card-body"><div class="card-title">${esc(n.name)}</div><div class="card-subtitle">${subtitle}</div></div></div>`
 }
 
-function tableH(tracks) {
-  const cols = _buildColString()
-  const header = _tableHeaderHTML()
-  const items = tracks.map((t, i) => _trackRowHTML(t, i, cols)).join('')
-  return `<div class="song-table">${header}${items}</div>`
-}
 
 function _trackRowHTML(t, i, cols) {
   if (!cols) cols = _buildColString()
@@ -1385,36 +1251,25 @@ function emptyS(title, desc, btn) {
 }
 
 // === Folder View ===
-function findNodeByPath(tree, path) {
-  if (!tree || !path) return null
-  const np = path.replace(/\\/g, '/')
-  for (const n of tree) {
-    const npath = n.path.replace(/\\/g, '/')
-    if (npath === np) return n
-    const r = findNodeByPath(n.children, np)
-    if (r) return r
-  }
-  return null
-}
-
 function renderFolderNode(node) {
   const bc = $('breadcrumb')
-  // Build breadcrumb HTML in one pass
   let bcHtml = ''
   if (S.folderStack.length > 0) {
     bcHtml = `<button class="btn-breadcrumb-back" id="btn-folder-back"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align:middle;margin-right:3px"><polyline points="15,18 9,12 15,6"/></svg>返回</button><span class="breadcrumb-sep">|</span>`
   }
   bcHtml += `<button class="breadcrumb-item" data-fp-root="">\u5168\u90e8\u97f3\u4e50</button>`
   for (let i = 0; i < S.folderStack.length; i++) {
-    const fp_i = S.folderStack[i]; const fn = findNodeByPath(S.folderTree, fp_i); const nm = fn ? fn.name : fp_i.split(/[\\/]/).pop()
+    const fp_i = S.folderStack[i]
+    const fn = findNodeByPath(S.folderTree, fp_i)
+    const nm = fn ? fn.name : fp_i.split(/[\\/]/).pop()
     bcHtml += `<span class="breadcrumb-sep">/</span><button class="breadcrumb-item${i === S.folderStack.length - 1 ? ' current' : ''}" data-fp="${esc(fp_i)}">${esc(nm)}</button>`
   }
   bc.innerHTML = bcHtml
+
   const meta = S._folderMeta || {}
   const validChildren = sortFolders(node.children.filter(c => meta[c.path]?.hasMusic))
   let html = ''
 
-  // Subfolder cards only (click to navigate)
   if (validChildren.length > 0) {
     const isList = S.folderView === 'list'
     const childHtml = isList ? validChildren.map(c => folderListRowHTML(c)).join('') : validChildren.map(c => folderCardHTML(c)).join('')
@@ -1422,27 +1277,22 @@ function renderFolderNode(node) {
     html += `<div class="section-title">\u5b50\u6587\u4ef6\u5939<span>${validChildren.length} \u4e2a</span></div>${folderSortBtnHTML()}<div class="${containerCls}">${childHtml}</div>`
   }
 
-  // Direct tracks in this folder
   if (node.tracks.length > 0) {
-    const allTracks = [...node.tracks]
-    pl = allTracks
-    const fCols = _buildColString()
+    const allTracks = _setViewPlaylist([...node.tracks])
     const fHeader = _tableHeaderHTML()
     html += `<div class="section-title" style="margin-top:${validChildren.length > 0 ? '24px' : '0'}">\u97f3\u4e50<span>${allTracks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pfolder="${esc(node.path)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><div class="song-table">${fHeader}<div id="vl-songs"></div></div>`
   }
+
   $('content-area').innerHTML = html || '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u7a7a\u6587\u4ef6\u5939</h3></div>'
   if (node.tracks.length > 0) {
     const fCols = _buildColString()
-    virtualList('vl-songs', [...node.tracks], 46, (t, i) => {
-      const cols = fCols
-      const isPlaying = S.playingTid && t.id === S.playingTid
-      const playState = isPlaying ? (S.playing ? 'is-playing-state' : 'is-paused-state') : ''
-      const isVid = isVideoFile(t)
-      const liked = isDefaultFavTrack(t.id)
-      return `<div class="song-row${isPlaying ? ' playing' : ''} ${playState}" data-tid="${t.id}" style="grid-template-columns:${cols}"><div class="song-row-idx"><span class="idx-num">${i + 1}</span><span class="idx-play-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg></span><span class="idx-wave"><span class="wave-bar"></span><span class="wave-bar"></span><span class="wave-bar"></span></span></div><div class="song-row-title">${esc(nName(t))}</div><div class="song-row-artist">${esc(t.metaArtist || t.artist)}</div><div class="song-row-album">${esc(t.album || '')}</div><div class="song-row-like${liked ? ' liked' : ''}" data-tid="${t.id}">${liked ? '\u2665' : '\u2661'}</div><div class="song-row-duration">${fmtTime(t.duration)}</div><div class="song-row-format"><span>${isVid ? '\uD83C\uDFAC' : ''}${(t.format || '').toUpperCase()}</span></div></div>`
-    }, (tid, keepView) => { const idx = pl.findIndex(t => t.id === tid); if (idx >= 0) playT(idx, keepView) })
+    virtualList('vl-songs', pl, 46, (t, i) => _trackRowHTML(t, i, fCols), (tid, keepView) => {
+      const idx = pl.findIndex(t => t.id === tid)
+      if (idx >= 0) playT(idx, keepView)
+    })
   }
 }
+
 
 // Remember scroll position per folder level so going back restores it
 const _folderScrollPos = new Map()
@@ -1491,9 +1341,8 @@ function navigateFolderTo(path) {
 // === Recent View ===
 function renderRecentView() {
   $('breadcrumb').innerHTML = `<button class="breadcrumb-item current">\u6700\u8fd1\u64ad\u653e</button>`
-  const tks = tracksFromIds(S.recents)
+  const tks = _setViewPlaylist(tracksFromIds(S.recents))
   if (!tks.length) { $('content-area').innerHTML = emptyS('\u8fd8\u6ca1\u6709\u64ad\u653e\u8bb0\u5f55', '\u5f00\u59cb\u64ad\u653e\u97f3\u4e50\u540e\u4f1a\u81ea\u52a8\u8bb0\u5f55', false); return }
-  pl = tks
   $('content-area').innerHTML = `<div class="section-title">\u6700\u8fd1\u64ad\u653e<span>${tks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pall="recent"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button>${tableVT('vl-recent', tks, (idx) => playT(idx, true))}`
 }
 
@@ -1856,7 +1705,7 @@ async function importFolder() {
     const allIds = new Set(at.map(t => t.id))
     cleanupStale(allIds)
     S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = []; S.activeFp = null
-    pl = at
+    _setViewPlaylist(at)
     if (S.playingTid && !allIds.has(S.playingTid)) { S.playingTid = null; S.playing = false; audio.pause(); lrc = [] }
     if (r.fileCount > 0) { updT(tid, '完成✔', 100, `共 ${r.fileCount || at.length} 首音乐`); rmT(tid) } else { updT(tid, '未找到音乐', 0, '请检查文件夹内容'); setTimeout(() => rmT(tid), 5000) }
     await restartWatching()
@@ -1902,12 +1751,12 @@ async function rescan() {
     cleanupStale(allIds)
     if (S.aF) {
       const fav = S.favs.find(f => f.id === S.aF)
-      pl = fav ? tracksFromIds(fav.trackIds) : at
+      _setViewPlaylist(fav ? tracksFromIds(fav.trackIds) : at)
     } else if (S.aPl) {
       const plObj = S.pls.find(p => p.id === S.aPl)
-      pl = plObj ? tracksFromIds(plObj.trackIds) : at
+      _setViewPlaylist(plObj ? tracksFromIds(plObj.trackIds) : at)
     } else {
-      pl = at
+      _setViewPlaylist(at)
     }
     if (currentTrackId) {
       const newIdx = pl.findIndex(t => t.id === currentTrackId)
@@ -2331,12 +2180,12 @@ $('content-area').addEventListener('click', e => {
     const row = e.target.closest('.song-row'); if (row && row.dataset.tid) { const idx = pl.findIndex(tk => tk.id === row.dataset.tid); if (idx >= 0) playT(idx, true); return }
   }
   const t = e.target.closest('.song-row'); if (t && t.dataset.tid) { /* single click does nothing, use dblclick or play button */ return }
-  if (e.target.closest('[data-ppl]')) { const el = e.target.closest('[data-ppl]'); const pid = el.dataset.ppl; const p = S.pls.find(x => x.id === pid); if (p) { const tks = tracksFromIds(p.trackIds); playAll(tks) } return }
-  if (e.target.closest('[data-pfav]')) { const el = e.target.closest('[data-pfav]'); const fid = el.dataset.pfav; const f = S.favs.find(x => x.id === fid); if (f) { const tks = tracksFromIds(f.trackIds); playAll(tks) } return }
-  if (e.target.closest('[data-pall]')) { playAll(S.all); return }
+  if (e.target.closest('[data-ppl]')) { const el = e.target.closest('[data-ppl]'); const pid = el.dataset.ppl; const p = S.pls.find(x => x.id === pid); if (p) { const tks = S.aPl === pid ? pl : _applySortToTracks(tracksFromIds(p.trackIds)); playAll(tks) } return }
+  if (e.target.closest('[data-pfav]')) { const el = e.target.closest('[data-pfav]'); const fid = el.dataset.pfav; const f = S.favs.find(x => x.id === fid); if (f) { const tks = S.aF === fid ? pl : _applySortToTracks(tracksFromIds(f.trackIds)); playAll(tks) } return }
+  if (e.target.closest('[data-pall]')) { if (pl.length) playAll(pl); return }
   if (e.target.closest('[data-pfolder]')) {
     const el = e.target.closest('[data-pfolder]'); const fpPath = el.dataset.pfolder; const n = findNodeByPath(S.folderTree, fpPath)
-    if (n) { const all = collectAllTracks(n); if (all.length) { pl = all; playT(0); renderPanel() } }
+    if (n) { const all = _applySortToTracks(collectAllTracks(n)); if (all.length) playAll(all) }
     return
   }
   if (e.target.closest('[data-delpl]')) { rmP(e.target.closest('[data-delpl]').dataset.delpl); return }
@@ -2432,11 +2281,11 @@ function showFolderCtx(e, folderPath) {
         }
         if (S.aF) {
           const fav = S.favs.find(f => f.id === S.aF)
-          pl = fav ? tracksFromIds(fav.trackIds) : at
+          _setViewPlaylist(fav ? tracksFromIds(fav.trackIds) : at)
         } else if (S.aPl) {
           const plObj = S.pls.find(p => p.id === S.aPl)
-          pl = plObj ? tracksFromIds(plObj.trackIds) : at
-        } else { pl = at }
+          _setViewPlaylist(plObj ? tracksFromIds(plObj.trackIds) : at)
+        } else { _setViewPlaylist(at) }
         if (S.playingTid && !allIds.has(S.playingTid)) { S.playingTid = null; S.playing = false; audio.pause(); lrc = [] }
         updT(tid, '完成✔', 100, `共 ${r.fileCount || at.length} 首`)
         rmT(tid)
@@ -2485,7 +2334,7 @@ function showRecentCtx(e) {
   m.onclick = async function (ev) {
     const b = ev.target.closest('button'); if (!b) return
     if (b.dataset.a === 'playrecent') {
-      const tks = tracksFromIds(S.recents)
+      const tks = _applySortToTracks(tracksFromIds(S.recents))
       if (tks.length) playAll(tks)
       hC()
       return
@@ -2510,7 +2359,7 @@ function showPlaylistEmptyCtx(e, plid) {
   m.style.top = Math.min(e.clientY, window.innerHeight - 100) + 'px'
   m.onclick = function (ev) {
     const b = ev.target.closest('button'); if (!b) return
-    if (b.dataset.a === 'playall') { const plObj = S.pls.find(p => p.id === plid); const tks = plObj ? tracksFromIds(plObj.trackIds) : []; if (tks.length) playAll(tks); hC(); return }
+    if (b.dataset.a === 'playall') { const plObj = S.pls.find(p => p.id === plid); const tks = plObj ? _applySortToTracks(tracksFromIds(plObj.trackIds)) : []; if (tks.length) playAll(tks); hC(); return }
     if (b.dataset.a === 'rename') { rnP(plid); hC(); return }
     if (b.dataset.a === 'delete') { rmP(plid); hC(); return }
     hC()
@@ -2527,7 +2376,7 @@ function showFavoriteEmptyCtx(e, fvid) {
   m.style.top = Math.min(e.clientY, window.innerHeight - 120) + 'px'
   m.onclick = function (ev) {
     const b = ev.target.closest('button'); if (!b) return
-    if (b.dataset.a === 'playall') { const tks = tracksFromIds(fav.trackIds); if (tks.length) playAll(tks); hC(); return }
+    if (b.dataset.a === 'playall') { const tks = _applySortToTracks(tracksFromIds(fav.trackIds)); if (tks.length) playAll(tks); hC(); return }
     if (b.dataset.a === 'rename') { rnF(fvid); hC(); return }
     if (b.dataset.a === 'delete') { rmF(fvid); hC(); return }
     hC()
@@ -2556,12 +2405,12 @@ function exitSearch() {
     if (S._prevFolderStack) { S.folderStack = S._prevFolderStack; S._prevFolderStack = null }
     if (S._prevActiveFp !== undefined) { S.activeFp = S._prevActiveFp; S._prevActiveFp = undefined }
     // Restore the playlist/fav track list
-    if (S.aF) { const fav = S.favs.find(f => f.id === S.aF); pl = fav ? tracksFromIds(fav.trackIds) : S.all }
-    else if (S.aPl) { const plObj = S.pls.find(p => p.id === S.aPl); pl = plObj ? tracksFromIds(plObj.trackIds) : S.all }
-    else { pl = S.all }
+    if (S.aF) { const fav = S.favs.find(f => f.id === S.aF); _setViewPlaylist(fav ? tracksFromIds(fav.trackIds) : S.all) }
+    else if (S.aPl) { const plObj = S.pls.find(p => p.id === S.aPl); _setViewPlaylist(plObj ? tracksFromIds(plObj.trackIds) : S.all) }
+    else { _setViewPlaylist(S.all) }
     activeLrcTab = 'lyrics'; S.prevView = null; S._prevAF = null; S._prevAPl = null
   }
-  else { pl = S.all; S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = [] }
+  else { _setViewPlaylist(S.all); S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = [] }
   syncPlayingState()
   if (S.playingTid) { const idx = pl.findIndex(t => t.id === S.playingTid); S.tI = idx >= 0 ? idx : -1; nI = idx >= 0 ? idx : 0 }
   renderAll(); schedSave()
@@ -2777,7 +2626,7 @@ $('search-input').addEventListener('keydown', e => {
     S.view = 'all'; S.aF = null; S.aPl = null; S.folderStack = []; S.activeFp = null
     if (S.tI >= 0 && pl[S.tI]) S.playingTid = pl[S.tI].id
     // Search by track metadata (fuzzy: substring + pinyin initials)
-    pl = S.all.filter(t => fuzzyMatch(t.name, q) || fuzzyMatch(t.artist, q) || fuzzyMatch(t.metaArtist, q) || fuzzyMatch(t.album, q))
+    _setViewPlaylist(S.all.filter(t => fuzzyMatch(t.name, q) || fuzzyMatch(t.artist, q) || fuzzyMatch(t.metaArtist, q) || fuzzyMatch(t.album, q)))
     // Search by folder name (fuzzy)
     function findFoldersByName(nodes) {
       const results = []
@@ -2830,17 +2679,14 @@ audio.addEventListener('timeupdate', () => {
   }
 })
 audio.addEventListener('loadedmetadata', () => {
+  if (!Number.isFinite(audio.duration) || audio.duration <= 0) return
   S.dur = audio.duration
   _progressDuration.textContent = fmtTime(S.dur)
-  // Write back real duration to track object (fixes video files showing 0:00 in list)
-  if (pl.length > 0 && S.tI >= 0) {
-    const ct = pl[S.tI]
-    if (ct && !ct.duration && audio.duration > 0) {
-      ct.duration = Math.round(audio.duration)
-      // Update the duration cell in the visible list row
-      const row = document.querySelector(`.song-row[data-tid="${ct.id}"] .song-row-duration`)
-      if (row) row.textContent = fmtTime(ct.duration)
-    }
+  const tid = S.playingTid || (S.tI >= 0 ? pl[S.tI]?.id : null)
+  const duration = Math.round(audio.duration)
+  if (tid && _setTrackDurationById(tid, duration)) {
+    _updateVisibleDurationCells(tid, duration)
+    if (S.view === 'lyrics') renderLrcContent()
   }
 })
 audio.addEventListener('ended', () => { if (!dsdState.active) hEnd() })
@@ -3065,41 +2911,6 @@ function commitImgChanges() {
   S._imgEditState.posY = imgDrag.posY * ratio
   S._imgEditState.vw = vw; S._imgEditState.vh = vh
   schedSave(); apThBg()
-}
-
-function hasMusicRecursive(node) {
-  if (!node) return false
-  if (node.tracks && node.tracks.length > 0) return true
-  for (const c of (node.children || [])) { if (hasMusicRecursive(c)) return true }
-  return false
-}
-
-// Precompute folder metadata in a single tree traversal to avoid repeated recursive scans
-function buildFolderMeta(tree) {
-  const meta = {}
-  function walk(node) {
-    const p = node.path
-    let trackCount = (node.tracks || []).length
-    let hasMusic = trackCount > 0
-    let coverData = node.coverData || null
-    let validChildCount = 0
-    for (const c of (node.children || [])) {
-      walk(c)
-      const childMeta = meta[c.path]
-      if (childMeta && childMeta.hasMusic) {
-        validChildCount++
-        hasMusic = true
-        trackCount += childMeta.trackCount
-        if (!coverData && childMeta.coverData) coverData = childMeta.coverData
-      }
-    }
-    if (!coverData && node.tracks && node.tracks.length) {
-      for (const t of node.tracks) { if (t.coverData) { coverData = t.coverData; break } }
-    }
-    meta[p] = { trackCount, hasMusic, validChildCount, coverData }
-  }
-  for (const n of (tree || [])) walk(n)
-  return meta
 }
 
 // Panel
