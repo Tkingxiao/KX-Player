@@ -4,14 +4,11 @@ import fs from 'node:fs'
 import IconvLite from 'iconv-lite'
 import * as musicMetadata from 'music-metadata'
 
-const DSD_EXTS = new Set(['.dsf', '.dff', '.dsd'])
-const VIDEO_EXTS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'])
-
 // Format categories for smart parsing strategy
 // Fast formats: well-structured headers, quick to parse
 const FAST_EXTS = new Set(['.mp3', '.flac', '.ogg', '.oga', '.opus', '.m4a', '.mp4', '.aac', '.wav', '.aiff', '.aif', '.wma', '.asf'])
 // Slow formats: complex structures, may need full file scanning
-const SLOW_EXTS = new Set(['.ape', '.dsf', '.dff', '.dsd', '.mpc', '.wv', '.tak', '.spx'])
+const SLOW_EXTS = new Set(['.ape', '.mpc', '.wv', '.tak', '.spx'])
 
 // Skip full metadata parsing for files larger than this threshold (bytes).
 // For ASMR/audio files >10MB, music-metadata is very slow due to cover
@@ -86,14 +83,10 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
     const ext = path.extname(filePath).toLowerCase()
     const stat = fs.statSync(filePath)
 
-    // Skip music-metadata for video files; use filename only
-    if (VIDEO_EXTS.has(ext)) {
-      return extractBasicInfo(filePath)
-    }
 
     // Smart parsing strategy based on format and file size:
     // 1. Very large files (>500MB): skip duration, estimate from bitrate
-    // 2. Slow formats (APE, DSD, etc.): use shorter timeout, skip duration for large files
+    // 2. Slow formats (APE, etc.): use shorter timeout, skip duration for large files
     // 3. Fast formats (MP3, FLAC, etc.): full parse with duration
     
     const isVeryLarge = stat.size > VERY_LARGE_FILE
@@ -102,9 +95,9 @@ async function parseFile(filePath: string): Promise<WorkerResultItem | null> {
 
     let skipDuration = false
     if (isVeryLarge) {
-      // For very large files, skip duration calculation (requires full file scan)
-      // Duration will be estimated from bitrate after parsing
-      skipDuration = true
+      // Fast container formats (including MP4/M4A) expose duration in headers,
+      // so keep parsing duration for them even when the file is large.
+      skipDuration = !isFastFormat
     } else if (isSlowFormat && stat.size > LARGE_FILE_SKIP_PARSE) {
       // For slow formats >10MB, also skip duration to avoid long scans
       skipDuration = true
