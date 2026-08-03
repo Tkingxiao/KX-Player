@@ -7,7 +7,7 @@ import chokidar from 'chokidar'
 import * as musicMetadata from 'music-metadata'
 import { getCoversDir } from './coverService'
 
-const AUDIO_EXTS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.m4a', '.aac', '.wma', '.opus', '.ape', '.wv', '.aiff', '.alac', '.dsf', '.dff', '.dsd'])
+const AUDIO_EXTS = new Set(['.mp3', '.flac', '.wav', '.ogg', '.m4a', '.aac', '.wma', '.opus', '.ape', '.wv', '.aiff', '.alac'])
 const VIDEO_EXTS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv'])
 const ALL_EXTS = new Set([...AUDIO_EXTS, ...VIDEO_EXTS])
 
@@ -401,7 +401,9 @@ async function enrichWithWorkers(
     if (i > 0 && i % YIELD_INTERVAL === 0) await yieldToEventLoop()
     const stat = getFileStat(filePath)
     const cached = existingMeta.get(filePath.replace(/\\/g, '/'))
-    if (stat && cached && cached.fileMtime === stat.mtime && cached.fileSize === stat.size) {
+    const ext = path.extname(filePath).toLowerCase()
+    const shouldRefreshZeroVideoDuration = cached && VIDEO_EXTS.has(ext) && (cached.duration || 0) <= 0
+    if (stat && cached && !shouldRefreshZeroVideoDuration && cached.fileMtime === stat.mtime && cached.fileSize === stat.size) {
       results.set(filePath, {
         duration: cached.duration,
         coverData: null, // Cover preserved by saveLibrarySnapshot's DB fallback
@@ -1077,12 +1079,15 @@ export async function scanFoldersIncremental(
     const cached = existingMeta.get(normalizedPath)
     if (!cached) { changedFiles.push(filePath); continue }
     const stat = getFileStat(filePath)
-    if (!stat || cached.fileMtime !== stat.mtime || cached.fileSize !== stat.size) {
+    const ext = path.extname(filePath).toLowerCase()
+    const shouldRefreshZeroVideoDuration = VIDEO_EXTS.has(ext) && (cached.duration || 0) <= 0
+    if (!stat || shouldRefreshZeroVideoDuration || cached.fileMtime !== stat.mtime || cached.fileSize !== stat.size) {
       changedFiles.push(filePath)
     }
   }
 
   console.log(`[scan-incr] ${changedFiles.length} new/changed out of ${totalFiles} files`)
+  const changedFileSet = new Set(changedFiles)
 
   // Build metaResults from existing data
   const metaResults = new Map<string, {
@@ -1092,7 +1097,7 @@ export async function scanFoldersIncremental(
   for (const filePath of files) {
     const normalizedPath = filePath.replace(/\\/g, '/')
     const cached = existingMeta.get(normalizedPath)
-    if (cached) {
+    if (cached && !changedFileSet.has(filePath)) {
       metaResults.set(filePath, {
         duration: cached.duration,
         coverData: cached.coverData,

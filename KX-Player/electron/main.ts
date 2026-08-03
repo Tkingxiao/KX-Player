@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, clipboard, shell, Tray, Menu, nati
 import path from 'node:path'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
-import { execFile, spawn } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { scanFoldersWithProgress, scanFoldersIncremental, startWatching, stopWatching, terminateWorkerPool } from './fileScanner'
 import { loadLibrarySnapshot, loadTrackListSnapshot, loadTrackMetadataIndex, loadFullMetadataIndex, saveLibrarySnapshot } from './libraryDb'
 import { initCoverDir, loadFolderCoverMap, saveTrackCover, saveFolderCover, saveExternalCover, setFolderCoverMapping, getTrackCoverDataUrl, getTrackCoversBatch, getFolderCoverByMapping, getAllFolderCoversFromMap, findExternalCoverInDir, getCoversDir } from './coverService'
@@ -55,24 +55,6 @@ function getLibraryDbPath(): string {
 function getBgImagePath(): string {
   // Keep background image in userData so it survives version upgrades
   return path.join(getUserDataDir(), 'kx-player-bg.png')
-}
-
-function getDsdTempDir(): string {
-  const dir = path.join(getUserDataDir(), 'dsd-temp')
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-  return dir
-}
-
-function cleanupDsdTemp() {
-  try {
-    const dir = getDsdTempDir()
-    if (fs.existsSync(dir)) {
-      const files = fs.readdirSync(dir)
-      for (const f of files) {
-        try { fs.unlinkSync(path.join(dir, f)) } catch { /* ignore */ }
-      }
-    }
-  } catch { /* ignore */ }
 }
 
 function createWindow() {
@@ -180,7 +162,7 @@ ipcMain.handle('dialog:openImageFile', async () => {
 ipcMain.handle('dialog:openAudioFiles', async () => {
   if (!mainWindow) return []
   const result = await dialog.showOpenDialog(mainWindow, {
-    filters: [{ name: '音频/视频', extensions: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'wma', 'opus', 'ape', 'wv', 'aiff', 'dsf', 'dff', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'] }],
+    filters: [{ name: '音频/视频', extensions: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'wma', 'opus', 'ape', 'wv', 'aiff', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'] }],
     properties: ['openFile', 'multiSelections'],
   })
   return result.canceled ? [] : result.filePaths
@@ -862,53 +844,6 @@ ipcMain.handle('ffmpeg:exec', async (_event, args: string[]) => {
 })
 
 
-ipcMain.handle('dsd:decodePcm', async (_event, filePath: string) => {
-  const exe = getFfmpegExe()
-  if (!exe) return { ok: false, error: 'ffmpeg.exe 未找到' }
-
-  return new Promise((resolve) => {
-    const child = spawn(exe, [
-      '-v', 'error',
-      '-i', filePath,
-      '-f', 's16le',
-      '-acodec', 'pcm_s16le',
-      '-ar', '44100',
-      '-ac', '2',
-      '-',
-    ], { stdio: ['ignore', 'pipe', 'pipe'] })
-
-    const stdoutChunks: Buffer[] = []
-    const stderrChunks: Buffer[] = []
-    let settled = false
-    let timeoutTimer: NodeJS.Timeout | null = null
-
-    const finish = (payload: unknown) => {
-      if (settled) return
-      settled = true
-      if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null }
-      resolve(payload)
-    }
-
-    child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(Buffer.from(chunk)))
-    child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(Buffer.from(chunk)))
-    child.on('error', (error) => finish({ ok: false, error: error.message }))
-    child.on('close', (code) => {
-      if (code !== 0) {
-        const stderr = Buffer.concat(stderrChunks).toString('utf-8').trim()
-        finish({ ok: false, error: stderr || `ffmpeg exited with code ${code}` })
-        return
-      }
-      const pcmBuffer = Buffer.concat(stdoutChunks)
-      finish({ ok: true, sampleRate: 44100, channels: 2, bitsPerSample: 16, pcmBase64: pcmBuffer.toString('base64') })
-    })
-
-    timeoutTimer = setTimeout(() => {
-      try { child.kill() } catch { }
-      finish({ ok: false, error: 'DSD decode timeout' })
-    }, 600000)
-  })
-})
-
 // Save converted audio file to disk
 ipcMain.handle('tools:saveFile', async (_event, filePath: string, base64Data: string) => {
   try {
@@ -1021,10 +956,7 @@ ipcMain.handle('window:forceClose', async () => {
 
 ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
 
-ipcMain.handle('dsd:getTempPath', () => getDsdTempDir())
-
 app.on('before-quit', async () => {
-  cleanupDsdTemp()
   terminateWorkerPool()
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {

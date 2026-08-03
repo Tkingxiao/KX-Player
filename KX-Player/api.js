@@ -41,7 +41,6 @@ export const api={
   onBeforeClose:cb=>{if(e.onBeforeClose)e.onBeforeClose(cb)},
   toolsSaveFile:(f,b)=>e.toolsSaveFile?e.toolsSaveFile(f,b):Promise.resolve(false),
   ffmpegExec:a=>e.ffmpegExec?e.ffmpegExec(a):Promise.resolve({code:-1,error:'not available'}),
-  dsdDecodePcm:p=>e.dsdDecodePcm?e.dsdDecodePcm(p):Promise.resolve({ok:false,error:'not available'}),
   startWatching:paths=>e.startWatching?e.startWatching(paths):Promise.resolve(),
   stopWatching:()=>{if(e.stopWatching)e.stopWatching()},
   onFsChanged:cb=>{if(e.onFsChanged)return e.onFsChanged(cb)},
@@ -49,7 +48,6 @@ export const api={
   loadBgImage:()=>e.loadBgImage?e.loadBgImage():null,
   saveBgImage:d=>e.saveBgImage?e.saveBgImage(d):Promise.resolve(false),
   removeBgImage:()=>e.removeBgImage?e.removeBgImage():Promise.resolve(),
-  dsdTempPath:()=>e.dsdTempPath?e.dsdTempPath():'',
   clipboardWriteText:text=>e.clipboardWriteText?e.clipboardWriteText(text):Promise.resolve(false),
   showItemInFolder:filePath=>e.showItemInFolder?e.showItemInFolder(filePath):Promise.resolve(false),
 }

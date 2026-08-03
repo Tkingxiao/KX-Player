@@ -62,8 +62,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   removeBgImage: () => ipcRenderer.invoke('bgImage:remove'),
   toolsSaveFile: (filePath: string, base64Data: string) => ipcRenderer.invoke('tools:saveFile', filePath, base64Data),
   ffmpegExec: (args: string[]) => ipcRenderer.invoke('ffmpeg:exec', args),
-  dsdDecodePcm: (filePath: string) => ipcRenderer.invoke('dsd:decodePcm', filePath),
-  dsdTempPath: () => ipcRenderer.invoke('dsd:getTempPath'),
   clipboardWriteText: (text: string) => ipcRenderer.invoke('clipboard:writeText', text),
   showItemInFolder: (filePath: string) => ipcRenderer.invoke('shell:showItemInFolder', filePath),
 })

@@ -150,18 +150,6 @@ function _initColumnHandlers(rootEl) {
 }
 
 let lyricsManualScrollUntil = 0
-let dsdState = {
-  active: false,
-  path: null,
-  context: null,
-  gainNode: null,
-  buffer: null,
-  source: null,
-  startedAt: 0,
-  pausedAt: 0,
-  duration: 0,
-  raf: 0,
-}
 
 // Cache frequently accessed DOM elements for performance
 const _progressFill = $('progress-fill')
@@ -822,18 +810,6 @@ async function loadT(idx) {
   const gen = ++_loadTGeneration
   nI = idx
   const t = pl[idx]
-  stopDsdPlayback(false)
-  if (isDsdTrack(t)) {
-    audio.pause()
-    audio.removeAttribute('src')
-    audio.load()
-    await loadLrcForTrack(t)
-    if (gen !== _loadTGeneration) return
-    await playDsdTrack(t, 0).catch(e => { console.error('DSD playback failed:', e); const tid = addT('DSD 播放失败'); updT(tid, '错误', 0, e.message); rmT(tid) })
-    if (gen !== _loadTGeneration) return
-    S.tI = idx; S.playing = true
-    return
-  }
   audio.src = 'file:///' + t.path.replace(/\\/g, '/')
   await loadLrcForTrack(t)
   if (gen !== _loadTGeneration) return
@@ -979,9 +955,7 @@ function playT(idx, keepView) {
   updPUI(t, true)
   const oldTI = S.tI
   S.tI = idx
-  const needLoad = isDsdTrack(t)
-    ? (idx !== oldTI) || !dsdState.active || dsdState.path !== t.path
-    : (idx !== oldTI) || dsdState.active || (audio.src === '' || !audio.src.includes(t.path.replace(/\\/g, '/')))
+  const needLoad = (idx !== oldTI) || (audio.src === '' || !audio.src.includes(t.path.replace(/\\/g, '/')))
   if (needLoad) {
     loadT(idx).then(() => {
       if (S.view === 'lyrics') renderContent()
@@ -1021,11 +995,10 @@ function updPUI(t, skipLrc) {
 }
 
 function hEnd() {
-  S.cTime = getPlaybackCurrentTime(); S.dur = getPlaybackDuration()
+  S.cTime = audio.currentTime; S.dur = audio.duration
   if (isNaN(S.dur)) return
   if (S.mode === 2) {
-    if (isCurrentTrackDsd()) playT(S.tI, true)
-    else { audio.currentTime = 0; audio.play().catch(() => { /* ignore */ }) }
+    audio.currentTime = 0; audio.play().catch(() => { /* ignore */ })
   }
   else if (S.mode === 3) { S.playing = false; updPlayBtn(); updPUI(pl[S.tI]); syncAllListsPlaying() }
   else nxt()
@@ -1460,135 +1433,6 @@ function clearRecents() {
   S.recents = []
   if (S.view === 'recent') renderAll()
   else schedSave()
-}
-
-function isDsdTrack(track) {
-  const ext = (track?.format || '').toLowerCase()
-  return ext === 'dsf' || ext === 'dff' || ext === 'dsd'
-}
-
-function isCurrentTrackDsd() {
-  const track = pl[S.tI]
-  return isDsdTrack(track)
-}
-
-function getPlaybackDuration() {
-  return dsdState.active ? dsdState.duration : audio.duration
-}
-
-function getPlaybackCurrentTime() {
-  if (!dsdState.active || !dsdState.context) return audio.currentTime
-  if (!S.playing) return dsdState.pausedAt || 0
-  return Math.min(dsdState.duration, Math.max(0, dsdState.pausedAt + (dsdState.context.currentTime - dsdState.startedAt)))
-}
-
-function stopDsdPlayback(resetTime = true) {
-  if (dsdState.raf) {
-    cancelAnimationFrame(dsdState.raf)
-    dsdState.raf = 0
-  }
-  if (dsdState.source) {
-    try { dsdState.source.onended = null } catch { /* ignore */ }
-    try { dsdState.source.stop() } catch { /* ignore */ }
-    try { dsdState.source.disconnect() } catch { /* ignore */ }
-  }
-  if (dsdState.context) {
-    try { dsdState.context.close() } catch { /* ignore */ }
-  }
-  dsdState.source = null
-  dsdState.context = null
-  dsdState.gainNode = null
-  dsdState.buffer = null
-  dsdState.active = false
-  dsdState.path = null
-  dsdState.startedAt = 0
-  if (resetTime) dsdState.pausedAt = 0
-  dsdState.duration = 0
-}
-
-function syncDsdVolume() {
-  if (!dsdState.active || !dsdState.gainNode) return
-  dsdState.gainNode.gain.value = S.muted ? 0 : (S.vol / 100)
-}
-
-function startDsdProgressLoop() {
-  if (!dsdState.active) return
-  if (dsdState.raf) cancelAnimationFrame(dsdState.raf)
-  const tick = () => {
-    if (!dsdState.active) return
-    if (S.playing) {
-      S.cTime = getPlaybackCurrentTime()
-      if (!_progressDragging) {
-        const p = S.dur ? (S.cTime / S.dur) * 100 : 0
-        _progressFill.style.width = p + '%'
-        _progressHandle.style.left = p + '%'
-        _progressCurrent.textContent = fmtTime(S.cTime)
-      }
-    }
-    dsdState.raf = requestAnimationFrame(tick)
-  }
-  dsdState.raf = requestAnimationFrame(tick)
-}
-
-async function playDsdTrack(track, seekTime = 0) {
-  stopDsdPlayback(false)
-  audio.pause()
-  audio.removeAttribute('src')
-  audio.load()
-  const decoded = await api.dsdDecodePcm(track.path)
-  if (!decoded || !decoded.ok || !decoded.pcmBase64) throw new Error(decoded?.error || 'DSD 解码失败')
-
-  const pcmBytes = Uint8Array.from(atob(decoded.pcmBase64), c => c.charCodeAt(0))
-  const pcmView = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, Math.floor(pcmBytes.byteLength / 2))
-  const channels = decoded.channels || 2
-  const sampleRate = decoded.sampleRate || 44100
-  const frames = Math.floor(pcmView.length / channels)
-  const context = new AudioContext({ sampleRate })
-  if (context.state === 'suspended') await context.resume()
-  const gainNode = context.createGain()
-  const buffer = context.createBuffer(channels, frames, sampleRate)
-
-  for (let channel = 0; channel < channels; channel++) {
-    const channelData = buffer.getChannelData(channel)
-    for (let frame = 0; frame < frames; frame++) {
-      const sample = pcmView[frame * channels + channel] || 0
-      channelData[frame] = sample / 32768
-    }
-  }
-
-  const source = context.createBufferSource()
-  source.buffer = buffer
-  source.connect(gainNode)
-  gainNode.connect(context.destination)
-
-  dsdState.active = true
-  dsdState.path = track.path
-  dsdState.context = context
-  dsdState.gainNode = gainNode
-  dsdState.buffer = buffer
-  dsdState.source = source
-  dsdState.duration = buffer.duration
-  dsdState.pausedAt = seekTime
-  dsdState.startedAt = context.currentTime
-  syncDsdVolume()
-
-  source.onended = () => {
-    if (!dsdState.active) return
-    const endedNaturally = S.playing && (getPlaybackCurrentTime() >= dsdState.duration - 0.05)
-    stopDsdPlayback()
-    if (endedNaturally) hEnd()
-  }
-
-  source.start(0, Math.max(0, Math.min(seekTime, buffer.duration - 0.01)))
-  S.dur = buffer.duration
-  _progressDuration.textContent = fmtTime(S.dur)
-  S.cTime = seekTime
-  S.tI = pl.findIndex(item => item.id === track.id)
-  S.playingTid = track.id
-  S.playing = true
-  updPlayBtn()
-  updPlayStateClass()
-  startDsdProgressLoop()
 }
 
 function goToTrackFolder(tid) {
@@ -2199,23 +2043,7 @@ $('content-area').addEventListener('click', e => {
   const lcl = e.target.closest('.lc-line'); if (lcl && lcl.dataset.lidx) {
     const time = lrc[parseInt(lcl.dataset.lidx)]
     if (time && time.time !== undefined) {
-      if (isCurrentTrackDsd()) {
-        const track = pl[S.tI]
-        if (!track) return
-        const wasPlaying = S.playing
-        dsdState.pausedAt = time.time
-        stopDsdPlayback(false)
-        S.cTime = time.time
-        $('progress-current').textContent = fmtTime(time.time)
-        if (wasPlaying) {
-          playDsdTrack(track, time.time).catch(() => {})
-        } else {
-          updPlayBtn()
-          updPlayStateClass()
-        }
-      } else {
-        audio.currentTime = time.time
-      }
+      audio.currentTime = time.time
       // Immediately scroll clicked lyric line to center (no delay)
       lyricsManualScrollUntil = 0
       _scrollLyricToCenter(lcl, 'auto')
@@ -2493,27 +2321,13 @@ $('player-cover').addEventListener('click', () => {
 // Playback
 $('btn-play').addEventListener('click', () => {
   if (S.playing) {
-    if (dsdState.active) {
-      dsdState.pausedAt = getPlaybackCurrentTime()
-      stopDsdPlayback(false)
-    } else {
-      audio.pause()
-    }
+    audio.pause()
     S.playing = false
   } else {
     if (!pl.length && S.all.length) { pl = S.all; playT(0) }
     else if (pl.length) {
-      if (isCurrentTrackDsd()) {
-        const track = pl[S.tI >= 0 ? S.tI : 0]
-        playDsdTrack(track, dsdState.pausedAt || S.cTime || 0).then(() => {
-          S.playing = true
-          updPlayBtn()
-          updPlayStateClass()
-        }).catch(() => {})
-      } else {
-        audio.play().catch(() => { })
-        S.playing = true
-      }
+      audio.play().catch(() => { })
+      S.playing = true
     }
   }
   updPlayBtn(); schedSave()
@@ -2555,7 +2369,6 @@ $('btn-mode').addEventListener('click', () => { S.mode = (S.mode + 1) % 4; apMod
 $('btn-volume').addEventListener('click', () => {
   S.muted = !S.muted
   audio.volume = S.muted ? 0 : S.vol / 100
-  syncDsdVolume()
   $('volume-fill').style.width = S.muted ? '0%' : S.vol + '%'
   $('volume-text').textContent = S.muted ? '0' : S.vol; schedSave()
 })
@@ -2597,25 +2410,8 @@ let _progressDragging = false
     if (!_progressDragging) return
     _progressDragging = false
     fill.classList.remove('no-transition')
-    const nextTime = getRatio(e) * getPlaybackDuration()
-    if (isCurrentTrackDsd()) {
-      const track = pl[S.tI]
-      if (!track) return
-      const shouldResume = S.playing
-      dsdState.pausedAt = nextTime
-      stopDsdPlayback(false)
-      S.cTime = nextTime
-      $('progress-current').textContent = fmtTime(nextTime)
-      if (shouldResume) {
-        playDsdTrack(track, nextTime).then(() => {
-          S.playing = true
-          updPlayBtn()
-          updPlayStateClass()
-        }).catch(() => {})
-      }
-    } else {
-      audio.currentTime = nextTime
-    }
+    const nextTime = getRatio(e) * audio.duration
+    audio.currentTime = nextTime
   })
 })()
 $('search-input').addEventListener('keydown', e => {
@@ -2650,7 +2446,6 @@ function updPlayStateClass() {
 audio.addEventListener('play', () => { S.playing = true; updPlayBtn(); updPlayStateClass() })
 audio.addEventListener('pause', () => { S.playing = false; updPlayBtn(); updPlayStateClass() })
 audio.addEventListener('timeupdate', () => {
-  if (dsdState.active) return
   if (!S.playing) return; S.cTime = audio.currentTime
   if (_progressDragging) return
   const p = S.dur ? (S.cTime / S.dur) * 100 : 0
@@ -2689,8 +2484,8 @@ audio.addEventListener('loadedmetadata', () => {
     if (S.view === 'lyrics') renderLrcContent()
   }
 })
-audio.addEventListener('ended', () => { if (!dsdState.active) hEnd() })
-audio.addEventListener('error', () => { if (!dsdState.active) { S.playing = false; updPlayBtn() } })
+audio.addEventListener('ended', () => { hEnd() })
+audio.addEventListener('error', () => { S.playing = false; updPlayBtn() })
 
 // Modals
 $('settings-modal').addEventListener('click', e => {
@@ -3014,7 +2809,7 @@ async function init() {
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) return
       // Update progress bar from current audio state
-      if (!dsdState.active && audio.duration) {
+      if (audio.duration) {
         S.cTime = audio.currentTime
         const p = S.dur ? (S.cTime / S.dur) * 100 : 0
         _progressFill.style.width = p + '%'
@@ -3050,23 +2845,9 @@ async function init() {
       if (t) {
         updPUI(t)
         try {
-          if (isDsdTrack(t)) {
-            stopDsdPlayback(false)
-            await loadLrcForTrack(t)
-            if (S.playing) {
-              await playDsdTrack(t, S.cTime || 0)
-            } else {
-              S.dur = t.duration || 0
-              _progressDuration.textContent = fmtTime(S.dur)
-              S.cTime = S.cTime || 0
-              _progressCurrent.textContent = fmtTime(S.cTime)
-              dsdState.pausedAt = S.cTime || 0
-            }
-          } else {
-            audio.src = 'file:///' + t.path.replace(/\\/g, '/')
-            audio.currentTime = S.cTime || 0
-            if (S.devId && audio.setSinkId) try { await audio.setSinkId(S.devId) } catch (e) { /* ignore */ }
-          }
+          audio.src = 'file:///' + t.path.replace(/\\/g, '/')
+          audio.currentTime = S.cTime || 0
+          if (S.devId && audio.setSinkId) try { await audio.setSinkId(S.devId) } catch (e) { /* ignore */ }
         } catch (e) { /* ignore */ }
       }
     }
