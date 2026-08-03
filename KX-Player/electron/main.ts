@@ -5,7 +5,7 @@ import fsp from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { scanFoldersWithProgress, scanFoldersIncremental, startWatching, stopWatching, terminateWorkerPool } from './fileScanner'
 import { loadLibrarySnapshot, loadTrackListSnapshot, loadTrackMetadataIndex, loadFullMetadataIndex, saveLibrarySnapshot } from './libraryDb'
-import { initCoverDir, loadFolderCoverMap, saveTrackCover, saveFolderCover, saveExternalCover, setFolderCoverMapping, getTrackCoverDataUrl, getTrackCoversBatch, getFolderCoverByMapping, getAllFolderCoversFromMap, findExternalCoverInDir, getCoversDir } from './coverService'
+import { initCoverDir, loadFolderCoverMap, saveTrackCover, saveFolderCover, saveExternalCover, setFolderCoverMapping, getTrackCoverDataUrl, getTrackCoversBatchAsync, getFolderCoversBatchAsync, getFolderCoverByMapping, getAllFolderCoversFromMapAsync, findExternalCoverInDir, getCoversDir } from './coverService'
 
 // Shared MIME type mapping for image files
 const IMG_MIME: Record<string, string> = { jpg: 'jpeg', jpeg: 'jpeg', png: 'png', bmp: 'bmp', webp: 'webp', gif: 'gif' }
@@ -240,7 +240,23 @@ ipcMain.handle('library:getCovers', async (_event, trackIds: string[]) => {
     const result: Record<string, string> = {}
     for (let i = 0; i < trackIds.length; i += 100) {
       const batch = trackIds.slice(i, i + 100)
-      const covers = getTrackCoversBatch(batch)
+      const covers = await getTrackCoversBatchAsync(batch)
+      Object.assign(result, covers)
+    }
+    return result
+  } catch {
+    return {}
+  }
+})
+
+// Load cover data for specific folders from filesystem (blob storage)
+ipcMain.handle('library:getFolderCovers', async (_event, folderPaths: string[]) => {
+  try {
+    if (!folderPaths || !folderPaths.length) return {}
+    const result: Record<string, string> = {}
+    for (let i = 0; i < folderPaths.length; i += 100) {
+      const batch = folderPaths.slice(i, i + 100)
+      const covers = await getFolderCoversBatchAsync(batch)
       Object.assign(result, covers)
     }
     return result
@@ -252,7 +268,7 @@ ipcMain.handle('library:getCovers', async (_event, trackIds: string[]) => {
 // Load cover data for all folder nodes from filesystem
 ipcMain.handle('library:loadFolderCovers', async () => {
   try {
-    return getAllFolderCoversFromMap()
+    return await getAllFolderCoversFromMapAsync()
   } catch {
     return {}
   }
@@ -261,9 +277,10 @@ ipcMain.handle('library:loadFolderCovers', async () => {
 // Incremental scan: only parse new/changed files, merge with existing library
 ipcMain.handle('library:scanIncremental', async (event, folderPaths: string[]) => {
   const sender = event.sender
+  let fullMeta: Map<string, any> | null = null
   try {
     console.time('[scan-incr] loadFullMeta')
-    const fullMeta = await loadFullMetadataIndex(getLibraryDbPath())
+    fullMeta = await loadFullMetadataIndex(getLibraryDbPath())
     console.timeEnd('[scan-incr] loadFullMeta')
 
     const result = await scanFoldersIncremental(folderPaths, fullMeta,
@@ -301,6 +318,8 @@ ipcMain.handle('library:scanIncremental', async (event, folderPaths: string[]) =
   } catch (err: any) {
     console.error('[scan-incr] Fatal error:', err?.message || err)
     return { artists: [], folderTree: [], allTracks: [], fileCount: 0 }
+  } finally {
+    fullMeta?.clear()
   }
 })
 
@@ -968,4 +987,3 @@ app.on('before-quit', async () => {
 })
 
 // --- ffmpeg WASM runs entirely in renderer, no system ffmpeg needed ---
-

@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite'
 import electron from 'vite-plugin-electron'
-import renderer from 'vite-plugin-electron-renderer'
 
 export default defineConfig({
   plugins: [
@@ -11,7 +10,7 @@ export default defineConfig({
           build: {
             outDir: 'dist-electron',
             rollupOptions: {
-              external: ['electron', 'sql.js', 'sharp', 'music-metadata'],
+              external: ['electron', 'better-sqlite3', 'sharp', 'music-metadata'],
             },
           },
         },
@@ -46,7 +45,6 @@ export default defineConfig({
         },
       },
     ]),
-    renderer(),
   ],
   build: {
     outDir: 'dist',

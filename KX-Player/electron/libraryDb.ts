@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import initSqlJs from 'sql.js'
+import Database from 'better-sqlite3'
 
 export interface TrackRecord {
   id: string
@@ -56,32 +56,13 @@ export interface LibrarySnapshot {
   scannedAt: number
 }
 
-type SqlJsDatabase = InstanceType<Awaited<ReturnType<typeof initSqlJs>>['Database']>
+type AppDatabase = Database.Database
 
-let SQL: Awaited<ReturnType<typeof initSqlJs>> | null = null
-let db: SqlJsDatabase | null = null
+let db: AppDatabase | null = null
 let dbFilePath = ''
 
 function normalizePath(input: string): string {
   return input.replace(/\\/g, '/').replace(/\/+$/, '')
-}
-
-async function ensureSql() {
-  if (SQL) return SQL
-  const candidateDirs = [
-    path.join(process.resourcesPath || '', 'sqljs'),
-    path.join(process.cwd(), 'node_modules', 'sql.js', 'dist'),
-  ].filter(Boolean)
-  SQL = await initSqlJs({
-    locateFile: (file) => {
-      for (const dir of candidateDirs) {
-        const fullPath = path.join(dir, file)
-        if (fs.existsSync(fullPath)) return fullPath
-      }
-      return path.join(candidateDirs[0] || process.cwd(), file)
-    },
-  })
-  return SQL
 }
 
 function ensureParentDir(filePath: string) {
@@ -89,24 +70,21 @@ function ensureParentDir(filePath: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 }
 
-function openDatabase(filePath: string, sql: Awaited<ReturnType<typeof initSqlJs>>) {
+function openDatabase(filePath: string): AppDatabase {
   if (db && dbFilePath === filePath) return db
   if (db) {
     try { db.close() } catch { /* ignore */ }
   }
 
   ensureParentDir(filePath)
-  if (fs.existsSync(filePath)) {
-    db = new sql.Database(fs.readFileSync(filePath))
-  } else {
-    db = new sql.Database()
-  }
+  db = new Database(filePath)
   dbFilePath = filePath
+  db.pragma('journal_mode = WAL')
   initializeSchema(db)
   return db
 }
 
-function initializeSchema(database: SqlJsDatabase) {
+function initializeSchema(database: AppDatabase) {
   database.exec(`
     CREATE TABLE IF NOT EXISTS library_meta (
       key TEXT PRIMARY KEY,
@@ -179,13 +157,7 @@ function initializeSchema(database: SqlJsDatabase) {
   try { database.exec('ALTER TABLE tracks ADD COLUMN sample_rate INTEGER') } catch { /* ok */ }
 }
 
-function saveToDisk(database: SqlJsDatabase, filePath: string) {
-  ensureParentDir(filePath)
-  const data = database.export()
-  fs.writeFileSync(filePath, Buffer.from(data))
-}
-
-function clearSnapshot(database: SqlJsDatabase) {
+function clearSnapshot(database: AppDatabase) {
   database.exec(`
     DELETE FROM folder_tracks;
     DELETE FROM folder_nodes;
@@ -196,18 +168,14 @@ function clearSnapshot(database: SqlJsDatabase) {
   `)
 }
 
-function insertMeta(database: SqlJsDatabase, key: string, value: string) {
-  const stmt = database.prepare(`INSERT INTO library_meta (key, value) VALUES (?, ?)`)
-  stmt.run([key, value])
-  stmt.free()
+function insertMeta(database: AppDatabase, key: string, value: string) {
+  database.prepare(`INSERT INTO library_meta (key, value) VALUES (?, ?)`).run(key, value)
 }
 
-export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySnapshot): Promise<void> {
-  const sql = await ensureSql()
-  const database = openDatabase(filePath, sql)
+export function saveLibrarySnapshot(filePath: string, snapshot: LibrarySnapshot): void {
+  const database = openDatabase(filePath)
 
-  database.exec('BEGIN TRANSACTION')
-  try {
+  const txWrite = database.transaction(() => {
     clearSnapshot(database)
     insertMeta(database, 'folderPaths', JSON.stringify(snapshot.folderPaths.map(normalizePath)))
     insertMeta(database, 'fileCount', String(snapshot.fileCount))
@@ -239,16 +207,16 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
     }
 
     for (const artist of snapshot.artists) {
-      insertArtist.run([artist.name, normalizePath(artist.path)])
-      const artistId = Number(database.exec('SELECT last_insert_rowid() AS id')[0].values[0][0])
+      const artistRes = insertArtist.run(artist.name, normalizePath(artist.path))
+      const artistId = Number(artistRes.lastInsertRowid)
 
       for (const album of artist.albums) {
         // Store NULL for cover_data (covers now in filesystem)
-        insertAlbum.run([artistId, album.name, album.artist, album.coverPath, null])
-        const albumId = Number(database.exec('SELECT last_insert_rowid() AS id')[0].values[0][0])
+        const albumRes = insertAlbum.run(artistId, album.name, album.artist, album.coverPath, null)
+        const albumId = Number(albumRes.lastInsertRowid)
 
         for (const track of album.tracks) {
-          insertTrack.run([
+          insertTrack.run(
             track.id,
             artistId,
             albumId,
@@ -260,7 +228,7 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
             track.format,
             track.isVideo ? 1 : 0,
             track.coverPath,
-            null, // cover_data → filesystem
+            null, // cover_data -> filesystem
             track.lyricsPath,
             track.fileMtime,
             track.fileSize,
@@ -269,8 +237,8 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
             track.genre ?? null,
             track.bitrate ?? null,
             track.sampleRate ?? null,
-            null, // album_cover_data → filesystem
-          ])
+            null, // album_cover_data -> filesystem
+          )
         }
       }
     }
@@ -281,59 +249,42 @@ export async function saveLibrarySnapshot(filePath: string, snapshot: LibrarySna
       const node = folderStack[fi++]
       const normalizedNodePath = normalizePath(node.path)
       // Store NULL for cover_data (covers now in filesystem)
-      insertFolder.run([
+      insertFolder.run(
         normalizedNodePath,
         node.name,
         folderParentMap.get(normalizedNodePath) ?? null,
         node.trackCount,
         null,
-      ])
+      )
       for (const track of node.tracks) {
-        insertFolderTrack.run([normalizedNodePath, track.id])
+        insertFolderTrack.run(normalizedNodePath, track.id)
       }
       folderStack.push(...node.children)
     }
+  })
 
-    database.exec('COMMIT')
-    saveToDisk(database, filePath)
-  } catch (error) {
-    database.exec('ROLLBACK')
-    throw error
-  } finally {
-    try { insertArtist.free() } catch { /* ignore */ }
-    try { insertAlbum.free() } catch { /* ignore */ }
-    try { insertTrack.free() } catch { /* ignore */ }
-    try { insertFolder.free() } catch { /* ignore */ }
-    try { insertFolderTrack.free() } catch { /* ignore */ }
-  }
+  txWrite()
 }
 
-function getSingleMeta(database: SqlJsDatabase, key: string): string | null {
-  const stmt = database.prepare(`SELECT value FROM library_meta WHERE key = ? LIMIT 1`)
-  stmt.bind([key])
-  const value = stmt.step() ? String(stmt.getAsObject().value) : null
-  stmt.free()
-  return value
+function getSingleMeta(database: AppDatabase, key: string): string | null {
+  const row = database.prepare(`SELECT value FROM library_meta WHERE key = ? LIMIT 1`).get(key) as { value: string } | undefined
+  return row ? String(row.value) : null
 }
 
-function rowsFromStmt<T>(stmt: any, mapper: (row: Record<string, unknown>) => T): T[] {
-  const rows: T[] = []
-  while (stmt.step()) {
-    rows.push(mapper(stmt.getAsObject()))
-  }
-  stmt.free()
-  return rows
+// Read all rows from a SELECT in one pass via better-sqlite3's .all().
+function rowsFromAll<T>(database: AppDatabase, sql: string, mapper: (row: Record<string, unknown>) => T): T[] {
+  const rows = database.prepare(sql).all() as Record<string, unknown>[]
+  return rows.map(mapper)
 }
-
-export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnapshot | null> {
-  const sql = await ensureSql()
+export function loadLibrarySnapshot(filePath: string, options?: { lean?: boolean }): LibrarySnapshot | null {
+  const lean = !!(options && options.lean)
   if (!fs.existsSync(filePath)) return null
-  const database = openDatabase(filePath, sql)
+  const database = openDatabase(filePath)
 
   const folderPathsRaw = getSingleMeta(database, 'folderPaths')
   if (!folderPathsRaw) return null
 
-  const tracksStmt = database.prepare(`
+  const trackRows = rowsFromAll(database, `
     SELECT
       t.id, t.name, t.path, t.duration, t.artist, t.album, t.format, t.is_video,
       t.cover_path, t.cover_data, t.lyrics_path, t.file_mtime, t.file_size,
@@ -341,8 +292,7 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
       t.album_cover_data, t.album_id, t.artist_id
     FROM tracks t
     ORDER BY t.artist COLLATE NOCASE, t.album COLLATE NOCASE, t.name COLLATE NOCASE
-  `)
-  const trackRows = rowsFromStmt(tracksStmt, (row) => ({
+  `, (row) => ({
     id: String(row.id),
     name: String(row.name),
     path: String(row.path),
@@ -366,30 +316,32 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
     artistId: Number(row.artist_id),
   }))
 
-  const albumsStmt = database.prepare(`
-    SELECT album_id, artist_id, name, artist_name, cover_path, cover_data
-    FROM albums
-    ORDER BY artist_name COLLATE NOCASE, name COLLATE NOCASE
-  `)
-  const albumRows = rowsFromStmt(albumsStmt, (row) => ({
-    albumId: Number(row.album_id),
-    artistId: Number(row.artist_id),
-    name: String(row.name),
-    artist: String(row.artist_name),
-    coverPath: row.cover_path ? String(row.cover_path) : null,
-    coverData: row.cover_data ? String(row.cover_data) : null,
-  }))
+  let albumRows: { albumId: number; artistId: number; name: string; artist: string; coverPath: string | null; coverData: string | null }[] = []
+  let artistRows: { artistId: number; name: string; path: string }[] = []
+  if (!lean) {
+    albumRows = rowsFromAll(database, `
+      SELECT album_id, artist_id, name, artist_name, cover_path, cover_data
+      FROM albums
+      ORDER BY artist_name COLLATE NOCASE, name COLLATE NOCASE
+    `, (row) => ({
+      albumId: Number(row.album_id),
+      artistId: Number(row.artist_id),
+      name: String(row.name),
+      artist: String(row.artist_name),
+      coverPath: row.cover_path ? String(row.cover_path) : null,
+      coverData: row.cover_data ? String(row.cover_data) : null,
+    }))
 
-  const artistsStmt = database.prepare(`
-    SELECT artist_id, name, root_path
-    FROM artists
-    ORDER BY name COLLATE NOCASE
-  `)
-  const artistRows = rowsFromStmt(artistsStmt, (row) => ({
-    artistId: Number(row.artist_id),
-    name: String(row.name),
-    path: String(row.root_path),
-  }))
+    artistRows = rowsFromAll(database, `
+      SELECT artist_id, name, root_path
+      FROM artists
+      ORDER BY name COLLATE NOCASE
+    `, (row) => ({
+      artistId: Number(row.artist_id),
+      name: String(row.name),
+      path: String(row.root_path),
+    }))
+  }
 
   const tracksByAlbum = new Map<number, TrackRecord[]>()
   const tracksById = new Map<string, TrackRecord>()
@@ -415,36 +367,38 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
       sampleRate: row.sampleRate,
       albumCoverData: row.albumCoverData,
     }
-    if (!tracksByAlbum.has(row.albumId)) tracksByAlbum.set(row.albumId, [])
-    tracksByAlbum.get(row.albumId)!.push(track)
+    if (!lean && !tracksByAlbum.has(row.albumId)) tracksByAlbum.set(row.albumId, [])
+    if (!lean) tracksByAlbum.get(row.albumId)!.push(track)
     tracksById.set(track.id, track)
   }
 
-  const albumsByArtist = new Map<number, AlbumRecord[]>()
-  for (const album of albumRows) {
-    const record: AlbumRecord = {
-      name: album.name,
-      artist: album.artist,
-      coverPath: album.coverPath,
-      coverData: album.coverData,
-      tracks: tracksByAlbum.get(album.albumId) ?? [],
+  let artists: ArtistRecord[] = []
+  if (!lean) {
+    const albumsByArtist = new Map<number, AlbumRecord[]>()
+    for (const album of albumRows) {
+      const record: AlbumRecord = {
+        name: album.name,
+        artist: album.artist,
+        coverPath: album.coverPath,
+        coverData: album.coverData,
+        tracks: tracksByAlbum.get(album.albumId) ?? [],
+      }
+      if (!albumsByArtist.has(album.artistId)) albumsByArtist.set(album.artistId, [])
+      albumsByArtist.get(album.artistId)!.push(record)
     }
-    if (!albumsByArtist.has(album.artistId)) albumsByArtist.set(album.artistId, [])
-    albumsByArtist.get(album.artistId)!.push(record)
+
+    artists = artistRows.map((artist) => ({
+      name: artist.name,
+      path: artist.path,
+      albums: albumsByArtist.get(artist.artistId) ?? [],
+    }))
   }
 
-  const artists: ArtistRecord[] = artistRows.map((artist) => ({
-    name: artist.name,
-    path: artist.path,
-    albums: albumsByArtist.get(artist.artistId) ?? [],
-  }))
-
-  const folderNodesStmt = database.prepare(`
+  const folderRows = rowsFromAll(database, `
     SELECT path, name, parent_path, track_count, cover_data
     FROM folder_nodes
     ORDER BY path COLLATE NOCASE
-  `)
-  const folderRows = rowsFromStmt(folderNodesStmt, (row) => ({
+  `, (row) => ({
     path: String(row.path),
     name: String(row.name),
     parentPath: row.parent_path ? String(row.parent_path) : null,
@@ -452,12 +406,11 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
     coverData: row.cover_data ? String(row.cover_data) : null,
   }))
 
-  const folderTracksStmt = database.prepare(`
+  const folderTrackRows = rowsFromAll(database, `
     SELECT folder_path, track_id
     FROM folder_tracks
     ORDER BY folder_path COLLATE NOCASE
-  `)
-  const folderTrackRows = rowsFromStmt(folderTracksStmt, (row) => ({
+  `, (row) => ({
     folderPath: String(row.folder_path),
     trackId: String(row.track_id),
   }))
@@ -517,8 +470,8 @@ export async function loadLibrarySnapshot(filePath: string): Promise<LibrarySnap
  * Lightweight library load that strips cover_data and album_cover_data from the response.
  * Use this for fast startup; covers can be loaded on demand via getTrackCovers().
  */
-export async function loadTrackListSnapshot(filePath: string): Promise<LibrarySnapshot | null> {
-  const snapshot = await loadLibrarySnapshot(filePath)
+export function loadTrackListSnapshot(filePath: string): LibrarySnapshot | null {
+  const snapshot = loadLibrarySnapshot(filePath, { lean: true })
   if (!snapshot) return null
   // Strip cover data from all tracks to reduce IPC payload from MBs to KBs
   for (const track of snapshot.allTracks) {
@@ -549,7 +502,7 @@ export async function loadTrackListSnapshot(filePath: string): Promise<LibrarySn
 // Stores only a hasCover flag (not full coverData) to avoid loading 100-300MB.
 // Full covers are preserved in DB via saveLibrarySnapshot's existing-cover fallback
 // and restored via loadFolderCovers (which also falls back to track covers).
-export async function loadTrackMetadataIndex(filePath: string): Promise<Map<string, {
+export function loadTrackMetadataIndex(filePath: string): Map<string, {
   duration: number
   hasCover: boolean
   title: string | null
@@ -559,18 +512,15 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
   genre: string | null
   bitrate: number | null
   sampleRate: number | null
-}>> {
-  const sql = await ensureSql()
+}> {
   if (!fs.existsSync(filePath)) return new Map()
-  const database = openDatabase(filePath, sql)
+  const database = openDatabase(filePath)
 
-  const stmt = database.prepare(`
+  const rows = rowsFromAll(database, `
     SELECT path, duration, cover_data, meta_title, meta_artist, file_mtime, file_size,
            genre, bitrate, sample_rate
     FROM tracks
-  `)
-
-  const rows = rowsFromStmt(stmt, (row) => ({
+  `, (row) => ({
     path: String(row.path),
     duration: Number(row.duration) || 0,
     hasCover: row.cover_data ? true : false,
@@ -604,7 +554,7 @@ export async function loadTrackMetadataIndex(filePath: string): Promise<Map<stri
  * Returns a Map keyed by normalized path (forward slashes) with all fields
  * needed to rebuild the library without re-parsing unchanged files.
  */
-export async function loadFullMetadataIndex(filePath: string): Promise<Map<string, {
+export function loadFullMetadataIndex(filePath: string): Map<string, {
   duration: number
   coverData: string | null
   title: string | null
@@ -614,16 +564,9 @@ export async function loadFullMetadataIndex(filePath: string): Promise<Map<strin
   sampleRate: number | null
   fileMtime: number
   fileSize: number
-}>> {
-  const sql = await ensureSql()
+}> {
   if (!fs.existsSync(filePath)) return new Map()
-  const database = openDatabase(filePath, sql)
-
-  const stmt = database.prepare(`
-    SELECT path, duration, meta_title, meta_artist, file_mtime, file_size,
-           genre, bitrate, sample_rate
-    FROM tracks
-  `)
+  const database = openDatabase(filePath)
 
   const index = new Map<string, {
     duration: number
@@ -637,7 +580,12 @@ export async function loadFullMetadataIndex(filePath: string): Promise<Map<strin
     fileSize: number
   }>()
 
-  const rows = rowsFromStmt(stmt, (r) => r)
+  const rows = rowsFromAll(database, `
+    SELECT path, duration, meta_title, meta_artist, file_mtime, file_size,
+           genre, bitrate, sample_rate
+    FROM tracks
+  `, (r) => r) as Record<string, unknown>[]
+
   for (const row of rows) {
     const r = row as any
     const normalizedPath = String(r.path).replace(/\\/g, '/')

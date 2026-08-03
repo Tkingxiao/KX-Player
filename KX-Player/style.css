@@ -95,7 +95,7 @@ body { font-family: var(--font); background-color: var(--bg); color: var(--text)
 .folder-list-row { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-radius: var(--radius); cursor: pointer; transition: background 0.15s; }
 .folder-list-row:hover { background: var(--bg-hover); }
 .folder-list-cover { width: 52px; height: 52px; border-radius: 10px; overflow: hidden; flex-shrink: 0; background: var(--bg-hover); display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
-.folder-list-cover img { width: 100%; height: 100%; object-fit: cover; }
+.folder-list-cover img { width: 100%; height: 100%; object-fit: contain; background-color: var(--bg-hover); }
 .folder-list-info { min-width: 0; flex: 1; }
 .folder-list-name { font-size: 15px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .folder-list-sub { font-size: 13px; color: var(--text-sub); margin-top: 3px; }
@@ -118,6 +118,7 @@ body { font-family: var(--font); background-color: var(--bg); color: var(--text)
 .folder-card .card-body { background: var(--bg-sidebar); }
 .folder-card .card-subtitle { color: var(--text); }
 .folder-card-cover { display: flex; align-items: center; justify-content: center; }
+.folder-card-cover img { object-fit: contain; background-color: var(--bg-sidebar); }
 
 button { font-family: var(--font); transition: all 0.2s ease; }
 button:active { transform: scale(0.96); }
@@ -129,7 +130,25 @@ button:active { transform: scale(0.96); }
 .btn-danger { display: inline-flex; align-items: center; gap: 6px; padding: 9px 20px; border-radius: 10px; border: none; background: var(--accent); color: white; font-size: 13px; font-weight: 600; font-family: var(--font); cursor: pointer; transition: all 0.2s ease; box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
 .btn-danger:hover { filter: brightness(1.1); box-shadow: 0 4px 16px rgba(0,0,0,0.18); transform: translateY(-1px); }
 
+
 .song-table { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+
+.song-table .vl-container {
+  max-height: calc(100vh - var(--player-height) - var(--titlebar-height) - 220px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.virtual-vl {
+  max-height: calc(100vh - var(--player-height) - var(--titlebar-height) - 220px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.virtual-folder-grid-row { display: flex; flex-wrap: nowrap; gap: 12px; margin-bottom: 12px; }
+.virtual-folder-grid-row .folder-card { width: var(--fw, 170px); flex: 0 0 auto; }
+.virtual-folder-grid-row .folder-card-cover { height: var(--fw, 170px); }
+
 .song-row-header { display: grid; gap: 6px; padding: 10px 16px; background: transparent; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-sub); align-items: center; }
 .col-hdr { position: relative; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
 .col-hdr-sort { cursor: pointer; transition: color 0.15s; }

@@ -1,6 +1,6 @@
 import { api } from './api.js'
-import { $, esc, arrayMatchSorted, fmtTime, isVideoFile, nName, fuzzyMatch, collectAllTracks } from './utils.js'
-import { virtualList, invalidateVL, _startResizeThrottle } from './virtual-list.js'
+import { $, esc, arrayMatchSorted, fmtTime, isVideoFile, nName, fuzzyMatchScore, collectAllTracks } from './utils.js'
+import { virtualList, virtualFolderList, invalidateVL, _startResizeThrottle, _flushResizeThrottle } from './virtual-list.js'
 import { _getCoverData, _loadCoversForTrackIds, _preloadVisibleCovers, _updateFolderTreeCovers, _clearCoverCache, _onCoversLoaded } from './cover.js'
 import { createTrackIndex } from './track-index.js'
 import { showConfirm, addT, updT, rmT } from './ui-feedback.js'
@@ -27,6 +27,8 @@ const S = {
   folderView: 'grid', // 'grid' | 'list'
   activeFp: null, // currently active folder path in sidebar
   _searchFolders: [],
+  _searchFolderTotal: 0,
+  _searchBack: null,
   _folderMeta: null, // precomputed folder metadata { path: { trackCount, validChildCount, hasMusic, coverData } }
 }
 
@@ -371,44 +373,17 @@ async function loadLibraryData() {
     }
     const allIds = new Set(S.all.map(t => t.id))
     cleanupStale(allIds)
-    // Load folder covers from SQLite (compressed, ~2-5KB each) and update _folderMeta
-    const folderCovers = await api.loadFolderCovers()
-    if (folderCovers && S._folderMeta) {
-      for (const [p, cd] of Object.entries(folderCovers)) {
-        if (S._folderMeta[p]) S._folderMeta[p].coverData = cd
-      }
-    }
-    // Also update folderTree nodes with covers
-    _updateFolderTreeCovers(S.folderTree, folderCovers)
-    // Preload covers for visible tracks
-    _preloadVisibleCovers(S.all)
+    // Show the library immediately so the first paint isn't blocked by cover
+    // loading or the offline-change sync below.
+    pl = S.all
+    renderAll()
     console.timeEnd('[startup] total')
 
     // If we used cached data, run an incremental scan to pick up any file
     // changes that happened while the app was not running (additions,
     // deletions, modifications). This is fast when nothing changed (only
     // file discovery, no re-parsing) and correctly syncs the library.
-    if (cacheUsed) {
-      const bgGen = ++_scanGeneration
-      api.scanFoldersIncremental(fp).then(r => {
-        // If a watcher-triggered rescan has already run, discard stale result
-        if (_scanGeneration !== bgGen || !r) return
-        applyScanResult(r)
-        const newIds = new Set(S.all.map(t => t.id))
-        cleanupStale(newIds)
-        // Reload covers after incremental scan may have changed the library
-        api.loadFolderCovers().then(fc => {
-          if (fc && S._folderMeta) {
-            for (const [p, cd] of Object.entries(fc)) {
-              if (S._folderMeta[p]) S._folderMeta[p].coverData = cd
-            }
-          }
-          _updateFolderTreeCovers(S.folderTree, fc || {})
-          _preloadVisibleCovers(S.all)
-        }).catch(() => {})
-        renderAll()
-      }).catch(() => {})
-    }
+    if (cacheUsed) runStartupIncrementalSync()
   } catch (e) { /* ignore */ }
   // Start file watcher (separate from library loading so failures don't block each other)
   try { await restartWatching() } catch (e) { console.warn('[watcher] init failed:', e) }
@@ -431,6 +406,28 @@ async function loadLibraryData() {
       coverEl.querySelector('.cover-placeholder').style.display = 'none'
     }
     if (S.view === 'lyrics') renderLrcContent()
+  })
+}
+
+function runStartupIncrementalSync() {
+  const syncPaths = fp.slice()
+  Promise.resolve().then(async () => {
+    try {
+      console.log('[startup] running incremental scan to sync offline changes...')
+      const r = await api.scanFoldersIncremental(syncPaths)
+      if (r && r.allTracks) {
+        const oldCount = S.all.length
+        const newCount = r.allTracks.length
+        console.log(`[startup] incremental scan: ${oldCount} -> ${newCount} tracks`)
+        applyScanResult(r)
+        _clearFolderCoverLazyState()
+        const newIds = new Set(S.all.map(t => t.id))
+        cleanupStale(newIds)
+        renderAll()
+      }
+    } catch (e) {
+      console.warn('[startup] incremental scan failed:', e)
+    }
   })
 }
 
@@ -1133,6 +1130,84 @@ function folderListRowHTML(n) {
   return `<div class="folder-list-row" data-fp="${esc(n.path)}"><div class="folder-list-cover">${coverBg ? `<img src="${coverBg}" alt="" />` : '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'}</div><div class="folder-list-info"><div class="folder-list-name">${esc(n.name)}</div><div class="folder-list-sub">${subtitle}</div></div></div>`
 }
 
+const _folderCoverPending = []
+const _folderCoverPendingSet = new Set()
+const _folderCoverLoading = new Set()
+const _folderCoverEmpty = new Set()
+let _folderCoverTimer = null
+
+function _queueFolderCovers(nodes) {
+  if (!nodes || !nodes.length) return
+  for (const node of nodes.flat ? nodes.flat() : nodes) {
+    if (!node || !node.path) continue
+    const meta = S._folderMeta || {}
+    const existing = (meta[node.path] || {}).coverData || node.coverData
+    if (existing || _folderCoverEmpty.has(node.path) || _folderCoverLoading.has(node.path) || _folderCoverPendingSet.has(node.path)) continue
+    _folderCoverPending.push(node.path)
+    _folderCoverPendingSet.add(node.path)
+  }
+  if (!_folderCoverTimer && _folderCoverPending.length) _folderCoverTimer = setTimeout(_flushFolderCovers, 40)
+}
+
+function _flushFolderCovers() {
+  _folderCoverTimer = null
+  const batch = _folderCoverPending.splice(0, 80)
+  for (const p of batch) {
+    _folderCoverPendingSet.delete(p)
+    _folderCoverLoading.add(p)
+  }
+  if (!batch.length) return
+  api.getFolderCovers(batch).then(covers => {
+    let changed = false
+    for (const p of batch) {
+      const cd = covers && covers[p]
+      if (cd && S._folderMeta && S._folderMeta[p] && S._folderMeta[p].coverData !== cd) {
+        S._folderMeta[p].coverData = cd
+        changed = true
+      } else if (!cd) {
+        _folderCoverEmpty.add(p)
+      }
+      _folderCoverLoading.delete(p)
+    }
+    if (changed) {
+      _updateFolderTreeCovers(S.folderTree, covers)
+      document.querySelectorAll('.virtual-vl').forEach(c => { if (c._vlRender) c._vlRender() })
+    }
+  }).catch(() => {
+    for (const p of batch) _folderCoverLoading.delete(p)
+  }).finally(() => {
+    if (_folderCoverPending.length && !_folderCoverTimer) _folderCoverTimer = setTimeout(_flushFolderCovers, 40)
+  })
+}
+
+function _clearFolderCoverLazyState() {
+  _folderCoverPending.length = 0
+  _folderCoverPendingSet.clear()
+  _folderCoverLoading.clear()
+  _folderCoverEmpty.clear()
+  if (_folderCoverTimer) { clearTimeout(_folderCoverTimer); _folderCoverTimer = null }
+}
+
+function _renderVirtualFolders(containerId, folders) {
+  if (!folders || !folders.length) return
+  if (S.folderView === 'list') {
+    virtualFolderList(containerId, folders, 78, folderListRowHTML, visible => _queueFolderCovers(visible))
+    return
+  }
+  const gap = 12
+  const minCard = 170
+  const vl = $(containerId)
+  const width = (vl && vl.clientWidth) || 700
+  const cols = Math.max(1, Math.floor((width + gap) / (minCard + gap)))
+  const cardWidth = (width - gap * (cols - 1)) / cols
+  const rows = []
+  for (let i = 0; i < folders.length; i += cols) rows.push(folders.slice(i, i + cols))
+  const rowHeight = cardWidth + 68
+  virtualFolderList(containerId, rows, rowHeight, (row) => `<div class="virtual-folder-grid-row" style="--fw:${cardWidth}px">${row.map(n => folderCardHTML(n)).join('')}</div>`, visibleRows => _queueFolderCovers(visibleRows.flat()))
+  const grid = $(containerId)
+  if (grid) grid._vlRebuild = () => _renderVirtualFolders(containerId, folders)
+}
+
 function renderFolderAll() {
   const bc = $('breadcrumb'), ca = $('content-area')
   if (S.q) {
@@ -1141,9 +1216,9 @@ function renderFolderAll() {
     let html = ''
     if (S._searchFolders.length) {
       const isList = S.folderView === 'list'
-      const folderHtml = isList ? S._searchFolders.map(n => folderListRowHTML(n)).join('') : S._searchFolders.map(n => folderCardHTML(n)).join('')
-      const containerCls = isList ? 'folder-list' : 'artist-grid'
-      html += `<div class="section-title">文件夹<span>${S._searchFolders.length} 个</span></div><div class="${containerCls}">${folderHtml}</div>`
+      const totalFolders = S._searchFolderTotal || S._searchFolders.length
+      const countLabel = String(totalFolders) + '\u4e2a'
+      html += `<div class="section-title">\u6587\u4ef6\u5939<span>${countLabel}</span></div><div class="virtual-vl" id="vt-search-folders"></div>`
     }
     if (pl.length) {
       if (html) html += '<div style="height:20px"></div>'
@@ -1151,6 +1226,7 @@ function renderFolderAll() {
       html += `<div class="section-title">音乐<span>${tks.length} 首</span></div><button class="btn-primary" style="margin-bottom:12px" data-pall="search"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>播放全部</button>${tableVT('vl-search', tks, (idx) => playT(idx, true))}`
     }
     ca.innerHTML = html
+    if (S._searchFolders.length) _renderVirtualFolders('vt-search-folders', S._searchFolders)
     return
   }
   const tree = S.folderTree || []
@@ -1163,10 +1239,8 @@ function renderFolderAll() {
   if (S.folderStack.length === 0) {
     bc.innerHTML = `<button class="breadcrumb-item current">\u5168\u90e8\u97f3\u4e50</button>`
     const validRoots = sortFolders(tree.filter(n => meta[n.path]?.hasMusic))
-    const isList = S.folderView === 'list'
-    const html = isList ? validRoots.map(n => folderListRowHTML(n)).join('') : validRoots.map(n => folderCardHTML(n)).join('')
-    const containerCls = isList ? 'folder-list' : 'artist-grid'
-    ca.innerHTML = `<div class="section-title">\u6587\u4ef6\u5939<span>${validRoots.length} \u4e2a\u6587\u4ef6\u5939</span></div>${folderSortBtnHTML()}<div class="${containerCls}">${html}</div>`
+    ca.innerHTML = `<div class="section-title">\u6587\u4ef6\u5939<span>${validRoots.length} \u4e2a\u6587\u4ef6\u5939</span></div>${folderSortBtnHTML()}<div class="virtual-vl" id="vt-root-folders"></div>`
+    _renderVirtualFolders('vt-root-folders', validRoots)
     _restoreFolderScroll()
     return
   }
@@ -1214,7 +1288,7 @@ function tableVT(containerId, tracks, onClick) {
       if (c) c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u6682\u65e0\u5185\u5bb9</h3></div>'
       return
     }
-    virtualList(containerId, tracks, 46, (t, i) => _trackRowHTML(t, i, cols), (tid, keepView) => { if (onClick) { const idx = tracks.findIndex(tk => tk.id === tid); if (idx >= 0) onClick(idx, keepView) } })
+    virtualList(containerId, tracks, 46, (t, i) => _trackRowHTML(t, i, cols), (tid, keepView) => { if (onClick) { const idx = tracks.findIndex(tk => tk.id === tid); if (idx >= 0) onClick(idx, keepView) } }, visible => _preloadVisibleCovers(visible))
   })
   return html
 }
@@ -1244,25 +1318,23 @@ function renderFolderNode(node) {
   let html = ''
 
   if (validChildren.length > 0) {
-    const isList = S.folderView === 'list'
-    const childHtml = isList ? validChildren.map(c => folderListRowHTML(c)).join('') : validChildren.map(c => folderCardHTML(c)).join('')
-    const containerCls = isList ? 'folder-list' : 'artist-grid'
-    html += `<div class="section-title">\u5b50\u6587\u4ef6\u5939<span>${validChildren.length} \u4e2a</span></div>${folderSortBtnHTML()}<div class="${containerCls}">${childHtml}</div>`
+    html += `<div class="section-title">\u5b50\u6587\u4ef6\u5939<span>${validChildren.length} \u4e2a</span></div>${folderSortBtnHTML()}<div class="virtual-vl" id="vt-child-folders"></div>`
   }
 
   if (node.tracks.length > 0) {
     const allTracks = _setViewPlaylist([...node.tracks])
     const fHeader = _tableHeaderHTML()
-    html += `<div class="section-title" style="margin-top:${validChildren.length > 0 ? '24px' : '0'}">\u97f3\u4e50<span>${allTracks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pfolder="${esc(node.path)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><div class="song-table">${fHeader}<div id="vl-songs"></div></div>`
+    html += `<div class="section-title" style="margin-top:${validChildren.length > 0 ? '24px' : '0'}">\u97f3\u4e50<span>${allTracks.length} \u9996</span></div><button class="btn-primary" style="margin-bottom:12px" data-pfolder="${esc(node.path)}"><svg viewBox="0 0 24 24" width="13" height="13" fill="white"><polygon points="5,3 19,12 5,21"/></svg>\u64ad\u653e\u5168\u90e8</button><div class="song-table">${fHeader}<div class="vl-container" id="vl-songs"></div></div>`
   }
 
   $('content-area').innerHTML = html || '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u7a7a\u6587\u4ef6\u5939</h3></div>'
+  if (validChildren.length > 0) _renderVirtualFolders('vt-child-folders', validChildren)
   if (node.tracks.length > 0) {
     const fCols = _buildColString()
     virtualList('vl-songs', pl, 46, (t, i) => _trackRowHTML(t, i, fCols), (tid, keepView) => {
       const idx = pl.findIndex(t => t.id === tid)
       if (idx >= 0) playT(idx, keepView)
-    })
+    }, visible => _preloadVisibleCovers(visible))
   }
 }
 
@@ -1284,14 +1356,46 @@ function _restoreFolderScroll() {
 function navigateFolder(path) {
   const node = findNodeByPath(S.folderTree, path)
   if (!node) return
+  // Coming from a search result: remember the search so the back button can
+  // return to the results list, then drop the active search UI for the folder view.
+  if (S.q) {
+    if (!S._searchBack) {
+      S._searchBack = { q: S.q, folders: S._searchFolders || [], folderTotal: S._searchFolderTotal || 0, pl: pl.slice() }
+    }
+    $('search-input').value = ''; S.q = ''; S._searchFolders = []; S._searchFolderTotal = 0
+    const sc = $('search-clear'); if (sc) sc.classList.add('hidden')
+    const sb = $('search-back'); if (sb) sb.classList.remove('visible')
+    const si = $('search-input'); if (si) si.classList.remove('has-back')
+  }
   _saveFolderScroll()
   S.activeFp = node.path
   if (S.folderStack[S.folderStack.length - 1] !== node.path) S.folderStack.push(node.path)
   S.view = 'all'; renderAll(); schedSave()
 }
 
+// Restore a search-results context after backing out of a folder that was
+// opened from a search result.
+function restoreSearchOrigin() {
+  const o = S._searchBack
+  if (!o) return false
+  S._searchBack = null
+  S.q = o.q
+  S._searchFolders = o.folders || []
+  S._searchFolderTotal = o.folderTotal || S._searchFolders.length
+  if (Array.isArray(o.pl) && o.pl.length) _setViewPlaylist(o.pl)
+  const si = $('search-input'); if (si) { si.value = o.q; si.classList.add('has-back') }
+  const sb = $('search-back'); if (sb) sb.classList.add('visible')
+  const sc = $('search-clear'); if (sc) sc.classList.remove('hidden')
+  return true
+}
+
 function navigateFolderUp() {
   _saveFolderScroll()
+  if (S._searchBack && S.folderStack.length <= 1) {
+    restoreSearchOrigin()
+    S.folderStack = []; S.activeFp = null
+    S.view = 'all'; renderAll(); schedSave(); return
+  }
   if (S.folderStack.length <= 1) { S.folderStack = []; S.activeFp = null }
   else { S.folderStack.pop() }
   S.view = 'all'; renderAll(); schedSave()
@@ -1538,14 +1642,7 @@ async function importFolder() {
     // Only scan the new folders (incremental scan)
     const r = await api.scanFoldersIncremental(fp)
     const at = applyScanResult(r)
-    // Restore folder covers from DB
-    const folderCovers = await api.loadFolderCovers()
-    if (folderCovers) {
-      for (const [p, cd] of Object.entries(folderCovers)) {
-        if (S._folderMeta && S._folderMeta[p]) S._folderMeta[p].coverData = cd
-      }
-      _updateFolderTreeCovers(S.folderTree, folderCovers)
-    }
+    _clearFolderCoverLazyState()
     const allIds = new Set(at.map(t => t.id))
     cleanupStale(allIds)
     S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = []; S.activeFp = null
@@ -2098,15 +2195,9 @@ function showFolderCtx(e, folderPath) {
       try {
         const r = await api.scanFoldersIncremental(fp)
         const at = applyScanResult(r)
+        _clearFolderCoverLazyState()
         const allIds = new Set(at.map(t => t.id))
         cleanupStale(allIds)
-        const folderCovers = await api.loadFolderCovers()
-        if (folderCovers) {
-          for (const [p, cd] of Object.entries(folderCovers)) {
-            if (S._folderMeta && S._folderMeta[p]) S._folderMeta[p].coverData = cd
-          }
-          _updateFolderTreeCovers(S.folderTree, folderCovers)
-        }
         if (S.aF) {
           const fav = S.favs.find(f => f.id === S.aF)
           _setViewPlaylist(fav ? tracksFromIds(fav.trackIds) : at)
@@ -2131,17 +2222,11 @@ function showFolderCtx(e, folderPath) {
       const r = await api.removeFolder(folderPath, fp)
       if (r && r.allTracks) {
         applyScanResult(r)
+        _clearFolderCoverLazyState()
         const allIds = new Set(r.allTracks.map(t => t.id))
         cleanupStale(allIds)
         pl = pl.filter(t => allIds.has(t.id))
         if (S.playingTid && !allIds.has(S.playingTid)) { S.playingTid = null; S.playing = false; audio.pause(); lrc = [] }
-      }
-      const folderCovers = await api.loadFolderCovers()
-      if (folderCovers) {
-        for (const [p, cd] of Object.entries(folderCovers)) {
-          if (S._folderMeta && S._folderMeta[p]) S._folderMeta[p].coverData = cd
-        }
-        _updateFolderTreeCovers(S.folderTree, folderCovers)
       }
       await restartWatching()
       schedSave()
@@ -2212,10 +2297,10 @@ function showFavoriteEmptyCtx(e, fvid) {
 }
 
 $('#breadcrumb').addEventListener('click', e => {
-  const b = e.target.closest('[data-bc="all"]'); if (b) { S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = []; S.activeFp = null; S.prevView = null; activeLrcTab = 'lyrics'; renderAll(); schedSave(); return }
+  const b = e.target.closest('[data-bc="all"]'); if (b) { S.view = 'all'; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.folderStack = []; S.activeFp = null; S.prevView = null; S._searchBack = null; activeLrcTab = 'lyrics'; renderAll(); schedSave(); return }
   const a = e.target.closest('[data-bc="artist"]'); if (a) { S.alI = -1; renderAll(); schedSave(); return }
   const fpEl = e.target.closest('[data-fp]'); if (fpEl) { navigateFolderTo(fpEl.dataset.fp); return }
-  if (e.target.closest('[data-fp-root]')) { S.activeFp = null; S.folderStack = []; S.view = 'all'; renderAll(); schedSave(); return }
+  if (e.target.closest('[data-fp-root]')) { S.activeFp = null; S.folderStack = []; S.view = 'all'; S._searchBack = null; renderAll(); schedSave(); return }
   if (e.target.closest('#btn-folder-back')) { navigateFolderUp(); return }
   if (e.target.closest('#btn-lyrics-back')) {
     goBackFromLyrics(); return
@@ -2226,7 +2311,7 @@ $('#breadcrumb').addEventListener('click', e => {
 })
 
 function exitSearch() {
-  $('search-input').value = ''; S.q = ''; S._searchFolders = []; $('search-clear').classList.add('hidden'); $('search-back').classList.remove('visible')
+  $('search-input').value = ''; S.q = ''; S._searchFolders = []; S._searchFolderTotal = 0; S._searchBack = null; $('search-clear').classList.add('hidden'); $('search-back').classList.remove('visible'); $('search-input').classList.remove('has-back')
   if (S.prevView) {
     S.view = S.prevView; S.aF = S._prevAF || null; S.aPl = S._prevAPl || null
     // Restore folder navigation state
@@ -2246,6 +2331,7 @@ function exitSearch() {
 
 $('#sidebar-nav').addEventListener('click', async e => {
   if (S.q) exitSearch()
+  S._searchBack = null
   const ni = e.target.closest('.nav-item'); if (ni) { if (ni.dataset.view) { S.prevView = null; S.view = ni.dataset.view; S.aI = -1; S.alI = -1; S.aPl = null; S.aF = null; S.activeFp = null; if (ni.dataset.view === 'all') S.folderStack = []; activeLrcTab = 'lyrics'; renderAll(); schedSave(); return } if (ni.id === 'btn-add-folder') { await importFolder(); return } }
   const fa = e.target.closest('[data-fa]'); if (fa) { const k = fa.dataset.fa; const xf = S.xf || new Set(); xf.has(k) ? xf.delete(k) : xf.add(k); S.xf = xf; renderSB(); schedSave(); return }
   const fpEl = e.target.closest('.folder-item[data-fp]'); if (fpEl) {
@@ -2376,6 +2462,12 @@ $('btn-volume').addEventListener('click', () => {
 // Progress bar dragging state (shared with timeupdate handler)
 let _progressDragging = false
 
+// Playback duration for the seek bar: prefer the live audio duration, fall back to saved state.
+function getPlaybackDuration() {
+  const d = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : S.dur
+  return d && d > 0 ? d : 0
+}
+
 ;(function initProgressBar() {
   const bar = $('progress-bar')
   const fill = $('progress-fill')
@@ -2410,29 +2502,48 @@ let _progressDragging = false
     if (!_progressDragging) return
     _progressDragging = false
     fill.classList.remove('no-transition')
-    const nextTime = getRatio(e) * audio.duration
+    const nextTime = getRatio(e) * getPlaybackDuration()
     audio.currentTime = nextTime
   })
 })()
 $('search-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') {
     const q = $('search-input').value
+    S._searchBack = null
     S.q = q; $('search-back').classList.toggle('visible', !!S.q); $('search-clear').classList.toggle('hidden', !S.q); $('search-input').classList.toggle('has-back', !!S.q)
     if (!S.prevView) { S.prevView = S.view; S._prevAF = S.aF; S._prevAPl = S.aPl; S._prevFolderStack = [...S.folderStack]; S._prevActiveFp = S.activeFp }
     S.view = 'all'; S.aF = null; S.aPl = null; S.folderStack = []; S.activeFp = null
     if (S.tI >= 0 && pl[S.tI]) S.playingTid = pl[S.tI].id
-    // Search by track metadata (fuzzy: substring + pinyin initials)
-    _setViewPlaylist(S.all.filter(t => fuzzyMatch(t.name, q) || fuzzyMatch(t.artist, q) || fuzzyMatch(t.metaArtist, q) || fuzzyMatch(t.album, q)))
-    // Search by folder name (fuzzy)
-    function findFoldersByName(nodes) {
-      const results = []
-      for (const n of nodes) {
-        if (fuzzyMatch(n.name, q)) { results.push(n); continue }
-        if (n.children.length) results.push(...findFoldersByName(n.children))
+    // Search by track metadata: score relevance across fields, rank by match degree
+    const scored = []
+    const fieldWeights = [['name', 1.0], ['artist', 0.95], ['metaArtist', 0.9], ['album', 0.8]]
+    for (const t of S.all) {
+      let best = -1
+      for (const [f, w] of fieldWeights) {
+        const s = fuzzyMatchScore(t[f], q)
+        if (s >= 0 && s * w > best) best = s * w
       }
-      return results
+      if (best >= 0) scored.push({ t, s: best })
     }
-    S._searchFolders = findFoldersByName(S.folderTree)
+    scored.sort((a, b) => b.s - a.s)
+    _setViewPlaylist(scored.map(o => o.t))
+    // Search by folder name: score then rank, keep top 400 but count all real matches
+    function findFoldersByName(nodes) {
+      const matched = []
+      const walk = (ns) => {
+        for (const n of ns) {
+          const s = fuzzyMatchScore(n.name, q)
+          if (s >= 0) matched.push({ n, s })
+          if (n.children.length) walk(n.children)
+        }
+      }
+      walk(nodes)
+      matched.sort((a, b) => b.s - a.s)
+      return { nodes: matched.map(o => o.n), total: matched.length }
+    }
+    const found = findFoldersByName(S.folderTree)
+    S._searchFolders = found.nodes
+    S._searchFolderTotal = found.total
     syncPlayingState()
     renderAll(); schedSave()
   }
@@ -2794,8 +2905,9 @@ async function init() {
       _startResizeThrottle()
       clearTimeout(_resizeFlushTimer)
       _resizeFlushTimer = setTimeout(() => {
-        _resizeActive = false
+        _flushResizeThrottle()
         document.querySelectorAll('.vl-container').forEach(c => { if (c._vlRender) c._vlRender() })
+        document.querySelectorAll('.virtual-vl').forEach(c => { if (c._vlRebuild) c._vlRebuild(); else if (c._vlRender) c._vlRender() })
       }, 300)
       if (!_resizeRAF) {
         _resizeRAF = requestAnimationFrame(() => {

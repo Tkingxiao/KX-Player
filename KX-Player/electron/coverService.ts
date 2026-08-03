@@ -5,6 +5,7 @@
 // - External cover files (cover.jpg/png/webp) are copied and used as folder covers.
 
 import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import sharp from 'sharp'
@@ -224,6 +225,49 @@ export function getFolderCoverByMapping(folderPath: string): string | null {
   } catch {
     return null
   }
+}
+
+/** Load covers for many track IDs in parallel (async). */
+export async function getTrackCoversBatchAsync(trackIds: string[]): Promise<Record<string, string>> {
+  const result: Record<string, string> = {}
+  await Promise.all(trackIds.map(async (id) => {
+    const p = getTrackCoverPath(id)
+    if (!p) return
+    try {
+      const buffer = await fsp.readFile(p)
+      result[id] = `data:image/jpeg;base64,${buffer.toString('base64')}`
+    } catch { /* skip */ }
+  }))
+  return result
+}
+
+/** Load covers for many folder paths in parallel (async). */
+export async function getFolderCoversBatchAsync(folderPaths: string[]): Promise<Record<string, string>> {
+  const result: Record<string, string> = {}
+  await Promise.all(folderPaths.map(async (folderPath) => {
+    const hash = _folderCoverMap[folderPath]
+    if (!hash) return
+    const p = path.join(coversDir(), `folder_${hash}.jpg`)
+    try {
+      const buffer = await fsp.readFile(p)
+      result[folderPath] = `data:image/jpeg;base64,${buffer.toString('base64')}`
+    } catch { /* skip */ }
+  }))
+  return result
+}
+
+/** Load all folder covers in parallel (async). */
+export async function getAllFolderCoversFromMapAsync(): Promise<Record<string, string>> {
+  const entries = Object.entries(_folderCoverMap)
+  const result: Record<string, string> = {}
+  await Promise.all(entries.map(async ([folderPath, hash]) => {
+    const p = path.join(coversDir(), `folder_${hash}.jpg`)
+    try {
+      const buffer = await fsp.readFile(p)
+      result[folderPath] = `data:image/jpeg;base64,${buffer.toString('base64')}`
+    } catch { /* skip */ }
+  }))
+  return result
 }
 
 export function getAllFolderCoversFromMap(): Record<string, string> {

@@ -13,7 +13,13 @@ export function _startResizeThrottle() {
   _resizeTimer = setTimeout(() => { _resizeActive = false }, 300)
 }
 
-export function virtualList(containerId, items, rowHeight, renderItem, onClick) {
+export function _flushResizeThrottle() {
+  _resizeActive = false
+  clearTimeout(_resizeTimer)
+  _resizeTimer = null
+}
+
+export function virtualList(containerId, items, rowHeight, renderItem, onClick, onVisibleItems) {
   const c = $(containerId)
   if (!c) return
   // Remove previous listeners and observer to prevent accumulation
@@ -45,6 +51,9 @@ export function virtualList(containerId, items, rowHeight, renderItem, onClick) 
     let html = ''
     for (let i = start; i < end; i++) html += renderItem(items[i], i)
     view.innerHTML = html
+    if (onVisibleItems) {
+      try { onVisibleItems(items.slice(start, end), start, end) } catch { /* ignore */ }
+    }
   }
 
   function scheduleRender(force = false) {
@@ -89,6 +98,63 @@ export function virtualList(containerId, items, rowHeight, renderItem, onClick) 
     c.addEventListener('click', clickFn)
     c.addEventListener('dblclick', dblClickFn)
   }
+}
+
+
+export function virtualFolderList(containerId, items, rowHeight, renderItem, onVisibleItems) {
+  const c = $(containerId)
+  if (!c) return
+  if (c._vlRO) { c._vlRO.disconnect(); c._vlRO = null }
+  if (c._vlRAF) { cancelAnimationFrame(c._vlRAF); c._vlRAF = 0 }
+  if (c._vlResizeTimer) { clearTimeout(c._vlResizeTimer); c._vlResizeTimer = null }
+  if (c._vlScrollFn) { c.removeEventListener('scroll', c._vlScrollFn) }
+  c.innerHTML = ''
+  if (!items.length) { c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u65e0\u5339\u914d\u6587\u4ef6\u5939</h3></div>'; return }
+  const totalH = items.length * rowHeight
+  const spacer = document.createElement('div'); spacer.style.height = totalH + 'px'; spacer.style.position = 'relative'
+  const view = document.createElement('div'); view.style.position = 'absolute'; view.style.top = '0'; view.style.left = '0'; view.style.right = '0'
+  spacer.appendChild(view); c.appendChild(spacer)
+  const buffer = 10
+  let lastStart = -1
+  let lastEnd = -1
+
+  function render(force = false) {
+    if (_resizeActive) return
+    const scrollTop = c.scrollTop, clientH = c.clientHeight || 600
+    const start = Math.max(0, Math.floor(scrollTop / rowHeight) - buffer)
+    const end = Math.min(items.length, Math.ceil((scrollTop + clientH) / rowHeight) + buffer)
+    if (!force && start === lastStart && end === lastEnd) return
+    lastStart = start
+    lastEnd = end
+    view.style.top = (start * rowHeight) + 'px'
+    let html = ''
+    for (let i = start; i < end; i++) html += renderItem(items[i], i)
+    view.innerHTML = html
+    if (onVisibleItems) {
+      try { onVisibleItems(items.slice(start, end), start, end) } catch { /* ignore */ }
+    }
+  }
+
+  function scheduleRender(force = false) {
+    if (c._vlRAF) return
+    c._vlRAF = requestAnimationFrame(() => {
+      c._vlRAF = 0
+      render(force)
+    })
+  }
+
+  c._vlRender = () => render(true)
+  c._vlItems = items
+  render(true)
+  const scrollFn = () => scheduleRender(false)
+  c._vlScrollFn = scrollFn
+  c.addEventListener('scroll', scrollFn, { passive: true })
+  const ro = new ResizeObserver(() => {
+    if (_resizeActive) return
+    clearTimeout(c._vlResizeTimer)
+    c._vlResizeTimer = setTimeout(() => render(true), 200)
+  })
+  ro.observe(c); c._vlRO = ro
 }
 
 export function invalidateVL(containerId) {
