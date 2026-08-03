@@ -119,7 +119,6 @@ export function virtualFolderList(containerId, items, rowHeight, renderItem, onV
   let lastEnd = -1
 
   function render(force = false) {
-    if (_resizeActive) return
     const scrollTop = c.scrollTop, clientH = c.clientHeight || 600
     const start = Math.max(0, Math.floor(scrollTop / rowHeight) - buffer)
     const end = Math.min(items.length, Math.ceil((scrollTop + clientH) / rowHeight) + buffer)
@@ -150,7 +149,6 @@ export function virtualFolderList(containerId, items, rowHeight, renderItem, onV
   c._vlScrollFn = scrollFn
   c.addEventListener('scroll', scrollFn, { passive: true })
   const ro = new ResizeObserver(() => {
-    if (_resizeActive) return
     clearTimeout(c._vlResizeTimer)
     c._vlResizeTimer = setTimeout(() => render(true), 200)
   })

@@ -1194,18 +1194,21 @@ function _renderVirtualFolders(containerId, folders) {
     virtualFolderList(containerId, folders, 78, folderListRowHTML, visible => _queueFolderCovers(visible))
     return
   }
+  // Fixed card size: resizing the window only changes the column count, not
+  // the card dimensions, so the grid reshapes quickly without re-measuring.
   const gap = 12
-  const minCard = 170
+  const cardWidth = 176
   const vl = $(containerId)
   const width = (vl && vl.clientWidth) || 700
-  const cols = Math.max(1, Math.floor((width + gap) / (minCard + gap)))
-  const cardWidth = (width - gap * (cols - 1)) / cols
+  const cols = Math.max(1, Math.floor((width + gap) / (cardWidth + gap)))
+  const grid = $(containerId)
+  // Column count unchanged: nothing to rebuild, just refresh visible rows.
+  if (grid && grid._vlCols === cols && grid._vlRender) { grid._vlRender(); return }
   const rows = []
   for (let i = 0; i < folders.length; i += cols) rows.push(folders.slice(i, i + cols))
   const rowHeight = cardWidth + 68
   virtualFolderList(containerId, rows, rowHeight, (row) => `<div class="virtual-folder-grid-row" style="--fw:${cardWidth}px">${row.map(n => folderCardHTML(n)).join('')}</div>`, visibleRows => _queueFolderCovers(visibleRows.flat()))
-  const grid = $(containerId)
-  if (grid) grid._vlRebuild = () => _renderVirtualFolders(containerId, folders)
+  if (grid) { grid._vlCols = cols; grid._vlRebuild = () => _renderVirtualFolders(containerId, folders) }
 }
 
 function renderFolderAll() {
@@ -1353,20 +1356,25 @@ function _restoreFolderScroll() {
   if (saved !== undefined) { ca.scrollTop = saved }
 }
 
+// Drop the active search UI, remembering it so the back button can return to
+// the results list if the user navigated here from a search result.
+function exitSearchForNav() {
+  if (!S.q) return
+  if (!S._searchBack) {
+    S._searchBack = { q: S.q, folders: S._searchFolders || [], folderTotal: S._searchFolderTotal || 0, pl: pl.slice() }
+  }
+  $('search-input').value = ''; S.q = ''; S._searchFolders = []; S._searchFolderTotal = 0
+  const sc = $('search-clear'); if (sc) sc.classList.add('hidden')
+  const sb = $('search-back'); if (sb) sb.classList.remove('visible')
+  const si = $('search-input'); if (si) si.classList.remove('has-back')
+}
+
 function navigateFolder(path) {
   const node = findNodeByPath(S.folderTree, path)
   if (!node) return
   // Coming from a search result: remember the search so the back button can
   // return to the results list, then drop the active search UI for the folder view.
-  if (S.q) {
-    if (!S._searchBack) {
-      S._searchBack = { q: S.q, folders: S._searchFolders || [], folderTotal: S._searchFolderTotal || 0, pl: pl.slice() }
-    }
-    $('search-input').value = ''; S.q = ''; S._searchFolders = []; S._searchFolderTotal = 0
-    const sc = $('search-clear'); if (sc) sc.classList.add('hidden')
-    const sb = $('search-back'); if (sb) sb.classList.remove('visible')
-    const si = $('search-input'); if (si) si.classList.remove('has-back')
-  }
+  exitSearchForNav()
   _saveFolderScroll()
   S.activeFp = node.path
   if (S.folderStack[S.folderStack.length - 1] !== node.path) S.folderStack.push(node.path)
@@ -1558,6 +1566,9 @@ function goToTrackFolder(tid) {
     if (parent === current || !findNodeByPath(S.folderTree, parent)) break
     current = parent
   }
+  // Leave the search results view the same way folder navigation does, and
+  // remember the search so the back button can return to the results list.
+  exitSearchForNav()
   S.activeFp = stack[0] || node.path
   S.folderStack = stack
   S.view = 'all'
@@ -2165,7 +2176,7 @@ $('content-area').addEventListener('dblclick', e => {
 })
 $('content-area').addEventListener('contextmenu', e => {
   const sr = e.target.closest('.song-row'); if (sr) { e.preventDefault(); showCtx(e, { tid: sr.dataset.tid, pid: S.aPl, fid: S.aF }); return }
-  const fc = e.target.closest('.folder-card[data-fp]'); if (fc) { e.preventDefault(); showFolderCtx(e, fc.dataset.fp); return }
+  const fpEl = e.target.closest('[data-fp]'); if (fpEl && fpEl.dataset.fp) { e.preventDefault(); showFolderCtx(e, fpEl.dataset.fp); return }
   if (S.view === 'lyrics' && S.playingTid) { e.preventDefault(); showCtx(e, { tid: S.playingTid, pid: S.aPl, fid: S.aF }); return }
   if (S.view === 'all' && S.folderStack && S.folderStack.length) { e.preventDefault(); showFolderCtx(e, S.folderStack[S.folderStack.length - 1]); return }
   if (S.view === 'recent') { e.preventDefault(); showRecentCtx(e); return }
@@ -2401,7 +2412,14 @@ function showSidebarFavCtx(e, fvid) {
 $('btn-rescan').addEventListener('click', rescan)
 // Player cover always goes to lyrics view
 $('player-cover').addEventListener('click', () => {
-  if (pl.length > 0 && S.tI >= 0) { if (S.view !== 'lyrics') S.prevView = S.view; S.view = 'lyrics'; activeLrcTab = 'lyrics'; renderAll(); schedSave() }
+  // Open lyrics whenever a track exists, even if it is not in the currently
+  // displayed list (e.g. search results or another folder view).
+  const hasTrack = (S.tI >= 0 && S.tI < pl.length && pl[S.tI]) || S.playingTid
+  if (!hasTrack) return
+  if (S.view !== 'lyrics') S.prevView = S.view
+  S.view = 'lyrics'
+  activeLrcTab = 'lyrics'
+  renderAll(); schedSave()
 })
 
 // Playback
@@ -2901,6 +2919,7 @@ async function init() {
     window.addEventListener('beforeunload', saveOnExit)
     let _resizeRAF = null
     let _resizeFlushTimer = null
+    let _folderResizeRAF = null
     window.addEventListener('resize', () => {
       _startResizeThrottle()
       clearTimeout(_resizeFlushTimer)
@@ -2909,6 +2928,14 @@ async function init() {
         document.querySelectorAll('.vl-container').forEach(c => { if (c._vlRender) c._vlRender() })
         document.querySelectorAll('.virtual-vl').forEach(c => { if (c._vlRebuild) c._vlRebuild(); else if (c._vlRender) c._vlRender() })
       }, 300)
+      // Reflow folder grid columns in real time (per animation frame) so the
+      // column count follows the window width immediately while dragging.
+      if (!_folderResizeRAF) {
+        _folderResizeRAF = requestAnimationFrame(() => {
+          _folderResizeRAF = null
+          document.querySelectorAll('.virtual-vl').forEach(c => { if (c._vlRebuild) c._vlRebuild(); else if (c._vlRender) c._vlRender() })
+        })
+      }
       if (!_resizeRAF) {
         _resizeRAF = requestAnimationFrame(() => {
           if (S.bgData) apThBg()
