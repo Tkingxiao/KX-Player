@@ -65,4 +65,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ffmpegExec: (args: string[]) => ipcRenderer.invoke('ffmpeg:exec', args),
   clipboardWriteText: (text: string) => ipcRenderer.invoke('clipboard:writeText', text),
   showItemInFolder: (filePath: string) => ipcRenderer.invoke('shell:showItemInFolder', filePath),
+  reportMemSample: (sample: unknown) => {
+    try { ipcRenderer.send('mem:report', sample) } catch { /* ignore */ }
+  },
+  // Best-effort renderer heap stats pulled via main (process is unavailable
+  // in renderer with contextIsolation). Returns null on unsupported platforms.
+  rendererMemoryUsage: (): Promise<{ rss: number; heapUsed: number; heapTotal: number; external: number; jsHeapUsed?: number; jsHeapTotal?: number } | null> => {
+    return ipcRenderer.invoke('mem:getRendererMemory')
+  },
 })
