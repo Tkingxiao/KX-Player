@@ -80,6 +80,12 @@ function openDatabase(filePath: string): AppDatabase {
   db = new Database(filePath)
   dbFilePath = filePath
   db.pragma('journal_mode = WAL')
+  // Cap SQLite page cache at ~16MB (negative = KiB). Default is ~2GB virtual
+  // which better-sqlite3 never actually consumes but its memory accounting
+  // contributes to perceived RSS; capping improves memory predictability.
+  db.pragma('cache_size = -16000')
+  // Keep schema mapping small for faster cold scans.
+  db.pragma('temp_store = MEMORY')
   initializeSchema(db)
   return db
 }
@@ -287,9 +293,9 @@ export function loadLibrarySnapshot(filePath: string, options?: { lean?: boolean
   const trackRows = rowsFromAll(database, `
     SELECT
       t.id, t.name, t.path, t.duration, t.artist, t.album, t.format, t.is_video,
-      t.cover_path, t.cover_data, t.lyrics_path, t.file_mtime, t.file_size,
+      t.cover_path, t.lyrics_path, t.file_mtime, t.file_size,
       t.meta_title, t.meta_artist, t.genre, t.bitrate, t.sample_rate,
-      t.album_cover_data, t.album_id, t.artist_id
+      t.album_id, t.artist_id${lean ? '' : ', t.cover_data, t.album_cover_data'}
     FROM tracks t
     ORDER BY t.artist COLLATE NOCASE, t.album COLLATE NOCASE, t.name COLLATE NOCASE
   `, (row) => ({
@@ -302,7 +308,7 @@ export function loadLibrarySnapshot(filePath: string, options?: { lean?: boolean
     format: String(row.format),
     isVideo: Number(row.is_video) === 1,
     coverPath: row.cover_path ? String(row.cover_path) : null,
-    coverData: row.cover_data ? String(row.cover_data) : null,
+    coverData: lean ? null : (row.cover_data ? String(row.cover_data) : null),
     lyricsPath: row.lyrics_path ? String(row.lyrics_path) : null,
     fileMtime: Number(row.file_mtime) || 0,
     fileSize: Number(row.file_size) || 0,
@@ -311,7 +317,7 @@ export function loadLibrarySnapshot(filePath: string, options?: { lean?: boolean
     genre: row.genre ? String(row.genre) : null,
     bitrate: row.bitrate ? Number(row.bitrate) : null,
     sampleRate: row.sample_rate ? Number(row.sample_rate) : null,
-    albumCoverData: row.album_cover_data ? String(row.album_cover_data) : null,
+    albumCoverData: lean ? null : (row.album_cover_data ? String(row.album_cover_data) : null),
     albumId: Number(row.album_id),
     artistId: Number(row.artist_id),
   }))
@@ -395,7 +401,7 @@ export function loadLibrarySnapshot(filePath: string, options?: { lean?: boolean
   }
 
   const folderRows = rowsFromAll(database, `
-    SELECT path, name, parent_path, track_count, cover_data
+    SELECT path, name, parent_path, track_count${lean ? '' : ', cover_data'}
     FROM folder_nodes
     ORDER BY path COLLATE NOCASE
   `, (row) => ({
@@ -403,7 +409,7 @@ export function loadLibrarySnapshot(filePath: string, options?: { lean?: boolean
     name: String(row.name),
     parentPath: row.parent_path ? String(row.parent_path) : null,
     trackCount: Number(row.track_count) || 0,
-    coverData: row.cover_data ? String(row.cover_data) : null,
+    coverData: lean ? null : (row.cover_data ? String(row.cover_data) : null),
   }))
 
   const folderTrackRows = rowsFromAll(database, `

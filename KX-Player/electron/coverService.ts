@@ -214,6 +214,15 @@ export function setFolderCoverMapping(folderPath: string) {
   saveFolderCoverMap()
 }
 
+/** Return the local absolute path of a folder cover (no base64 read). */
+export function getFolderCoverPathByMapping(folderPath: string): string | null {
+  const hash = _folderCoverMap[folderPath]
+  if (!hash) return null
+  const p = path.join(coversDir(), `folder_${hash}.jpg`)
+  if (!fs.existsSync(p)) return null
+  return p
+}
+
 export function getFolderCoverByMapping(folderPath: string): string | null {
   const hash = _folderCoverMap[folderPath]
   if (!hash) return null

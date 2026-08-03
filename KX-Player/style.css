@@ -21,7 +21,7 @@ body { font-family: var(--font); background-color: var(--bg); color: var(--text)
 ::-webkit-scrollbar-thumb { background: rgba(100,100,110,0.4); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(140,140,150,0.55); }
 
-#bg-layer { position: fixed; inset: 0; z-index: -1; overflow: hidden; opacity: var(--overlay-opacity); filter: blur(var(--bg-blur)); pointer-events: none; }
+#bg-layer { position: fixed; inset: 0; z-index: -1; overflow: hidden; opacity: var(--overlay-opacity); filter: none; pointer-events: none; }
 #bg-layer img { position: absolute; pointer-events: none; user-select: none; -webkit-user-drag: none; }
 #app { display: flex; flex-direction: column; height: 100vh; position: relative; z-index: 1; }
 

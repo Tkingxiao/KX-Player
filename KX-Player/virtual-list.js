@@ -4,6 +4,42 @@
 
 import { $ } from './utils.js'
 
+function _releaseImages(root) {
+  if (!root || !root.querySelectorAll) return
+  root.querySelectorAll('img').forEach(img => {
+    try {
+      img.removeAttribute('src')
+      img.removeAttribute('srcset')
+    } catch { /* ignore */ }
+  })
+}
+
+export function destroyVirtualListContainer(c, clearDom = true) {
+  if (!c) return
+  if (c._vlRO) { c._vlRO.disconnect(); c._vlRO = null }
+  if (c._vlRAF) { cancelAnimationFrame(c._vlRAF); c._vlRAF = 0 }
+  if (c._vlResizeTimer) { clearTimeout(c._vlResizeTimer); c._vlResizeTimer = null }
+  if (c._vlScrollFn) { c.removeEventListener('scroll', c._vlScrollFn); c._vlScrollFn = null }
+  if (c._vlClickFn) { c.removeEventListener('click', c._vlClickFn); c._vlClickFn = null }
+  if (c._vlDblClickFn) { c.removeEventListener('dblclick', c._vlDblClickFn); c._vlDblClickFn = null }
+  c._vlRender = null
+  c._vlRebuild = null
+  c._vlItems = null
+  c._vlCols = null
+  if (clearDom) {
+    _releaseImages(c)
+    c.innerHTML = ''
+  }
+}
+
+export function destroyVirtualLists(root) {
+  if (!root || !root.querySelectorAll) return
+  const nodes = []
+  if (root.matches && (root.matches('.vl-container') || root.matches('.virtual-vl'))) nodes.push(root)
+  nodes.push(...root.querySelectorAll('.vl-container, .virtual-vl'))
+  nodes.forEach(node => destroyVirtualListContainer(node, true))
+}
+
 // Resize throttler: suspend VL renders during window resize to avoid jank
 let _resizeActive = false
 let _resizeTimer = null
@@ -23,13 +59,7 @@ export function virtualList(containerId, items, rowHeight, renderItem, onClick, 
   const c = $(containerId)
   if (!c) return
   // Remove previous listeners and observer to prevent accumulation
-  if (c._vlRO) { c._vlRO.disconnect(); c._vlRO = null }
-  if (c._vlRAF) { cancelAnimationFrame(c._vlRAF); c._vlRAF = 0 }
-  if (c._vlResizeTimer) { clearTimeout(c._vlResizeTimer); c._vlResizeTimer = null }
-  if (c._vlScrollFn) { c.removeEventListener('scroll', c._vlScrollFn) }
-  if (c._vlClickFn) { c.removeEventListener('click', c._vlClickFn) }
-  if (c._vlDblClickFn) { c.removeEventListener('dblclick', c._vlDblClickFn) }
-  c.innerHTML = ''
+  destroyVirtualListContainer(c, true)
   if (!items.length) { c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u6682\u65e0\u5185\u5bb9</h3></div>'; return }
   const totalH = items.length * rowHeight
   const spacer = document.createElement('div'); spacer.style.height = totalH + 'px'; spacer.style.position = 'relative'
@@ -104,11 +134,7 @@ export function virtualList(containerId, items, rowHeight, renderItem, onClick, 
 export function virtualFolderList(containerId, items, rowHeight, renderItem, onVisibleItems) {
   const c = $(containerId)
   if (!c) return
-  if (c._vlRO) { c._vlRO.disconnect(); c._vlRO = null }
-  if (c._vlRAF) { cancelAnimationFrame(c._vlRAF); c._vlRAF = 0 }
-  if (c._vlResizeTimer) { clearTimeout(c._vlResizeTimer); c._vlResizeTimer = null }
-  if (c._vlScrollFn) { c.removeEventListener('scroll', c._vlScrollFn) }
-  c.innerHTML = ''
+  destroyVirtualListContainer(c, true)
   if (!items.length) { c.innerHTML = '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u65e0\u5339\u914d\u6587\u4ef6\u5939</h3></div>'; return }
   const totalH = items.length * rowHeight
   const spacer = document.createElement('div'); spacer.style.height = totalH + 'px'; spacer.style.position = 'relative'
