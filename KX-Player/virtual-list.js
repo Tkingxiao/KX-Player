@@ -65,7 +65,9 @@ export function virtualList(containerId, items, rowHeight, renderItem, onClick, 
   const spacer = document.createElement('div'); spacer.style.height = totalH + 'px'; spacer.style.position = 'relative'
   const view = document.createElement('div'); view.style.position = 'absolute'; view.style.top = '0'; view.style.left = '0'; view.style.right = '0'
   spacer.appendChild(view); c.appendChild(spacer)
-  const buffer = 10
+  // Buffer kept small: each extra row can carry a cover <img> whose decoded
+  // bitmap costs width*height*4 bytes in the renderer process.
+  const buffer = 6
   let lastStart = -1
   let lastEnd = -1
 
@@ -140,7 +142,9 @@ export function virtualFolderList(containerId, items, rowHeight, renderItem, onV
   const spacer = document.createElement('div'); spacer.style.height = totalH + 'px'; spacer.style.position = 'relative'
   const view = document.createElement('div'); view.style.position = 'absolute'; view.style.top = '0'; view.style.left = '0'; view.style.right = '0'
   spacer.appendChild(view); c.appendChild(spacer)
-  const buffer = 10
+  // Buffer kept small: each extra row can carry a cover <img> whose decoded
+  // bitmap costs width*height*4 bytes in the renderer process.
+  const buffer = 6
   let lastStart = -1
   let lastEnd = -1
 

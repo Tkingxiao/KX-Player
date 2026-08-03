@@ -3,7 +3,6 @@
 // NOT in SQLite. Loaded on demand via IPC, with deduplication and LRU cache.
 
 import { api } from './api.js'
-import { mark as markMem } from './mem-monitor.js'
 
 const _coverCache = new Map()          // id -> dataUrl string (cover data)
 const _coverLoading = new Set()        // Set of trackIds currently being loaded (prevents duplicate requests)
@@ -87,19 +86,16 @@ function _flushBatch() {
     if (_pendingBatch.length) _flushBatch()
     return
   }
-  markMem('renderer:cover:request', `batch=${toLoad.length}`)
   for (const id of toLoad) _coverLoading.add(id)
   api.getTrackCovers(toLoad).then(covers => {
     let hasNewCovers = false
     const loadedIds = []
-    let bytesIn = 0
     for (const [id, data] of Object.entries(covers)) {
       _setCachedCover(id, data || '')
       _coverLoading.delete(id)
       if (data) {
         hasNewCovers = true
         loadedIds.push(id)
-        bytesIn += data.length
       }
     }
     // Clean up loading state for IDs that returned no cover
@@ -110,7 +106,6 @@ function _flushBatch() {
       }
     }
     _evictCoverCache()
-    markMem('renderer:cover:response', `loaded=${loadedIds.length} bytes~=${(bytesIn / 1024).toFixed(0)}KB cacheSize=${_coverCache.size} cacheBytes~=${(_coverCacheBytes / 1024 / 1024).toFixed(1)}MB`)
     // Notify listeners that covers have been loaded
     if (hasNewCovers) {
       for (const callback of _coverLoadedCallbacks) {
@@ -170,15 +165,4 @@ export function _clearCoverCache() {
   _pendingBatch.length = 0
   _pendingSet.clear()
   if (_batchTimer) { clearTimeout(_batchTimer); _batchTimer = null }
-}
-
-// Expose cache stats for the memory monitor. Read-only; updates when the
-// cache mutates. Returned as a small object literal to keep call cost low.
-export function _getCoverCacheStats() {
-  return { size: _coverCache.size, bytes: _coverCacheBytes }
-}
-if (typeof window !== 'undefined') {
-  window.__coverCacheBytes = () => _coverCacheBytes
-  window.__coverCacheSize = () => _coverCache.size
-  window.__getCoverCacheStats = _getCoverCacheStats
 }

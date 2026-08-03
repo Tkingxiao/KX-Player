@@ -30,16 +30,57 @@ function coversDir(): string {
 export function getCoversDir(): string { return coversDir() }
 
 // --- Compression ---
+// Decoded bitmap cost in the renderer is width*height*4 bytes, so keep the
+// stored dimension ceiling low; 300px is enough for the player cover panel
+// and keeps Chromium's decoded-image cache small while scrolling.
+const MAX_COVER_DIM = 300
+
 async function compressToJpeg(input: Buffer): Promise<Buffer> {
   if (input.length < 10 * 1024) return input // skip tiny images
   try {
     return await sharp(input)
-      .resize(400, 400, { fit: 'inside', withoutEnlargement: true })
+      .resize(MAX_COVER_DIM, MAX_COVER_DIM, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 70 })
       .toBuffer()
   } catch {
     return input
   }
+}
+
+// --- One-time migration: downscale oversized legacy cover files ---
+// Covers written by older versions (or imported external artwork) may exceed
+// MAX_COVER_DIM; each such image pins width*height*4 bytes of decoded bitmap
+// in the renderer for every visible <img>. Runs in the background, rewrites
+// only oversized files atomically (tmp + rename), and never throws.
+let _migrating = false
+export async function migrateOversizedCovers(): Promise<number> {
+  if (_migrating) return 0
+  _migrating = true
+  let fixed = 0
+  try {
+    const files = fs.readdirSync(coversDir()).filter(f => f.endsWith('.jpg'))
+    for (const f of files) {
+      const p = path.join(coversDir(), f)
+      try {
+        const buffer = await fsp.readFile(p)
+        const meta = await sharp(buffer).metadata()
+        if ((meta.width || 0) > MAX_COVER_DIM || (meta.height || 0) > MAX_COVER_DIM) {
+          const out = await sharp(buffer)
+            .resize(MAX_COVER_DIM, MAX_COVER_DIM, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 70 })
+            .toBuffer()
+          await fsp.writeFile(p + '.tmp', out)
+          await fsp.rename(p + '.tmp', p)
+          fixed++
+        }
+      } catch { /* skip unreadable file */ }
+      // Yield so the main process stays responsive during migration.
+      await new Promise(r => setImmediate(r))
+    }
+  } catch { /* ignore */ }
+  _migrating = false
+  if (fixed) console.log(`[cover] migrated ${fixed} oversized cover file(s) to <=${MAX_COVER_DIM}px`)
+  return fixed
 }
 
 // --- Save ---

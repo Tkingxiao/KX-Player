@@ -8,91 +8,6 @@ import { idbGet, idbSet } from './idb-store.js'
 import { hex2rgb, h2hsl, hsvToRgb } from './color-utils.js'
 import { findBestLyricsMatch } from './lyrics-matcher.js'
 import { buildFolderMeta, findNodeByPath, hasMusicRecursive } from './folder-tree.js'
-import { startMemMonitor, mark as markMem } from './mem-monitor.js'
-
-// Start memory monitor as early as possible so we capture the entire lifecycle.
-startMemMonitor()
-markMem('renderer:scriptLoaded')
-
-// === State size diagnostics ===
-// We cannot read process.memoryUsage() directly in the renderer across
-// contextIsolation, but we CAN measure how much memory our own long-lived
-// data structures consume. The dominant cost in this renderer is V8 object
-// heap size; we approximate it with JSON.stringify(...).length which is
-// cheap and order-of-magnitude accurate for plain objects.
-function _approxBytes(v) {
-  if (v == null) return 0
-  try {
-    return JSON.stringify(v).length
-  } catch {
-    return 0
-  }
-}
-function stateSizesBrief() {
-  const all = S.all
-  const tree = S.folderTree
-  const meta = S._folderMeta
-  return `all=${(all.length / 1000).toFixed(1)}k`
-    + ` tree=${(tree.length * 8 / 1024).toFixed(0)}kB`
-    + ` meta=${Object.keys(meta || {}).length}`
-    + ` coverCache=${window.__coverCacheSize?.() || 0}`
-}
-function logStructSizes() {
-  // Compute byte counts for every long-lived collection.
-  const allBytes = _approxBytes(S.all)
-  const treeBytes = _approxBytes(S.folderTree)
-  const metaBytes = _approxBytes(S._folderMeta)
-  const favsBytes = _approxBytes(S.favs)
-  const plsBytes = _approxBytes(S.pls)
-  const recentsBytes = _approxBytes(S.recents)
-  const bgBytes = S.bgData ? _approxBytes(S.bgData.slice(0, 4096)) * Math.ceil((S.bgData.length || 1) / 4096) : 0
-  const coverMemBytes = window.__coverCacheBytes?.() || 0
-  const domBytes = _approxBytes({ html: document.documentElement.outerHTML.slice(0, 8192) })
-  // Probe <img> nodes that hold base64 data URLs — these don't show up in
-  // JS object size but decode to large ImageBitmaps retained by the GPU.
-  let imgDataBytes = 0, imgCount = 0, imgDecoded = 0
-  if (typeof document !== 'undefined') {
-    const imgs = document.querySelectorAll('img')
-    imgCount = imgs.length
-    imgs.forEach((img) => {
-      try {
-        if (img.src && img.src.startsWith('data:')) {
-          imgDataBytes += img.src.length
-        }
-        if (img.naturalWidth) {
-          // bytes per pixel ≈ 4 (RGBA), this approximates decoded bitmap size
-          imgDecoded += img.naturalWidth * img.naturalHeight * 4
-        }
-      } catch { /* ignore */ }
-    })
-  }
-  // Audio element source URL — large dataURLs here are also hidden from JSON
-  // but can pin memory if loaded from blob/data URLs.
-  let audioSrcBytes = 0
-  try { if (audio && audio.src && audio.src.startsWith('data:')) audioSrcBytes = audio.src.length } catch {}
-  markMem('renderer:structs',
-    `all=${(allBytes / 1024).toFixed(0)}kB`
-    + ` tree=${(treeBytes / 1024).toFixed(0)}kB`
-    + ` meta=${(metaBytes / 1024).toFixed(0)}kB`
-    + ` favs=${(favsBytes / 1024).toFixed(0)}kB`
-    + ` pls=${(plsBytes / 1024).toFixed(0)}kB`
-    + ` recents=${recentsBytes}B`
-    + ` bg=${(bgBytes / 1024).toFixed(0)}kB`
-    + ` coverBytes=${(coverMemBytes / 1024).toFixed(0)}kB`
-    + ` imgs=${imgCount}x${(imgDataBytes / 1024).toFixed(0)}kB(~${(imgDecoded / 1024 / 1024).toFixed(1)}MBdec)`
-    + ` dom=${(domBytes / 1024).toFixed(0)}kB`
-  )
-}
-// Periodic diagnostics every 30s — use a separate timer so we don't depend
-// on the IPC pull working (which has been broken on this Electron build).
-let _structTimer = null
-function startStructSizeLog() {
-  if (_structTimer) return
-  _structTimer = setInterval(() => {
-    try { logStructSizes() } catch { /* ignore */ }
-  }, 30000)
-}
-startStructSizeLog()
 
 function stripScanResultCovers(result) {
   if (!result) return result
@@ -350,7 +265,6 @@ function cleanupStale(allIds) {
 }
 
 function applyScanResult(result) {
-  markMem('renderer:applyScanResult:start', `tracks=${result?.allTracks?.length ?? 0} folders=${result?.folderTree?.length ?? 0}`)
   stripScanResultCovers(result)
   S.folderTree = result?.folderTree || []
   S._folderMeta = buildFolderMeta(S.folderTree)
@@ -358,7 +272,6 @@ function applyScanResult(result) {
   const at = result?.allTracks || []
   S.all = at
   rebuildTrackIndex()
-  markMem('renderer:applyScanResult:done', `tracks=${at.length}`)
   return at
 }
 
@@ -375,7 +288,6 @@ async function restartWatching() {
 
   try {
     stopWatchingFs = await api.onFsChanged(() => {
-      markMem('renderer:watcher:fsChanged')
       console.log('[watcher] fs changed, triggering rescan')
       _watcherTriggered = true
       rescan()
@@ -491,7 +403,6 @@ async function loadS() {
 async function loadLibraryData() {
   try {
     if (!fp.length) return
-    markMem('renderer:loadLibraryData:start', `folders=${fp.length}`)
     console.time('[startup] total')
     // Use fast load (no cover data) to avoid loading 200MB+ of base64 at startup.
     // Covers are loaded on demand from SQLite (already compressed to 400px thumbnails).
@@ -516,9 +427,7 @@ async function loadLibraryData() {
     // loading or the offline-change sync below.
     pl = S.all
     renderAll()
-    markMem('renderer:loadLibraryData:renderDone')
     console.timeEnd('[startup] total')
-    markMem('renderer:loadLibraryData:done', `tracks=${S.all.length} cacheUsed=${cacheUsed}`)
 
     // If we used cached data, run an incremental scan to pick up any file
     // changes that happened while the app was not running (additions,
@@ -536,7 +445,7 @@ async function loadLibraryData() {
     const currentCoverLoaded = currentTrack && (!loadedSet.size || loadedSet.has(currentTrack.id))
     if (!currentCoverLoaded) return
 
-    const coverData = _getCoverData(currentTrack)
+    const coverData = _playerCover(currentTrack)
     if (!coverData) return
 
     const coverImgEl = $('player-cover-img')
@@ -612,7 +521,6 @@ function runStartupIncrementalSync() {
   const syncPaths = fp.slice()
   Promise.resolve().then(async () => {
     try {
-      logStructSizes()
       console.log('[startup] running incremental scan to sync offline changes...')
       const r = await api.scanFoldersIncremental(syncPaths)
       if (r && r.allTracks) {
@@ -667,7 +575,8 @@ function apTh() {
     root.style.setProperty('--border', 'rgba(0,0,0,0.1)'); root.style.setProperty('--modal-bg', 'rgba(252,252,255,0.98)')
     root.style.setProperty('--modal-overlay', 'rgba(0,0,0,0.35)')
   }
-  // Sidebar opacity
+  // Sidebar opacity (translucent, but no backdrop-filter: content-area never
+  // scrolls behind the chrome, so blur is not needed for readability)
   const sidebarEl = $('sidebar'), titlebarEl = $('titlebar'), playerBarEl = $('player-bar')
   const sidebarAlpha = (S.sidebarOpacity ?? 100) / 100
   const sbBg = isDark ? `rgba(16,16,22,${sidebarAlpha})` : `rgba(245,245,247,${sidebarAlpha})`
@@ -1029,7 +938,6 @@ async function loadT(idx) {
   const gen = ++_loadTGeneration
   nI = idx
   const t = pl[idx]
-  markMem('renderer:loadT:start', `tid=${t?.id} fmt=${t?.format}`)
   // Cleanly reset the <audio> element so Chromium releases the previous
   // BufferSource and MediaSource object before we hand it a new src.
   try {
@@ -1038,7 +946,6 @@ async function loadT(idx) {
   audio.removeAttribute('src')
   try { audio.load() } catch { /* ignore */ }
   const newSrc = 'file:///' + t.path.replace(/\\/g, '/')
-  markMem('renderer:loadT:setSrc', `len=${newSrc.length}`)
   audio.src = newSrc
   await loadLrcForTrack(t)
   if (gen !== _loadTGeneration) return
@@ -1046,7 +953,6 @@ async function loadT(idx) {
   await audio.play().catch(() => { /* ignore */ })
   if (gen !== _loadTGeneration) return
   S.tI = idx; S.playing = true
-  markMem('renderer:loadT:done', `idx=${idx}`)
 }
 
 async function loadLrcForTrack(t) {
@@ -1175,7 +1081,6 @@ async function loadLrcForTrack(t) {
 function playT(idx, keepView) {
   if (idx < 0 || idx >= pl.length) return
   const t = pl[idx]
-  markMem('renderer:playT', `tid=${t?.id}`)
   S.playingTid = t.id
   if (!S.recents.includes(t.id)) { S.recents.unshift(t.id); if (S.recents.length > 200) S.recents.length = 200 }
   if (!keepView && S.view !== 'lyrics') {
@@ -1199,7 +1104,7 @@ function playT(idx, keepView) {
 }
 
 function updPUI(t, skipLrc) {
-  let cd = _getCoverData(t)
+  let cd = _playerCover(t)
   const titleEl = $('player-title'), artistEl = $('player-artist')
   const coverEl = $('player-cover'), coverImgEl = $('player-cover-img')
   titleEl.textContent = nName(t)
@@ -1221,8 +1126,51 @@ function updPUI(t, skipLrc) {
     }
     // Lazy-load cover if not in memory
     if (t && t.id) _loadCoversForTrackIds([t.id])
+    // Also request the containing folder's external cover as a fallback
+    // (pre-strip this arrived via track.albumCoverData).
+    const dir = _trackDir(t)
+    if (dir) _queueFolderCovers([{ path: dir }])
   }
   if (!skipLrc && S.view === 'lyrics') renderLrcContent()
+}
+
+// Normalized (slash) directory of a track, matching S._folderMeta keys.
+function _trackDir(t) {
+  try {
+    const p = (t && t.path || '').replace(/\\/g, '/')
+    const i = p.lastIndexOf('/')
+    return i > 0 ? p.slice(0, i) : null
+  } catch { return null }
+}
+
+// Cover for player bar / lyrics: the track's own cover first, falling back
+// to the containing folder's external cover. Restores the pre-strip
+// albumCoverData fallback without shipping cover bytes on every track.
+function _playerCover(t) {
+  const cd = _getCoverData(t)
+  if (cd) return cd
+  const dir = _trackDir(t)
+  const fm = dir && S._folderMeta && S._folderMeta[dir]
+  return (fm && fm.coverData) || null
+}
+
+// Refresh the player bar cover from the folder-cover fallback. Called when
+// folder covers finish lazy-loading, so the cover appears even if it was
+// not available when the track started.
+function _syncPlayerCoverFallback() {
+  try {
+    const t = S.tI >= 0 && pl && S.tI < pl.length ? pl[S.tI] : null
+    if (!t || _getCoverData(t)) return
+    const cd = _playerCover(t)
+    if (!cd) return
+    const coverImgEl = $('player-cover-img'), coverEl = $('player-cover')
+    if (coverImgEl && coverEl) {
+      coverImgEl.src = cd
+      coverImgEl.style.display = ''
+      const ph = coverEl.querySelector('.cover-placeholder')
+      if (ph) ph.style.display = 'none'
+    }
+  } catch { /* ignore */ }
 }
 
 function hEnd() {
@@ -1282,12 +1230,10 @@ function renderAll() {
 }
 
 function _doRenderAll() {
-  markMem('renderer:renderAll:start', `view=${S.view}`, { dedupeMs: 50 })
   invalidateFavCache()
   renderSB(); renderContent(); syncPlayingState()
   requestAnimationFrame(() => _initColumnHandlers($('content-area')))
   renderPanel(); updPlayBtn(); syncAllListsPlaying(); schedSave()
-  markMem('renderer:renderAll:end', `view=${S.view}`, { dedupeMs: 50 })
 }
 
 function renderSB() {
@@ -1441,6 +1387,7 @@ function _flushFolderCovers() {
     if (changed) {
       _updateFolderTreeCovers(S.folderTree, covers)
       document.querySelectorAll('.virtual-vl').forEach(c => { if (c._vlRender) c._vlRender() })
+      _syncPlayerCoverFallback()
     }
   }).catch(() => {
     for (const p of batch) _folderCoverLoading.delete(p)
@@ -1707,7 +1654,7 @@ function renderLrcContent() {
   const t = getTrackById(S.playingTid)
   const container = $('content-area')
   if (!container) return
-  const cd = t ? _getCoverData(t) : null
+  const cd = t ? _playerCover(t) : null
   const lrcHtml = buildLrcLines(lrc)
   container.innerHTML = t ? `<div class="lyrics-page-actions"><button class="lyrics-action-btn" data-lact="folder">\u6240\u5728\u6587\u4ef6\u5939</button><button class="lyrics-action-btn" data-lact="copy">\u590d\u5236\u8def\u5f84</button></div><div class="lyrics-content-layout"><div class="lyrics-content-left"><div class="lyrics-content-cover">${cd ? `<img src="${esc(cd)}" alt="" loading="lazy" decoding="async" />` : '<div class="cover-fallback"><svg viewBox="0 0 24 24" width="56" height="56" fill="none" stroke="currentColor" stroke-width="1"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg></div>'}</div></div><div class="lyrics-content-right"><div class="lyrics-content-info"><div class="lc-title">${esc(nName(t))}</div><div class="lc-artist">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}${isVideoFile(t) ? ' \u00b7 \u89c6\u9891-\u4ec5\u97f3\u9891\u6a21\u5f0f' : ''}</div></div><div class="lyrics-tab-btns"><button class="lyrics-tab-btn${activeLrcTab === 'lyrics' ? ' active' : ''}" data-ltab="lyrics">\u6b4c\u8bcd</button><button class="lyrics-tab-btn${activeLrcTab === 'meta' ? ' active' : ''}" data-ltab="meta">\u4fe1\u606f</button></div><div class="lyrics-container-wrapper"><div class="lyrics-lines-scroll${activeLrcTab !== 'lyrics' ? ' hidden' : ''}" id="lyrics-lines-scroll">${lrcHtml || '<div class="lc-empty">\u6682\u65e0\u6b4c\u8bcd</div>'}</div><div class="lyrics-meta-panel${activeLrcTab !== 'meta' ? ' hidden' : ''}" id="lyrics-meta-panel"><div class="meta-row"><span class="meta-label">\u6587\u4ef6\u540d</span><span class="meta-value">${esc(nName(t))}</span></div><div class="meta-row"><span class="meta-label">\u827a\u672f\u5bb6</span><span class="meta-value">${esc(t.metaArtist || t.artist || '\u4f5a\u540d')}</span></div><div class="meta-row"><span class="meta-label">\u4e13\u8f91</span><span class="meta-value">${esc(t.album || '')}</span></div><div class="meta-row"><span class="meta-label">\u683c\u5f0f</span><span class="meta-value">${t.format.toUpperCase()}${isVideoFile(t) ? ' (\u89c6\u9891)' : ''}</span></div><div class="meta-row"><span class="meta-label">\u65f6\u957f</span><span class="meta-value">${fmtTime(t.duration)}</span></div><div class="meta-row"><span class="meta-label">\u6587\u4ef6</span><span class="meta-value">${esc(t.path)}</span></div></div></div></div></div>` : '<div class="empty-state"><div class="empty-state-icon">\u266a</div><h3>\u672a\u5728\u64ad\u653e</h3></div>'
   const lines = container.querySelectorAll('.lc-line')
@@ -2796,7 +2743,6 @@ function getPlaybackDuration() {
 $('search-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') {
     const q = $('search-input').value
-    markMem('renderer:search:start', `q="${q}" tracks=${S.all.length}`)
     S._searchBack = null
     S.q = q; $('search-back').classList.toggle('visible', !!S.q); $('search-clear').classList.toggle('hidden', !S.q); $('search-input').classList.toggle('has-back', !!S.q)
     if (!S.prevView) { S.prevView = S.view; S._prevAF = S.aF; S._prevAPl = S.aPl; S._prevFolderStack = [...S.folderStack]; S._prevActiveFp = S.activeFp }
@@ -2834,7 +2780,6 @@ $('search-input').addEventListener('keydown', e => {
     S._searchFolderTotal = found.total
     syncPlayingState()
     renderAll(); schedSave()
-    markMem('renderer:search:done', `tracks=${scored.length} folders=${found.total} q="${q}"`)
   }
 })
 $('search-back').addEventListener('click', () => exitSearch())
@@ -3215,12 +3160,33 @@ async function init() {
     // so user doesn't see stale state (progress bar, lyrics, etc.)
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
-        // Release heavy native resources (decoded images) to free ~100MB
-        // while the window is hidden. We restore them on visibility:visible.
+        // Release heavy native resources (decoded images) to free ~100-250MB
+        // while the window is hidden. Every <img> pins a width*height*4 byte
+        // bitmap in the renderer process; dropping src releases it. We
+        // restore everything on visibility:visible.
         releaseImageResources()
+        releaseDomImages(document.body)
         return
       }
       restoreImageResources()
+      // Re-render virtual lists so released cover <img> sources come back.
+      document.querySelectorAll('.vl-container, .virtual-vl').forEach(c => {
+        try { if (c._vlRender) c._vlRender() } catch { /* ignore */ }
+      })
+      // Restore the static playlist/favorites header cover (not part of any
+      // virtual list, so _vlRender above does not rebuild it).
+      const hdrImg = document.querySelector('.pl-content-cover img')
+      if (hdrImg) {
+        try {
+          const firstWithCover = (pl || []).find(t => _playerCover(t))
+          const cd = firstWithCover ? _playerCover(firstWithCover) : null
+          if (cd) hdrImg.src = cd
+        } catch { /* ignore */ }
+      }
+      // Restore the player bar cover for the current track.
+      if (S.tI >= 0 && pl && S.tI < pl.length && pl[S.tI]) {
+        try { updPUI(pl[S.tI], true) } catch { /* ignore */ }
+      }
       // Update progress bar from current audio state
       if (audio.duration) {
         S.cTime = audio.currentTime
