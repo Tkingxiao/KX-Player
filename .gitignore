@@ -13,7 +13,11 @@ dist_electron/
 *.deb
 *.rpm
 *.blockmap
+# 注意：*.yml 会吞掉所有 .yaml/.yml 配置文件（含未来的 CI workflow），
+# 因此显式放行 .github 下的工作流。negation 必须写在 *.yml 之后才生效。
 *.yml
+!.github/**/*.yml
+!.github/**/*.yaml
 
 # IDE
 .reasonix/
@@ -48,3 +52,50 @@ error.md
 plan.md
 better.md
 record-time.js
+
+# Rust / Tauri build artifacts
+KX-Player/src-tauri/target/
+**/target/
+
+# AI/agent tool state (临时钩子状态，勿入库)
+.mimosa/
+**/.mimosa/
+.zcode/
+**/.zcode/
+.toolchain/
+**/.toolchain/
+
+# 本地测试媒体（开发期临时生成）
+test-media/
+**/test-media/
+
+# 测试运行目录（临时 APPDATA / 日志 / dump）
+.test-run/
+**/.test-run/
+
+# 运行期产物
+kx-player-log.txt
+
+# 构建 / 测试缓存（当前无被跟踪文件命中，可安全忽略）
+*.tsbuildinfo
+.vite/
+coverage/
+.eslintcache
+
+# 编辑器备份 / 崩溃残留
+*~
+*.bak
+*.tmp
+*.old
+*.stackdump
+*.dmp
+
+# 待索引清理后再启用的规则（直接加会与已跟踪文件冲突）：
+#   KX-Player/src-tauri/gen/schemas/   → Tauri 每次 build 自动重建，现有 4 个文件已入库
+#   HANDOVER*.md                       → HANDOVER-electron-era.md 已入库，需先决定是否保留
+# 启用时需配合：git rm -r --cached <路径>
+/docs-vibecoding
+HANDOVER-electron-era.md
+HANDOVER.md
+CLAUDE.md
+/tmp

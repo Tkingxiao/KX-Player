@@ -6,6 +6,11 @@ import fsp from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { scanFoldersWithProgress, scanFoldersIncremental, startWatching, stopWatching, terminateWorkerPool } from './fileScanner'
 import { loadLibrarySnapshot, loadTrackListSnapshot, loadTrackMetadataIndex, loadFullMetadataIndex, saveLibrarySnapshot } from './libraryDb'
+import {
+  getAllProgress, setProgress, markCompleted, clearProgress, pruneProgressAndBookmarks,
+  listBookmarks, addBookmark, renameBookmark, removeBookmark, closeProgressDb,
+} from './progressDb'
+import { chatCompletion, pingProvider, listModels, renameDir, type ChatMessage } from './aiService'
 import { initCoverDir, loadFolderCoverMap, saveTrackCover, saveFolderCover, saveExternalCover, setFolderCoverMapping, getTrackCoverDataUrl, getTrackCoversBatchAsync, getFolderCoversBatchAsync, getFolderCoverByMapping, getFolderCoverPathByMapping, getAllFolderCoversFromMapAsync, findExternalCoverInDir, getCoversDir, getTrackCoverPath, migrateOversizedCovers } from './coverService'
 
 // Shared MIME type mapping for image files
@@ -173,6 +178,19 @@ app.whenReady().then(async () => {
   // resident. One file, so blocking startup briefly is acceptable.
   await migrateOversizedBgImage()
 
+  // Forward renderer console to stdout so dev builds surface renderer errors
+  // (they are not visible in the terminal otherwise).
+  app.whenReady().then(() => {
+    const poll = () => {
+      const win = mainWindow
+      if (!win || win.isDestroyed()) { setTimeout(poll, 500); return }
+      win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+        if (level >= 2) console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`)
+      })
+    }
+    poll()
+  })
+
   // Downscale legacy oversized cover files in the background. Deferred so it
   // never competes with the startup library load / incremental scan for CPU.
   setTimeout(() => { migrateOversizedCovers().catch(() => { /* ignore */ }) }, 8000)
@@ -239,6 +257,7 @@ ipcMain.handle('dialog:openAudioFiles', async () => {
 })
 
 ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: string[]) => {
+  console.log('[scan] full scan folders:', JSON.stringify(folderPaths))
   const sender = event.sender
   try {
     console.time('[scan] loadMetadataIndex')
@@ -267,6 +286,7 @@ ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: str
         fileCount: result.fileCount,
         scannedAt: Date.now(),
       })
+      try { pruneProgressAndBookmarks(getLibraryDbPath()) } catch { /* ignore */ }
     } catch { /* ignore */ }
     console.timeEnd('[scan] saveLibrary')
 
@@ -279,10 +299,11 @@ ipcMain.handle('scanner:scanFoldersWithProgress', async (event, folderPaths: str
       console.error('[scan] saveCovers failed:', e)
     }
     stripCoverPayloadForRenderer(result)
-    return result
+    // 渲染端 applyScanResult 依赖 folderPaths（否则曲库路径被归零，后续重扫传空）
+    return { ...result, folderPaths }
   } catch (err: any) {
     console.error('[scan] Fatal error:', err?.message || err)
-    return { artists: [], folderTree: [], allTracks: [], fileCount: 0 }
+    return { artists: [], folderTree: [], allTracks: [], fileCount: 0, folderPaths }
   }
 })
 
@@ -303,6 +324,110 @@ ipcMain.handle('library:loadFast', async () => {
   } catch {
     return null
   }
+})
+
+// ── AI 翻译（网络仅限主进程；API Key 不落盘）────────────────────
+ipcMain.handle('ai:chat', async (_event, payload: {
+  baseURL: string
+  apiKey: string
+  model: string
+  messages: ChatMessage[]
+  temperature?: number
+}) => {
+  try {
+    if (!payload || !Array.isArray(payload.messages)) return { ok: false, content: '', error: '参数错误' }
+    const content = await chatCompletion({
+      baseURL: String(payload.baseURL || ''),
+      apiKey: String(payload.apiKey || ''),
+      model: String(payload.model || ''),
+      messages: payload.messages,
+      temperature: typeof payload.temperature === 'number' ? payload.temperature : 0.3,
+    })
+    return { ok: true, content }
+  } catch (e) {
+    return { ok: false, content: '', error: e instanceof Error ? e.message : String(e) }
+  }
+})
+
+ipcMain.handle('ai:ping', async (_event, payload: { baseURL: string; apiKey: string; model: string }) => {
+  return pingProvider({
+    baseURL: String(payload?.baseURL || ''),
+    apiKey: String(payload?.apiKey || ''),
+    model: String(payload?.model || ''),
+  })
+})
+
+ipcMain.handle('ai:listModels', async (_event, payload: { baseURL: string; apiKey: string }) => {
+  return listModels(String(payload?.baseURL || ''), String(payload?.apiKey || ''))
+})
+
+ipcMain.handle('fs:renameDir', async (_event, oldPath: string, newPath: string) => {
+  if (typeof oldPath !== 'string' || typeof newPath !== 'string' || !oldPath || !newPath) {
+    return { ok: false, error: '参数错误' }
+  }
+  return renameDir(oldPath, newPath)
+})
+
+// ── 播放进度与书签（ASMR 长音频续播）────────────────────────────
+ipcMain.handle('progress:getAll', async () => {
+  try { return getAllProgress(getLibraryDbPath()) } catch { return [] }
+})
+
+ipcMain.handle('progress:set', async (_event, trackId: string, positionMs: number, completed: boolean | null, lastSpeed: number | null) => {
+  try {
+    if (typeof trackId !== 'string' || !trackId) return false
+    if (typeof positionMs !== 'number' || !Number.isFinite(positionMs)) return false
+    setProgress(getLibraryDbPath(), trackId, positionMs, completed === undefined ? null : completed,
+      typeof lastSpeed === 'number' && Number.isFinite(lastSpeed) ? lastSpeed : null)
+    return true
+  } catch { return false }
+})
+
+ipcMain.handle('progress:markCompleted', async (_event, trackId: string, completed: boolean) => {
+  try {
+    if (typeof trackId !== 'string' || !trackId) return false
+    markCompleted(getLibraryDbPath(), trackId, !!completed)
+    return true
+  } catch { return false }
+})
+
+ipcMain.handle('progress:clear', async (_event, trackId: string) => {
+  try {
+    if (typeof trackId !== 'string' || !trackId) return false
+    clearProgress(getLibraryDbPath(), trackId)
+    return true
+  } catch { return false }
+})
+
+ipcMain.handle('bookmarks:list', async (_event, trackId: string) => {
+  try {
+    if (typeof trackId !== 'string' || !trackId) return []
+    return listBookmarks(getLibraryDbPath(), trackId)
+  } catch { return [] }
+})
+
+ipcMain.handle('bookmarks:add', async (_event, trackId: string, atMs: number, label: string) => {
+  try {
+    if (typeof trackId !== 'string' || !trackId) return null
+    if (typeof atMs !== 'number' || !Number.isFinite(atMs)) return null
+    return addBookmark(getLibraryDbPath(), trackId, atMs, typeof label === 'string' ? label : '')
+  } catch { return null }
+})
+
+ipcMain.handle('bookmarks:rename', async (_event, id: string, label: string) => {
+  try {
+    if (typeof id !== 'string' || !id) return false
+    renameBookmark(getLibraryDbPath(), id, typeof label === 'string' ? label : '')
+    return true
+  } catch { return false }
+})
+
+ipcMain.handle('bookmarks:remove', async (_event, id: string) => {
+  try {
+    if (typeof id !== 'string' || !id) return false
+    removeBookmark(getLibraryDbPath(), id)
+    return true
+  } catch { return false }
 })
 
 // Load cover data for specific tracks from filesystem. Returns path-based
@@ -396,6 +521,7 @@ ipcMain.handle('library:scanIncremental', async (event, folderPaths: string[]) =
         fileCount: result.fileCount,
         scannedAt: Date.now(),
       })
+      try { pruneProgressAndBookmarks(getLibraryDbPath()) } catch { /* ignore */ }
     } catch { /* ignore */ }
     console.timeEnd('[scan-incr] saveLibrary')
 
@@ -408,10 +534,10 @@ ipcMain.handle('library:scanIncremental', async (event, folderPaths: string[]) =
       console.error('[scan-incr] saveCovers failed:', e)
     }
     stripCoverPayloadForRenderer(result)
-    return result
+    return { ...result, folderPaths }
   } catch (err: any) {
     console.error('[scan-incr] Fatal error:', err?.message || err)
-    return { artists: [], folderTree: [], allTracks: [], fileCount: 0 }
+    return { artists: [], folderTree: [], allTracks: [], fileCount: 0, folderPaths }
   } finally {
     fullMeta?.clear()
   }
@@ -531,6 +657,7 @@ ipcMain.handle('library:removeFolder', async (_event, folderPath: string, remain
       fileCount: keptTracks.length,
       scannedAt: Date.now(),
     })
+    try { pruneProgressAndBookmarks(dbPath) } catch { /* ignore */ }
 
     // Clean up cover files for removed tracks
     try {
@@ -874,12 +1001,13 @@ ipcMain.handle('settings:save', async (_event, settings: unknown) => {
 ipcMain.on('settings:syncSave', (_event, settings: unknown) => {
   try {
     const settingsPath = getSettingsPath()
+    console.log('[settings] syncSave ->', settingsPath)
     const dir = path.dirname(settingsPath)
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true })
     }
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf-8')
-  } catch { /* ignore */ }
+  } catch (e) { console.error('[settings] syncSave failed:', e) }
 })
 
 
@@ -1089,6 +1217,7 @@ ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
 
 app.on('before-quit', async () => {
   terminateWorkerPool()
+  closeProgressDb()
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {
       mainWindow.webContents.send('window:beforeClose')

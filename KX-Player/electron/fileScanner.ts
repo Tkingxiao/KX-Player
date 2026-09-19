@@ -623,8 +623,10 @@ async function groupTracksByFolder(
     let artistName = path.basename(matchedRoot)
     let albumName: string
 
+    // 专辑 = 音轨的直接父目录名；经典两层布局（根/作品/音轨）与旧版一致，
+    // 更深嵌套（根/a/作品/音轨）取倒数第二级，保证封面查找落在作品目录。
     if (parts.length >= 2) {
-      albumName = parts[0]
+      albumName = parts[parts.length - 2]
     } else {
       albumName = artistName
     }
@@ -639,8 +641,8 @@ async function groupTracksByFolder(
 
     const artist = artistMap.get(artistName)!
     if (!artist.albums.has(albumName)) {
-      const albumDirPath = parts.length >= 1
-        ? path.join(matchedRoot, parts[0])
+      const albumDirPath = parts.length >= 2
+        ? path.join(matchedRoot, ...parts.slice(0, -1))
         : matchedRoot
       artist.albums.set(albumName, {
         name: albumName,
@@ -659,7 +661,7 @@ async function groupTracksByFolder(
       name: (meta.title && meta.title.trim()) ? meta.title.trim() : normalizeName(fp),
       path: nfp,
       duration: meta.duration,
-      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '浣氬悕',
+      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '佚名',
       album: albumName,
       format: trackExt.replace('.', ''),
       isVideo: VIDEO_EXTS.has(trackExt),
@@ -736,7 +738,6 @@ async function buildFolderTree(
 
     const dir = path.dirname(fp).replace(/\\/g, '/')
     const dirName = path.basename(dir)
-    const parentDir = path.dirname(dir).replace(/\\/g, '/')
 
     const node = getOrCreateNode(dir, dirName)
     const trackExt = path.extname(fp).toLowerCase()
@@ -746,7 +747,7 @@ async function buildFolderTree(
       name: (meta.title && meta.title.trim()) ? meta.title.trim() : normalizeName(fp),
       path: nfp,
       duration: meta.duration,
-      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '浣氬悕',
+      artist: meta.artist && meta.artist.trim() ? meta.artist.trim() : '佚名',
       album: dirName,
       format: trackExt.replace('.', ''),
       isVideo: VIDEO_EXTS.has(trackExt),
@@ -762,22 +763,21 @@ async function buildFolderTree(
       sampleRate: meta.sampleRate || null,
     })
 
-    let isRoot = true
-    for (let ri = 0; ri < cleanRoots.length; ri++) {
-      if (parentDir === cleanRoots[ri] || parentDir.startsWith(cleanRoots[ri] + '/')) {
-        isRoot = false
-        const pName = path.basename(parentDir)
-        const parentNode = getOrCreateNode(parentDir, pName)
-        if (!parentNode.children.some(c => c.path === dir)) {
-          parentNode.children.push(node)
-        }
-        break
+    // Link the full ancestor chain from the file's directory up to the matched
+    // root, so intermediate folders (root/a/b/tracks) stay connected. The old
+    // logic only linked the immediate directory, orphaning deeper levels.
+    let cur = dir
+    for (;;) {
+      const parent = path.dirname(cur).replace(/\\/g, '/')
+      if (parent === cur) break
+      const parentIsRoot = cleanRoots.includes(parent)
+      const curNode = getOrCreateNode(cur, path.basename(cur))
+      const parentNode = getOrCreateNode(parent, path.basename(parent))
+      if (!parentNode.children.some(c => c.path === cur)) {
+        parentNode.children.push(curNode)
       }
-    }
-    if (isRoot) {
-      if (!roots.some(r => r.path === dir)) {
-        roots.push(node)
-      }
+      if (parentIsRoot) break // parentNode is the root node; roots assembly handles it
+      cur = parent
     }
   }
 
@@ -904,17 +904,27 @@ async function fillAlbumCovers(
       if (foundCached) continue
 
       // --- Tier 2: External cover files (fast 鈥?reads small image) ---
+      // 专辑目录（音轨所在叶子目录）优先；找不到时向上层目录回溯最多 3 级，
+      // 兼容「作品/子目录/音轨」等封面放在作品根目录的布局。
       if (album.dirPath) {
-        const externalCover = findExternalCover(album.dirPath, 1)
-        if (externalCover) {
-          album.coverData = externalCover
-          continue
+        let dir: string | null = album.dirPath
+        for (let hop = 0; hop < 3 && dir; hop++) {
+          const externalCover = findExternalCover(dir, 0)
+          if (externalCover) {
+            album.coverData = externalCover
+            break
+          }
+          if (hop === 0) {
+            const anyImage = findAnyImage(dir)
+            if (anyImage) {
+              album.coverData = anyImage
+              break
+            }
+          }
+          const parent = path.dirname(dir)
+          dir = parent === dir ? null : parent
         }
-        const anyImage = findAnyImage(album.dirPath)
-        if (anyImage) {
-          album.coverData = anyImage
-          continue
-        }
+        if (album.coverData) continue
       }
 
       // --- Tier 3: Embedded cover extraction (slowest 鈥?parses audio file) ---
@@ -952,19 +962,19 @@ export async function scanFoldersWithProgress(
   onStage?: (stage: string) => void
 ): Promise<{ artists: ScannedArtist[]; folderTree: FolderNode[]; allTracks: ScannedTrack[]; fileCount: number }> {
   console.time('[scan] total')
-  onStage?.('鍙戠幇鏂囦欢...')
+  onStage?.('发现文件...')
   console.time('[scan] discoverFiles')
   const files = await discoverFiles(folderPaths)
   console.timeEnd('[scan] discoverFiles')
   const totalFiles = files.length
   onProgress?.(0, totalFiles)
-  onStage?.(`瑙ｆ瀽鍏冩暟鎹?.. (${totalFiles} 涓枃浠?`)
+  onStage?.(`解析元数据... (${totalFiles} 个文件)`)
 
   console.time('[scan] enrichWithWorkers')
   const metaResults = await enrichWithWorkers(files, existingMeta, onProgress)
   console.timeEnd('[scan] enrichWithWorkers')
 
-  onStage?.('鏁寸悊缁撴瀯...')
+  onStage?.('整理结构...')
   console.time('[scan] groupTracksByFolder')
   const artists = await groupTracksByFolder(files, metaResults, folderPaths)
   console.timeEnd('[scan] groupTracksByFolder')
@@ -1097,7 +1107,7 @@ export async function scanFoldersIncremental(
 
   // Process only new/changed files via workers
   if (changedFiles.length > 0) {
-    onStage?.('瑙ｆ瀽鏂版枃浠跺厓鏁版嵁...')
+    onStage?.('解析新文件元数据...')
     const workerResults = await enrichWithWorkers(changedFiles, existingMeta, (completed, total) => {
       onProgress?.(completed, total)
     })
@@ -1109,7 +1119,7 @@ export async function scanFoldersIncremental(
   }
 
   // Build structures (same as full scan)
-  onStage?.('鏋勫缓闊充箰搴?..')
+  onStage?.('构建音乐库...')
 
   console.time('[scan-incr] groupTracksByFolder')
   const artists = await groupTracksByFolder(files, metaResults, allFolderPaths)

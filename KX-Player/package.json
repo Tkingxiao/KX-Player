@@ -1,76 +1,35 @@
 {
   "name": "kx-music-player",
-  "version": "1.0.6",
+  "version": "2.0.0",
   "author": "Kingxiao",
-  "description": "KX音乐播放器 - 本地桌面音乐播放器",
-  "main": "dist-electron/main.js",
+  "description": "KX音乐播放器 - 本地 ASMR 音视频播放器（Tauri 2 + Rust 内核）",
+  "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "tauri dev",
+    "dev:vite": "vite",
     "build": "vite build",
-    "electron:build": "set \"ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/\" && set \"ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/\" && npm run build && electron-builder",
-    "postinstall": "electron-builder install-app-deps"
+    "build:fe": "vite build",
+    "tauri": "tauri",
+    "check": "vue-tsc --noEmit && vitest run",
+    "check:types": "vue-tsc --noEmit"
   },
   "dependencies": {
     "@fontsource/inter": "^5.2.8",
     "@fontsource/noto-sans-sc": "^5.2.9",
-    "better-sqlite3": "^12.11.1",
+    "@tauri-apps/api": "^2.11.1",
     "chinese-conv": "^4.0.0",
-    "chokidar": "^5.0.0",
-    "fast-glob": "^3.3.3",
-    "iconv-lite": "^0.7.2",
-    "music-metadata": "^11.0.2",
+    "pinia": "^4.0.3",
     "pinyin-pro": "^3.28.1",
-    "sharp": "^0.35.2"
+    "vue": "^3.5.43"
   },
   "devDependencies": {
-    "electron": "^42.5.1",
-    "electron-builder": "^26.15.3",
-    "esbuild": "^0.28.1",
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/node": "^26.6.1",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "typescript": "^5.9.3",
     "vite": "^8.1.0",
-    "vite-plugin-electron": "^0.29.0"
-  },
-  "build": {
-    "appId": "com.kxplayer.music",
-    "productName": "KX音乐播放器",
-    "asarUnpack": [
-      "@img/**",
-      "sharp/**",
-      "node_modules/better-sqlite3/**"
-    ],
-    "directories": {
-      "output": "dist_electron"
-    },
-    "files": [
-      "dist/**/*",
-      "dist-electron/**/*",
-      "public/icon-256.png",
-      "public/icon-128.png",
-      "public/favicon.ico"
-    ],
-    "extraResources": [
-      {
-        "from": "ffmpeg.exe",
-        "to": "ffmpeg/ffmpeg.exe",
-        "filter": [
-          "**/*"
-        ]
-      }
-    ],
-    "win": {
-      "target": [
-        "nsis"
-      ],
-      "icon": "public/favicon.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "KX音乐播放器",
-      "uninstallDisplayName": "KX音乐播放器",
-      "include": "build/uninstall.nsh"
-    },
-    "npmRebuild": true
+    "vitest": "^5.0.1",
+    "vue-tsc": "^3.3.11"
   }
 }

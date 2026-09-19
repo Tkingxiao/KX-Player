@@ -1,52 +1,27 @@
 import { defineConfig } from 'vite'
-import electron from 'vite-plugin-electron'
+import vue from '@vitejs/plugin-vue'
+import { resolve } from 'node:path'
 
+// Tauri 前端构建配置（后端在 src-tauri/，由 tauri-cli 编排）
 export default defineConfig({
-  plugins: [
-    electron([
-      {
-        entry: 'electron/main.ts',
-        vite: {
-          build: {
-            outDir: 'dist-electron',
-            rollupOptions: {
-              external: ['electron', 'better-sqlite3', 'sharp', 'music-metadata'],
-            },
-          },
-        },
-      },
-      {
-        entry: 'electron/preload.ts',
-        onstart(args) {
-          args.reload()
-        },
-        vite: {
-          build: {
-            outDir: 'dist-electron',
-            rollupOptions: {
-              external: ['electron'],
-            },
-          },
-        },
-      },
-      {
-        entry: 'electron/workers/metadata-worker.ts',
-        vite: {
-          build: {
-            outDir: 'dist-electron/workers',
-            rollupOptions: {
-              external: ['electron'],
-              output: {
-                format: 'cjs',
-                entryFileNames: 'metadata-worker.js',
-              },
-            },
-          },
-        },
-      },
-    ]),
-  ],
+  plugins: [vue()],
+  resolve: {
+    alias: {
+      '@': resolve(__dirname, 'src'),
+    },
+  },
+  // Vite 开发服务器选项（tauri dev 调用 dev:vite）
+  clearScreen: false,
+  server: {
+    port: 5173,
+    strictPort: true,
+  },
+  envPrefix: ['VITE_', 'TAURI_'],
   build: {
     outDir: 'dist',
+    // WebView2 目标支持较新语法，minify 保持 esbuild 默认
+    target: 'chrome120',
+    minify: 'esbuild',
+    sourcemap: false,
   },
 })
