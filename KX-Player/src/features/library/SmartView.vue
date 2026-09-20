@@ -11,8 +11,9 @@ import { usePlayerStore } from '@/stores/player'
 import VirtualGrid from '@/components/VirtualGrid.vue'
 import VirtualList from '@/components/VirtualList.vue'
 import MediaCover from '@/components/MediaCover.vue'
+import SelectMenu from '@/components/SelectMenu.vue'
 import TrackTable from '@/features/library/TrackTable.vue'
-import { SMART_LABELS, DURATION_BUCKETS, matchSmart, type DurationBucket } from '@/utils/collections'
+import { SMART_LABELS, DURATION_BUCKETS, matchSmart, cmpBy } from '@/utils/collections'
 import { trackName, trackArtist, fmtTime } from '@/utils/format'
 import type { Track } from '@/contracts/api'
 
@@ -66,8 +67,35 @@ const filteredTracks = computed<Track[]>(() => {
   if (ui.categoryId !== null || ui.tagIds.size) {
     list = list.filter(matchTaxonomy)
   }
-  return list
+  return applySort(list)
 })
+
+// ── 排序（默认名称 A-Z；「最近播放」类集合保留其语义排序作为默认）──
+const SORT_OPTIONS = [
+  { value: 'name', label: '名称' },
+  { value: 'artist', label: '作者' },
+  { value: 'duration', label: '时长' },
+  { value: 'mtime', label: '文件修改时间' },
+  { value: 'playedAt', label: '最近播放' },
+]
+
+const sortValue = computed({
+  get: () => settings.trackSort,
+  set: (v) => { settings.trackSort = v as typeof settings.trackSort; settings.scheduleSave() },
+})
+const sortDirValue = computed({
+  get: () => settings.trackSortDir,
+  set: (v) => { settings.trackSortDir = v as typeof settings.trackSortDir; settings.scheduleSave() },
+})
+
+function applySort(list: Track[]): Track[] {
+  const field = settings.trackSort
+  const sign = settings.trackSortDir === 'asc' ? 1 : -1
+  if (field === 'playedAt') {
+    return [...list].sort((a, b) => sign * ((library.progress.get(a.id)?.playedAt ?? 0) - (library.progress.get(b.id)?.playedAt ?? 0)))
+  }
+  return [...list].sort(cmpBy(field as never, settings.trackSortDir))
+}
 
 const viewMode = computed(() => (key: string) => (key === 'recent' ? 'list' : settings.folderView))
 
@@ -96,14 +124,38 @@ function rowKey(i: number): string {
       <h1 class="sv-title">{{ title }}</h1>
       <span class="sv-count tnum">{{ filteredTracks.length }} 首</span>
       <div class="sv-head-actions">
-        <button
-          class="icon-btn"
-          :title="settings.folderView === 'grid' ? '切换为列表' : '切换为网格'"
-          @click="settings.folderView = settings.folderView === 'grid' ? 'list' : 'grid'; settings.scheduleSave()"
+        <!-- 排序：选择栏形式（默认名称 A-Z） -->
+        <SelectMenu
+          v-model="sortValue"
+          variant="text"
+          :options="SORT_OPTIONS"
+          title="排序字段"
+        />
+        <SelectMenu
+          v-model="sortDirValue"
+          variant="icon"
+          title="排序方向"
+          :options="[{ value: 'asc', label: '升序（A→Z）' }, { value: 'desc', label: '降序（Z→A）' }]"
         >
-          <svg v-if="settings.folderView === 'grid'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" /><line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" /></svg>
-          <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /></svg>
-        </button>
+          <template #icon>
+            <svg v-if="settings.trackSortDir === 'asc'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="20" y2="5" /><line x1="12" y1="10" x2="17" y2="10" /><line x1="12" y1="15" x2="14" y2="15" /><path d="M7 4v14M7 18l-3-3M7 18l3-3" /></svg>
+            <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="14" y2="5" /><line x1="12" y1="10" x2="17" y2="10" /><line x1="12" y1="15" x2="20" y2="15" /><path d="M7 20V6M7 6l-3 3M7 6l3 3" /></svg>
+          </template>
+        </SelectMenu>
+
+        <!-- 视图形态：选择栏形式（网格 / 列表） -->
+        <SelectMenu
+          :model-value="settings.folderView"
+          variant="icon"
+          title="视图形态"
+          :options="[{ value: 'grid', label: '卡片网格' }, { value: 'list', label: '紧凑列表' }]"
+          @update:model-value="settings.folderView = $event as 'grid' | 'list'; settings.scheduleSave()"
+        >
+          <template #icon>
+            <svg v-if="settings.folderView === 'grid'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /></svg>
+            <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" /><line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" /></svg>
+          </template>
+        </SelectMenu>
       </div>
     </div>
 

@@ -6,9 +6,58 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https://asset.localhost data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost" />
   <title>KX Player</title>
+  <!--
+    内联关键样式：WebView 在 CSS/JS 到达前会先绘制一帧。
+    这里把窗口底色与占位骨架直接内联，启动瞬间即为深色主题 + 加载指示，
+    不再出现纯白闪烁（外部样式表加载完成后会被正常样式覆盖）。
+  -->
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #0d0d12;
+      color: #b8b8c2;
+      font-family: 'Inter', 'Noto Sans SC', 'Yu Gothic UI', 'Meiryo', sans-serif;
+      overflow: hidden;
+    }
+    #boot {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 18px;
+      background: #0d0d12;
+    }
+    #boot .boot-logo {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      color: #f0f0f5;
+      opacity: 0.9;
+    }
+    #boot .boot-spinner {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      border: 2px solid rgba(230, 58, 46, 0.9);
+      border-top-color: transparent;
+      animation: boot-spin 0.8s linear infinite;
+    }
+    @keyframes boot-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      #boot .boot-spinner { animation: none; }
+    }
+  </style>
 </head>
 <body>
   <div id="app"></div>
+  <!-- 启动占位：Vue 挂载后由 main.ts 移除 -->
+  <div id="boot">
+    <span class="boot-logo">KX Player</span>
+    <span class="boot-spinner" role="status" aria-label="正在启动"></span>
+  </div>
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

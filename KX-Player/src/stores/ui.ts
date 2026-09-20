@@ -1,6 +1,7 @@
 /** UI store：视图导航 / 搜索 / 面板 / 多选 / 右键菜单。 */
 import { defineStore } from 'pinia'
-import { ref, shallowRef } from 'vue'
+import { ref, shallowRef, computed, watch } from 'vue'
+import { api } from '@/bridge/ipc'
 
 export type ViewKind =
   | 'folder' | 'smart' | 'recent' | 'fav' | 'playlist' | 'search' | 'tools' | 'lyrics' | 'stage' | 'ai'
@@ -49,9 +50,108 @@ export const useUiStore = defineStore('ui', () => {
 
   const settingsOpen = ref(false)
   const inspectorOpen = ref(false)
-  const inspectorTab = ref<'queue' | 'info' | 'bookmark'>('queue')
+  const inspectorTab = ref<'queue' | 'subtitle' | 'info' | 'bookmark'>('queue')
   const queueOpen = ref(false)
   const bgEditorOpen = ref(false)
+
+  // 视图返回上一页
+  const previousView = ref<ViewKind>('smart')
+  const previousFolderPath = ref('')
+
+  // 画中画状态：悬浮窗是独立系统窗口（pip），主窗口只镜像开关状态
+  const pipEnabled = ref(false)
+  /** 钉住：切视图不自动关闭悬浮窗 */
+  const pipPinned = ref(false)
+
+  // ── 视频遮挡压制 ────────────────────────────────────────────
+  // mpv 覆盖窗口是原生顶层窗口，恒在 WebView 之上；任何需要显示在视频
+  // 区域上方的浮层（播放栏弹窗/设置模态/右键菜单/确认框）打开时都必须
+  // 先把覆盖窗口藏起来，否则会被视频盖住。
+  const pbBlockCount = ref(0)
+  const confirmOpen = ref(false)
+  const videoBlocked = computed(
+    () =>
+      pbBlockCount.value > 0 ||
+      confirmOpen.value ||
+      settingsOpen.value ||
+      bgEditorOpen.value ||
+      !!autoTagReview.value ||
+      !!ctxMenu.value,
+  )
+  function pushVideoBlock(): void {
+    pbBlockCount.value++
+  }
+  function popVideoBlock(): void {
+    if (pbBlockCount.value > 0) pbBlockCount.value--
+  }
+
+  // 视图切换时记录上一页（用于返回；stage 是覆盖层，不记录为返回目标）
+  watch(view, (newV, oldV) => {
+    if (oldV && oldV !== 'stage') {
+      previousView.value = oldV
+      previousFolderPath.value = folderPath.value
+    }
+  })
+
+  function goBack(): void {
+    view.value = previousView.value
+    if (previousFolderPath.value) folderPath.value = previousFolderPath.value
+  }
+
+  /** 悬浮窗几何（物理像素，本地持久化于 pip 窗口自身） */
+  interface PipRect { x: number; y: number; w: number; h: number }
+  function defaultPipRect(): PipRect {
+    const dpr = window.devicePixelRatio || 1
+    const w = Math.round(320 * dpr)
+    const h = Math.round(180 * dpr)
+    return {
+      x: Math.max(0, Math.round((screen.availWidth - w) / 2)),
+      y: Math.max(0, Math.round((screen.availHeight - h) / 2) - Math.round(24 * dpr)),
+      w,
+      h,
+    }
+  }
+  function loadPipRect(): PipRect | null {
+    try {
+      const raw = localStorage.getItem('kx.pipRect')
+      if (!raw) return null
+      const r = JSON.parse(raw) as PipRect
+      if (typeof r.x !== 'number' || typeof r.y !== 'number' || typeof r.w !== 'number' || typeof r.h !== 'number') return null
+      return r
+    } catch {
+      return null
+    }
+  }
+
+  async function togglePip(): Promise<void> {
+    if (pipEnabled.value) await closePip()
+    else await openPip()
+  }
+
+  async function openPip(): Promise<void> {
+    const rect = loadPipRect() ?? defaultPipRect()
+    const ok = await api.pipOpen(rect.x, rect.y, rect.w, rect.h)
+    if (ok) pipEnabled.value = true
+  }
+
+  /** 关闭悬浮窗并复位钉住状态。先等 Rust 把 mpv 覆盖窗口挂回主窗口
+   *  再翻转状态，避免 stage 在挂靠切换完成前抢发旧坐标系下的矩形。 */
+  async function closePip(): Promise<void> {
+    await api.pipClose()
+    pipEnabled.value = false
+    pipPinned.value = false
+  }
+
+  // ── 独立悬浮窗事件同步 ──────────────────────────────────────
+  // pip 窗口是独立系统窗口，其打开/关闭/钉住状态以 Rust 广播为准，
+  // 主窗口这里只镜像（PipRoot 在 pip 窗口内管理自身的交互状态）。
+  api.onPipClosed(() => {
+    pipEnabled.value = false
+    pipPinned.value = false
+  })
+  api.onPipPinned((pinned) => {
+    pipPinned.value = pinned
+  })
 
   // 多选（批量操作）
   const selectionMode = ref(false)
@@ -138,8 +238,11 @@ export const useUiStore = defineStore('ui', () => {
     view, smartKey, durationKey, categoryId, tagIds, tagMode, taxonomyExpanded, autoTagReview,
     folderPath, listPath, aiFolder, searchQuery, searchActive,
     settingsOpen, inspectorOpen, inspectorTab, queueOpen, bgEditorOpen,
+    previousView, previousFolderPath, pipEnabled, pipPinned,
+    videoBlocked, pushVideoBlock, popVideoBlock, confirmOpen,
     selectionMode, selection, ctxMenu, toasts,
     openFolder, savedScroll, recordScroll, toast, updateToast, removeToast,
     toggleSelect, clearSelection, toggleTag, toggleExpanded, clearTaxonomy, closeAllPanels,
+    goBack, togglePip, closePip,
   }
 })

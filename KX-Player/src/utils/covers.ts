@@ -111,15 +111,22 @@ export function cachedTrackCover(ids: (string | undefined | null)[]): string | n
 }
 
 // ── 文件夹封面 ──────────────────────────────────────────────────
+/** 无封面的目录记入负缓存，避免每次渲染都重新请求（否则整屏卡片持续发 IPC）。 */
+const folderMiss = new Set<string>()
+
 function queueFolderCovers(paths: string[], cb: (url: string | null) => void): void {
+  const toRequest: string[] = []
   for (const p of paths) {
     if (!p) continue
-    if (folderCache.has(p)) { cb(folderCache.get(p)!); continue }
+    const hit = folderCache.get(p)
+    if (hit) { cb(hit); continue }
+    if (folderMiss.has(p)) { cb(null); continue }
     let set = folderPending.get(p)
     if (!set) { set = new Set(); folderPending.set(p, set) }
     set.add(cb)
+    toRequest.push(p)
   }
-  if (folderPending.size && !folderTimer) {
+  if (toRequest.length && !folderTimer) {
     folderTimer = setTimeout(flushFolderCovers, FOLDER_FLUSH_MS)
   }
 }
@@ -138,15 +145,25 @@ async function flushFolderCovers(): Promise<void> {
     for (const p of batch) {
       const url = result[p] || null
       if (url) folderCache.set(p, url)
+      else folderMiss.add(p)
       const cbs = batchCbs.get(p)
       if (cbs) for (const cb of cbs) cb(url)
     }
   } catch {
+    // 网络/后端异常不算「无封面」：不入负缓存，稍后可重试
     for (const p of batch) {
       const cbs = batchCbs.get(p)
       if (cbs) for (const cb of cbs) cb(null)
     }
   }
+  if (folderPending.size && !folderTimer) {
+    folderTimer = setTimeout(flushFolderCovers, FOLDER_FLUSH_MS)
+  }
+}
+
+/** 曲库变更/重新扫描后清空负缓存，让新增封面能被重新发现 */
+export function invalidateFolderCoverMisses(): void {
+  folderMiss.clear()
 }
 
 export function cachedFolderCover(path: string | null | undefined): string | null {

@@ -29,9 +29,10 @@ use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, GetStockObject, BLACK_BR
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage, HTTRANSPARENT,
-    MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, WM_DESTROY, WM_ERASEBKGND,
-    WM_MOUSEACTIVATE, WM_NCHITTEST, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    GWLP_HWNDPARENT, HTTRANSPARENT, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
+    WM_DESTROY, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const HOST_CLASS: &str = "kx_mpv_host";
@@ -51,12 +52,17 @@ pub struct StageRect {
 enum StageCmd {
     Rect(StageRect),
     Visible(bool),
+    /// 切换覆盖窗口的挂靠目标：Some(hwnd)=独立悬浮窗（pip），None=主窗口。
+    /// 同时把覆盖窗口的 owner 切到目标窗口，保证 z 序在目标之上、且随目标最小化而隐藏。
+    Attach(Option<isize>),
     Destroy,
 }
 
 static CMDS: Mutex<VecDeque<StageCmd>> = Mutex::new(VecDeque::new());
 static HOST: OnceCell<isize> = OnceCell::new();
 static MAIN_HWND: OnceCell<isize> = OnceCell::new();
+/// 当前挂靠目标窗口（None=主窗口）。坐标换算（ClientToScreen）以目标窗口的客户区为基准。
+static TARGET: Mutex<Option<isize>> = Mutex::new(None);
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -175,6 +181,7 @@ fn drain_and_apply() {
         match cmd {
             Some(StageCmd::Rect(r)) => apply_rect(main, host, &r),
             Some(StageCmd::Visible(v)) => set_os_visible(host, v),
+            Some(StageCmd::Attach(target)) => apply_attach(host, target),
             Some(StageCmd::Destroy) => {
                 unsafe { DestroyWindow(host as HWND) };
                 return;
@@ -202,8 +209,13 @@ fn enqueue(cmd: StageCmd) {
 fn apply_rect(main_hwnd: isize, host: isize, rect: &StageRect) {
     unsafe {
         if rect.visible && rect.w > 0 && rect.h > 0 {
+            // 坐标相对「当前挂靠目标窗口」的客户区换算成屏幕坐标
+            let base = match TARGET.lock() {
+                Ok(t) => t.unwrap_or(main_hwnd),
+                Err(_) => main_hwnd,
+            };
             let mut pt = POINT { x: rect.x, y: rect.y };
-            ClientToScreen(main_hwnd as HWND, &mut pt);
+            ClientToScreen(base as HWND, &mut pt);
             SetWindowPos(
                 host as HWND,
                 std::ptr::null_mut(),
@@ -220,6 +232,32 @@ fn apply_rect(main_hwnd: isize, host: isize, rect: &StageRect) {
     }
 }
 
+/// 切换挂靠目标（在舞台线程执行）：
+/// - 目标 = pip 悬浮窗：覆盖窗口成为其 owned 窗口（z 序在 pip 之上、随 pip 隐藏/最小化）。
+/// - 目标 = None：挂回主窗口（随主窗口最小化/关闭，与原先行为一致）。
+/// 修改 owner 后必须 SetWindowPos 刷新，否则窗口层级/可见性可能不生效。
+fn apply_attach(host: isize, target: Option<isize>) {
+    unsafe {
+        let base = match target {
+            Some(h) => h,
+            None => MAIN_HWND.get().copied().unwrap_or(0),
+        };
+        let _ = TARGET.lock().map(|mut t| *t = target);
+        if base != 0 {
+            SetWindowLongPtrW(host as HWND, GWLP_HWNDPARENT, base);
+        }
+        SetWindowPos(
+            host as HWND,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOZORDER | 0x0001 /* SWP_NOSIZE */ | 0x0002 /* SWP_NOMOVE */,
+        );
+    }
+}
+
 /// 设置舞台矩形（客户区物理像素 → 屏幕坐标）。异步：仅入队，由舞台线程执行。
 pub fn set_stage_rect(rect: StageRect) {
     enqueue(StageCmd::Rect(rect));
@@ -228,6 +266,11 @@ pub fn set_stage_rect(rect: StageRect) {
 /// 只切换可见性（主窗口失焦/聚焦时用）
 pub fn set_os_visible_cmd(visible: bool) {
     enqueue(StageCmd::Visible(visible));
+}
+
+/// 切换覆盖窗口挂靠目标（None=主窗口）。异步：仅入队，由舞台线程执行。
+pub fn attach(target: Option<isize>) {
+    enqueue(StageCmd::Attach(target));
 }
 
 fn set_os_visible(host: isize, visible: bool) {

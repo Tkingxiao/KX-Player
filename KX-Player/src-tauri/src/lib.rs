@@ -52,45 +52,78 @@ pub fn run() {
             build_tray(app)?;
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            WindowEvent::CloseRequested { api, .. } => {
-                let state: tauri::State<AppWindowsState> = window.app_handle().state();
-                let player: tauri::State<PlayerCore> = window.app_handle().state();
-                if state.force_close.load(std::sync::atomic::Ordering::SeqCst) {
+        .on_window_event(|window, event| {
+            // 悬浮窗（pip）事件与主窗口互不干扰，单独分流
+            if window.label() == "pip" {
+                let app = window.app_handle();
+                match event {
+                    // 用户 Alt+F4 / 系统菜单关闭：隐藏并挂回主窗口，不真正销毁
+                    // （窗口实例保留，再次打开时复用，避免重复创建 WebView 的开销）
+                    WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let player: tauri::State<PlayerCore> = app.state();
+                        player.attach_overlay(None);
+                        let _ = window.hide();
+                        let _ = app.emit("pip:closed", ());
+                    }
+                    WindowEvent::Destroyed => {
+                        let player: tauri::State<PlayerCore> = app.state();
+                        player.attach_overlay(None);
+                        let _ = app.emit("pip:closed", ());
+                    }
+                    // 悬浮窗移动/缩放：覆盖窗口跟随（矩形相对 pip 客户区，重放即换算到新屏幕位置）
+                    WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                        let player: tauri::State<PlayerCore> = app.state();
+                        player.reposition();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    let state: tauri::State<AppWindowsState> = window.app_handle().state();
+                    let player: tauri::State<PlayerCore> = window.app_handle().state();
+                    if state.force_close.load(std::sync::atomic::Ordering::SeqCst) {
+                        player.destroy_host();
+                    } else {
+                        api.prevent_close();
+                        // 关闭=隐藏到托盘：一并隐藏视频覆盖窗口（悬浮窗挂靠期间不受影响）
+                        player.set_stage_visible(false);
+                        let _ = window.hide();
+                    }
+                }
+                WindowEvent::Resized { .. } => {
+                    let state: tauri::State<AppWindowsState> = window.app_handle().state();
+                    let maximized = window.is_maximized().unwrap_or(false);
+                    let last = state.last_maximized.load(std::sync::atomic::Ordering::SeqCst);
+                    if maximized != last {
+                        state.last_maximized.store(maximized, std::sync::atomic::Ordering::SeqCst);
+                        let _ = window.app_handle().emit("window:maximizeChange", maximized);
+                    }
+                    // 缩放/最大化：视频覆盖窗口跟随（客户区矩形不变，但屏幕位置可能已变）
+                    let player: tauri::State<PlayerCore> = window.app_handle().state();
+                    player.reposition();
+                }
+                WindowEvent::Moved(_) => {
+                    let player: tauri::State<PlayerCore> = window.app_handle().state();
+                    player.reposition();
+                }
+                WindowEvent::Focused(focused) => {
+                    let player: tauri::State<PlayerCore> = window.app_handle().state();
+                    // 失焦隐藏视频覆盖层（避免浮在别的应用上），聚焦恢复
+                    player.focus_changed(*focused);
+                }
+                WindowEvent::Destroyed => {
+                    let player: tauri::State<PlayerCore> = window.app_handle().state();
                     player.destroy_host();
-                } else {
-                    api.prevent_close();
-                    // 关闭=隐藏到托盘：一并隐藏视频覆盖窗口
-                    player.set_stage_visible(false);
-                    let _ = window.hide();
+                    // 主窗口真正销毁时一并销毁悬浮窗（应用退出）
+                    if let Some(pip) = window.app_handle().get_webview_window("pip") {
+                        let _ = pip.destroy();
+                    }
                 }
+                _ => {}
             }
-            WindowEvent::Resized { .. } => {
-                let state: tauri::State<AppWindowsState> = window.app_handle().state();
-                let maximized = window.is_maximized().unwrap_or(false);
-                let last = state.last_maximized.load(std::sync::atomic::Ordering::SeqCst);
-                if maximized != last {
-                    state.last_maximized.store(maximized, std::sync::atomic::Ordering::SeqCst);
-                    let _ = window.app_handle().emit("window:maximizeChange", maximized);
-                }
-                // 缩放/最大化：视频覆盖窗口跟随（客户区矩形不变，但屏幕位置可能已变）
-                let player: tauri::State<PlayerCore> = window.app_handle().state();
-                player.reposition();
-            }
-            WindowEvent::Moved(_) => {
-                let player: tauri::State<PlayerCore> = window.app_handle().state();
-                player.reposition();
-            }
-            WindowEvent::Focused(focused) => {
-                let player: tauri::State<PlayerCore> = window.app_handle().state();
-                // 失焦隐藏视频覆盖层（避免浮在别的应用上），聚焦恢复
-                player.focus_changed(*focused);
-            }
-            WindowEvent::Destroyed => {
-                let player: tauri::State<PlayerCore> = window.app_handle().state();
-                player.destroy_host();
-            }
-            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             commands::dialog_fs::open_folder,
@@ -107,6 +140,7 @@ pub fn run() {
             commands::dialog_fs::show_item_in_folder,
             commands::library::scan_folders,
             commands::library::scan_folders_incremental,
+            commands::library::startup_sync,
             commands::library::remove_folder,
             commands::library::load_library,
             commands::library::load_library_fast,
@@ -115,6 +149,8 @@ pub fn run() {
             commands::library::load_folder_covers,
             commands::library::get_progress_all,
             commands::library::set_progress,
+            commands::library::analyze_loudness,
+            commands::library::cancel_loudness,
             commands::library::mark_track_completed,
             commands::library::clear_track_progress,
             commands::library::list_bookmarks,
@@ -135,6 +171,9 @@ pub fn run() {
             commands::system::force_close_window,
             commands::system::toggle_fullscreen,
             commands::system::ffmpeg_exec,
+            commands::system::ffmpeg_probe,
+            commands::system::convert_run,
+            commands::system::convert_cancel,
             commands::system::ai_chat,
             commands::system::ai_ping,
             commands::system::ai_list_models,
@@ -148,8 +187,17 @@ pub fn run() {
             commands::player::player_set_video_enabled,
             commands::player::player_set_stage_rect,
             commands::player::player_get_state,
+            commands::player::player_subtitle_tracks,
+            commands::player::player_set_subtitle_track,
+            commands::player::player_set_subtitle_visible,
+            commands::player::player_set_subtitle_delay,
+            commands::player::player_set_sub_style,
+            commands::player::player_apply_loudness_gain,
             commands::player::player_list_devices,
             commands::player::player_set_device,
+            commands::player::pip_open,
+            commands::player::pip_close,
+            commands::player::pip_set_pinned,
             commands::player::app_force_quit,
             commands::library::taxonomy_list_categories,
             commands::library::taxonomy_create_category,
@@ -160,6 +208,7 @@ pub fn run() {
             commands::library::taxonomy_unassign_category,
             commands::library::taxonomy_list_tags,
             commands::library::taxonomy_upsert_tag,
+            commands::library::taxonomy_rename_tag,
             commands::library::taxonomy_delete_tag,
             commands::library::taxonomy_tag_tracks,
             commands::library::taxonomy_untag_tracks,

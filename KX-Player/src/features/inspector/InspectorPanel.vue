@@ -1,12 +1,15 @@
 <script setup lang="ts">
-/** 检查器：队列（可跳转/移除）/ 信息 / 书签 三 Tab。宽度可拖拽（260–480，持久化）。 */
-import { ref, computed, watch, onBeforeUnmount } from 'vue'
+/**
+ * 检查器：队列 / 字幕 / 信息 / 书签 四 Tab。
+ * 新增字幕样式面板：映射 mpv sub-* 属性（P0-24/25）。
+ */
+import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useUiStore } from '@/stores/ui'
 import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useSettingsStore } from '@/stores/settings'
 import { fmtTime, trackName, trackArtist } from '@/utils/format'
-import type { Track } from '@/contracts/api'
+import type { Track, SubStyle } from '@/contracts/api'
 
 const ui = useUiStore()
 const player = usePlayerStore()
@@ -25,8 +28,8 @@ function startResize(e: MouseEvent): void {
     settings.inspectorWidth = Math.max(260, Math.min(480, startW - (ev.clientX - startX)))
   }
   resizeUp = () => {
-    window.removeEventListener('mousemove', resizeMove!)
-    window.removeEventListener('mouseup', resizeUp!)
+    if (resizeMove) window.removeEventListener('mousemove', resizeMove)
+    if (resizeUp) window.removeEventListener('mouseup', resizeUp)
     resizeMove = null
     resizeUp = null
     settings.scheduleSave()
@@ -65,23 +68,74 @@ async function addBookmark(): Promise<void> {
   await player.addBookmarkAt(bookmarkLabel.value.trim())
   bookmarkLabel.value = ''
 }
+
+// 字幕样式
+const SUB_POS_PRESETS = [
+  { label: '上', value: 20 },
+  { label: '中', value: 50 },
+  { label: '下', value: 95 },
+]
+
+const subStyle = ref<SubStyle>({
+  fontSize: 45,
+  color: '#ffffff',
+  borderColor: '#000000',
+  borderSize: 1.5,
+  shadowOffset: 1,
+  pos: 95,
+})
+
+let subDebounce: ReturnType<typeof setTimeout> | null = null
+function pushSubStyle(): void {
+  if (subDebounce) clearTimeout(subDebounce)
+  subDebounce = setTimeout(() => {
+    void player.setSubStyle?.(subStyle.value)
+  }, 100)
+}
+
+function setSubPos(v: number): void {
+  subStyle.value.pos = v
+  pushSubStyle()
+}
+
+function resetSubStyle(): void {
+  subStyle.value = {
+    fontSize: 45,
+    color: '#ffffff',
+    borderColor: '#000000',
+    borderSize: 1.5,
+    shadowOffset: 1,
+    pos: 95,
+  }
+  pushSubStyle()
+}
+
+onMounted(() => {
+  // 初始同步一次
+  pushSubStyle()
+})
 </script>
 
 <template>
   <aside id="inspector" :style="{ width: settings.inspectorWidth + 'px' }">
     <div class="insp-resizer" @mousedown="startResize" />
-    <div class="insp-tabs">
-      <button class="insp-tab" :class="{ active: ui.inspectorTab === 'queue' }" @click="ui.inspectorTab = 'queue'">队列</button>
-      <button class="insp-tab" :class="{ active: ui.inspectorTab === 'info' }" @click="ui.inspectorTab = 'info'">信息</button>
-      <button class="insp-tab" :class="{ active: ui.inspectorTab === 'bookmark' }" @click="ui.inspectorTab = 'bookmark'">书签</button>
-      <button class="icon-btn insp-close" title="关闭" @click="ui.inspectorOpen = false">✕</button>
+    <div class="insp-tabs" role="tablist">
+      <button class="insp-tab" role="tab" :class="{ active: ui.inspectorTab === 'queue' }" @click="ui.inspectorTab = 'queue'">队列</button>
+      <button class="insp-tab" role="tab" :class="{ active: ui.inspectorTab === 'subtitle' }" @click="ui.inspectorTab = 'subtitle'">字幕</button>
+      <button class="insp-tab" role="tab" :class="{ active: ui.inspectorTab === 'info' }" @click="ui.inspectorTab = 'info'">信息</button>
+      <button class="insp-tab" role="tab" :class="{ active: ui.inspectorTab === 'bookmark' }" @click="ui.inspectorTab = 'bookmark'">书签</button>
+      <button class="icon-btn insp-close" title="关闭" aria-label="关闭检查器" @click="ui.inspectorOpen = false">✕</button>
     </div>
 
     <div class="insp-body">
       <!-- 队列 -->
       <div v-if="ui.inspectorTab === 'queue'" class="insp-queue">
         <div class="insp-queue-name">{{ player.queueName || '当前队列' }} · {{ queueTracks.length }} 首</div>
-        <div v-if="!queueTracks.length" class="empty-state"><p>队列为空</p></div>
+        <div v-if="!queueTracks.length" class="empty-state">
+          <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.2"><line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" /><line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" /></svg>
+          <p>队列为空</p>
+          <p class="empty-hint">在曲库中双击条目即可开始播放</p>
+        </div>
         <div
           v-for="(t, i) in queueTracks"
           :key="t.id + i"
@@ -91,11 +145,97 @@ async function addBookmark(): Promise<void> {
         >
           <span class="queue-idx tnum">{{ i + 1 }}</span>
           <div class="queue-meta">
-            <div class="queue-name">{{ trackName(t) }}</div>
+            <div class="queue-name" :title="trackName(t)">{{ trackName(t) }}</div>
             <div class="queue-sub">{{ trackArtist(t) }}</div>
           </div>
           <span class="queue-dur tnum">{{ fmtTime(t.duration) }}</span>
-          <button class="icon-btn queue-remove" title="移出队列" @click="removeAt(i)">✕</button>
+          <button class="icon-btn queue-remove" title="移出队列" aria-label="移出队列" @click="removeAt(i)">✕</button>
+        </div>
+      </div>
+
+      <!-- 字幕：轨道选择 + 偏移 + 样式（mpv sub-* 属性遥控） -->
+      <div v-else-if="ui.inspectorTab === 'subtitle'" class="insp-subtitle">
+        <!-- 轨道选择 -->
+        <div class="sub-group">
+          <label>轨道</label>
+          <div class="sub-track-row">
+            <template v-if="player.subtitleTracks.length">
+              <button
+                v-for="t in player.subtitleTracks"
+                :key="t.id"
+                class="sub-pos-btn"
+                :class="{ active: t.selected }"
+                :title="t.title"
+                @click="player.selectSubtitle(t.id)"
+              >{{ t.id <= 0 ? '关闭' : (t.title || `轨 ${t.id}`) }}</button>
+            </template>
+            <span v-else class="sub-empty">{{ player.currentId ? '未找到字幕轨' : '未在播放' }}</span>
+          </div>
+        </div>
+        <!-- 显隐 + 偏移 -->
+        <div class="sub-group">
+          <label>显示</label>
+          <div class="sub-track-row">
+            <button
+              class="sub-pos-btn"
+              :class="{ active: player.subtitleVisible }"
+              :disabled="!player.subtitleTracks.length"
+              :title="player.subtitleTracks.length ? '' : '未找到字幕'"
+              @click="player.toggleSubtitleVisible()"
+            >{{ player.subtitleVisible ? '已开启' : '已关闭' }}</button>
+          </div>
+        </div>
+        <div class="sub-group">
+          <label>偏移</label>
+          <div class="sub-delay-row">
+            <button class="sub-pos-btn" title="字幕提前 0.1s" @click="player.nudgeSubtitleDelay(-0.1)">−0.1</button>
+            <button class="sub-delay-val tnum" title="点击归零" @click="player.nudgeSubtitleDelay(-player.subtitleDelay)">{{ player.subtitleDelay > 0 ? '+' : '' }}{{ player.subtitleDelay.toFixed(1) }}s</button>
+            <button class="sub-pos-btn" title="字幕延后 0.1s" @click="player.nudgeSubtitleDelay(0.1)">+0.1</button>
+          </div>
+        </div>
+        <div class="sub-group">
+          <label>位置</label>
+          <div class="sub-pos-row">
+            <button
+              v-for="p in SUB_POS_PRESETS"
+              :key="p.value"
+              class="sub-pos-btn"
+              :class="{ active: subStyle.pos === p.value }"
+              @click="setSubPos(p.value)"
+            >{{ p.label }}</button>
+          </div>
+        </div>
+        <div class="sub-group">
+          <label>字号</label>
+          <input v-model.number="subStyle.fontSize" type="range" min="12" max="80" step="1" @input="pushSubStyle" />
+          <span class="sub-val tnum">{{ subStyle.fontSize }}</span>
+        </div>
+        <div class="sub-group">
+          <label>主色</label>
+          <input v-model="subStyle.color" type="color" @input="pushSubStyle" />
+          <span class="sub-hex">{{ subStyle.color }}</span>
+        </div>
+        <div class="sub-group">
+          <label>描边色</label>
+          <input v-model="subStyle.borderColor" type="color" @input="pushSubStyle" />
+          <span class="sub-hex">{{ subStyle.borderColor }}</span>
+        </div>
+        <div class="sub-group">
+          <label>描边宽度</label>
+          <input v-model.number="subStyle.borderSize" type="range" min="0" max="4" step="0.1" @input="pushSubStyle" />
+          <span class="sub-val tnum">{{ subStyle.borderSize }}</span>
+        </div>
+        <div class="sub-group">
+          <label>阴影偏移</label>
+          <input v-model.number="subStyle.shadowOffset" type="range" min="0" max="4" step="0.5" @input="pushSubStyle" />
+          <span class="sub-val tnum">{{ subStyle.shadowOffset }}</span>
+        </div>
+        <div class="sub-actions">
+          <button class="btn-ghost" @click="resetSubStyle">重置</button>
+        </div>
+        <div class="sub-note">
+          <p>所有字幕样式由 mpv / libass 渲染，变更即时生效。</p>
+          <p>双语字幕：主轨 + 次轨同时加载，次轨字号由 mpv 统一缩放。</p>
         </div>
       </div>
 
@@ -139,7 +279,7 @@ async function addBookmark(): Promise<void> {
               <input v-model="renameValue" class="bm-rename" @keydown.enter="player.renameBookmarkById(bm.id, renameValue.trim()); renamingId = null" @blur="player.renameBookmarkById(bm.id, renameValue.trim()); renamingId = null" />
             </template>
             <span v-else class="bm-label" @dblclick="renamingId = bm.id; renameValue = bm.label">{{ bm.label || '（未命名）' }}</span>
-            <button class="icon-btn" title="删除书签" @click="player.removeBookmarkById(bm.id)">✕</button>
+            <button class="icon-btn" title="删除书签" aria-label="删除书签" @click="player.removeBookmarkById(bm.id)">✕</button>
           </div>
           <div v-if="!player.bookmarks.length" class="bm-empty">当前曲目暂无书签，输入名称后点击「打点」</div>
         </template>
@@ -313,5 +453,109 @@ async function addBookmark(): Promise<void> {
   font-size: 11.5px;
   color: var(--text-muted);
   padding: 10px 6px;
+}
+.empty-hint {
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.insp-subtitle {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 6px 6px 12px;
+}
+.sub-group {
+  display: grid;
+  grid-template-columns: 56px 1fr 44px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.sub-group label {
+  color: var(--text-sub);
+}
+.sub-group input[type="range"] {
+  width: 100%;
+  accent-color: rgb(var(--accent-rgb));
+}
+.sub-group input[type="color"] {
+  width: 100%;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  cursor: pointer;
+}
+.sub-val, .sub-hex {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+}
+.sub-pos-row {
+  display: flex;
+  gap: 6px;
+}
+.sub-pos-btn {
+  flex: 1;
+  padding: 5px 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-sub);
+}
+.sub-pos-btn:hover { background: var(--bg-hover); }
+.sub-pos-btn.active {
+  border-color: rgb(var(--accent-rgb));
+  color: rgb(var(--accent-rgb));
+  background: var(--bg-selected);
+}
+.sub-pos-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.sub-track-row {
+  grid-column: 2 / 4;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.sub-track-row .sub-pos-btn {
+  flex: 0 1 auto;
+  padding: 5px 10px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sub-delay-row {
+  grid-column: 2 / 4;
+  display: flex;
+  gap: 6px;
+}
+.sub-delay-row .sub-pos-btn { flex: 1; }
+.sub-delay-val {
+  flex: 1;
+  padding: 5px 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  color: rgb(var(--accent-rgb));
+  text-align: center;
+}
+.sub-delay-val:hover { background: var(--bg-hover); }
+.sub-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 5px 0;
+}
+.sub-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.sub-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.6;
 }
 </style>

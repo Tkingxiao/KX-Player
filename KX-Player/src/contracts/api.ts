@@ -19,6 +19,7 @@ export interface Track {
   genre: string | null
   bitrate: number | null
   sampleRate: number | null
+  loudnessLufs?: number | null
   albumCoverData?: string | null
 }
 
@@ -48,6 +49,45 @@ export interface DirEntry {
 export interface AudioDevice {
   deviceId: string
   label: string
+}
+
+/** 字幕轨（mpv/libass）；id<=0 表示「关闭字幕」 */
+export interface SubtitleTrack {
+  id: number
+  title: string
+  lang: string
+  selected: boolean
+}
+
+export interface FfmpegInfo {
+  available: boolean
+  path: string | null
+  version: string | null
+}
+
+export interface ConvertItem {
+  id: number
+  path: string
+  outPath: string
+  kind: 'convert' | 'extract'
+  format: string
+}
+
+export interface ConvertProgress {
+  taskId: number
+  itemId: number
+  state: 'running' | 'done' | 'failed' | 'cancelled' | 'queue-finished'
+  error?: string
+}
+
+export interface SubStyle {
+  font?: string
+  fontSize?: number
+  color?: string
+  borderColor?: string
+  borderSize?: number
+  shadowOffset?: number
+  pos?: number
 }
 
 export interface PlayProgress {
@@ -100,6 +140,8 @@ export interface AppApi {
   openAudioFiles: () => Promise<string[]>
   scanFoldersWithProgress: (paths: string[]) => Promise<ScanResult | null>
   scanFoldersIncremental: (paths: string[]) => Promise<ScanResult | null>
+  /** 启动静默增量同步：无变更时不触发扫描态 UI */
+  startupSync: (paths: string[]) => Promise<ScanResult | null>
   removeFolder: (folderPath: string, remainingPaths: string[]) => Promise<ScanResult | null>
   loadLibrary: () => Promise<ScanResult | null>
   loadLibraryFast: () => Promise<ScanResult | null>
@@ -135,6 +177,11 @@ export interface AppApi {
   removeBgImage: () => Promise<boolean>
   toolsSaveFile: (p: string, b64: string) => Promise<boolean>
   ffmpegExec: (args: string[]) => Promise<{ code: number; stdout?: string; stderr?: string }>
+  /** ffmpeg 可用性探测（转换页据此降级显示） */
+  ffmpegProbe: () => Promise<FfmpegInfo>
+  /** 启动转换队列（任务 + convert:progress 事件），返回 taskId */
+  convertRun: (items: ConvertItem[]) => Promise<number>
+  convertCancel: (taskId: number) => Promise<boolean>
   aiChat: (payload: {
     baseURL: string
     apiKey: string
@@ -173,8 +220,37 @@ export interface AppApi {
   playerStop: () => Promise<boolean>
   playerSetVideoEnabled: (enabled: boolean) => Promise<boolean>
   playerSetStageRect: (rect: { x: number; y: number; w: number; h: number; visible: boolean }) => Promise<boolean>
+  /** 播放状态快照（pip 窗口冷启动时拉取一次） */
+  playerGetState: () => Promise<MpvPlayerState>
+  /** 打开独立悬浮窗（物理像素）；成功返回 true */
+  pipOpen: (x: number, y: number, w: number, h: number) => Promise<boolean>
+  /** 关闭/隐藏独立悬浮窗，mpv 覆盖窗口挂回主窗口 */
+  pipClose: () => Promise<boolean>
+  /** 悬浮窗已关闭（由 pip 窗口或主窗口触发） */
+  onPipClosed: (cb: () => void) => () => void
+  /** 钉住状态变更（pip 窗口内切换时同步到主窗口） */
+  onPipPinned: (cb: (pinned: boolean) => void) => () => void
+  /** pip 窗口内设置钉住状态 */
+  pipSetPinned: (pinned: boolean) => Promise<boolean>
   playerListDevices: () => Promise<AudioDevice[]>
   playerSetDevice: (deviceId: string) => Promise<boolean>
+  playerSubtitleTracks: () => Promise<SubtitleTrack[]>
+  playerSetSubtitleTrack: (id: number) => Promise<boolean>
+  playerSetSubtitleVisible: (visible: boolean) => Promise<boolean>
+  playerSetSubtitleDelay: (sec: number) => Promise<boolean>
+  playerSetSubStyle: (style: {
+    font?: string
+    fontSize?: number
+    color?: string
+    borderColor?: string
+    borderSize?: number
+    shadowOffset?: number
+    pos?: number
+  }) => Promise<boolean>
+  playerApplyLoudnessGain: (trackLufs: number | null, targetLufs: number) => Promise<boolean>
+  /** 后台响度分析（任务 + loudness:progress 事件）：[trackId, path] 列表 */
+  analyzeLoudness: (tracks: [string, string][]) => Promise<boolean>
+  cancelLoudness: () => Promise<boolean>
   toggleFullscreen: () => Promise<boolean>
 
   // ── 分类与标签（P0-11/12/13）──
@@ -187,6 +263,7 @@ export interface AppApi {
   taxonomyUnassignCategory: (categoryId: number, trackIds: string[]) => Promise<boolean>
   taxonomyListTags: () => Promise<Tag[]>
   taxonomyUpsertTag: (name: string, color?: string | null, kind?: string) => Promise<Tag | null>
+  taxonomyRenameTag: (id: number, name: string) => Promise<boolean>
   taxonomyDeleteTag: (id: number) => Promise<boolean>
   taxonomyTagTracks: (tagIds: number[], trackIds: string[], mode?: 'add' | 'replace') => Promise<boolean>
   taxonomyUntagTracks: (tagId: number, trackIds: string[]) => Promise<boolean>

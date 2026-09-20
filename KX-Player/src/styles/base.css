@@ -27,6 +27,24 @@ button {
   background: none;
   border: none;
   cursor: pointer;
+  /* 统一交互反馈：所有按钮都有平滑的悬停/按下过渡 */
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    opacity var(--dur-fast) var(--ease),
+    box-shadow var(--dur-fast) var(--ease),
+    transform var(--dur-press) var(--ease),
+    filter var(--dur-fast) var(--ease);
+}
+
+/* 按下反馈：轻微内缩；大按钮（播放/主行动）反馈更明显 */
+button:not(:disabled):active {
+  transform: scale(0.97);
+}
+.pb-play:not(:disabled):active,
+.btn-primary:not(:disabled):active {
+  transform: scale(0.94);
 }
 
 input,
@@ -60,14 +78,13 @@ textarea {
 }
 
 /* ── 应用骨架 ── */
-/* 背景必须透明：壁纸在 #bg-layer（fixed, z-0），骨架若不透明会完全盖住它 */
 #app-shell {
   display: grid;
   grid-template-rows: var(--titlebar-h) 1fr var(--playerbar-h);
   height: 100%;
-  background: transparent;
   position: relative;
-  z-index: 0;
+  z-index: 1;
+  background: transparent;
 }
 
 #app-middle {
@@ -75,7 +92,14 @@ textarea {
   grid-template-columns: auto 1fr auto;
   min-height: 0;
   position: relative;
-  z-index: 1;
+}
+
+#content-wrap {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 /* ── 背景 ── */
@@ -89,14 +113,8 @@ textarea {
 #bg-layer img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: var(--bg-fit, cover);
   user-select: none;
-}
-#bg-layer::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: rgba(0, 0, 0, var(--bg-overlay, 0.4));
 }
 
 /* ── 通用小控件 ── */
@@ -185,6 +203,21 @@ textarea {
   color: var(--text);
 }
 
+/* 禁用态统一可见（无障碍：置灰 + 禁止指针） */
+button:disabled,
+.btn-primary:disabled,
+.btn-ghost:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.btn-primary:disabled:hover {
+  filter: none;
+}
+.btn-ghost:disabled:hover {
+  background: none;
+  color: var(--text-sub);
+}
+
 .section-title {
   font-size: 11px;
   letter-spacing: 0.06em;
@@ -257,4 +290,85 @@ textarea {
 .slide-right-leave-to {
   transform: translateX(24px);
   opacity: 0;
+}
+
+/* ── 通用动效工具类 ── */
+
+/* 弹入（下拉/弹层）：轻微回弹 + 位移 */
+.pop-scale-enter-active {
+  transition: opacity 140ms var(--ease), transform 140ms var(--ease-out-back);
+}
+.pop-scale-leave-active {
+  transition: opacity 100ms var(--ease), transform 100ms var(--ease);
+}
+.pop-scale-enter-from,
+.pop-scale-leave-to {
+  opacity: 0;
+  transform: translateY(6px) scale(0.97);
+}
+
+/* 视图切换：内容区淡入上浮（不阻塞交互） */
+.view-enter-active {
+  transition: opacity 180ms var(--ease), transform 180ms var(--ease);
+}
+.view-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
+/* 列表项依次浮现（配合 :style 的 animation-delay 使用） */
+@keyframes item-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.item-rise {
+  animation: item-rise 220ms var(--ease) both;
+}
+
+/* 卡片/封面图片淡入，避免加载完成时突兀闪现 */
+@keyframes img-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+img.fade-in {
+  animation: img-fade-in 200ms var(--ease) both;
+}
+/* 列表/网格顶部与底部渐隐，缓和被容器裁切的生硬边缘。
+   --fade-top/--fade-bottom 由使用处按需覆盖高度。 */
+.edge-fade {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--fade-top, 0px),
+    #000 calc(100% - var(--fade-bottom, 0px)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--fade-top, 0px),
+    #000 calc(100% - var(--fade-bottom, 0px)),
+    transparent 100%
+  );
+}
+/* 滚动容器底部悬浮渐隐遮罩（不占布局，盖在内容上） */
+.scroll-fade-bottom::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--scroll-fade-h, 28px);
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--bg, #0d0d12));
+  opacity: var(--scroll-fade-opacity, 1);
+  transition: opacity var(--dur) var(--ease);
+}
+
+/* 减弱动效偏好下禁用上述动效 */
+@media (prefers-reduced-motion: reduce) {
+  .item-rise,
+  img.fade-in {
+    animation: none;
+  }
 }

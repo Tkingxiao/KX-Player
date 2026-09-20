@@ -126,5 +126,36 @@ pub fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS ix_track_tags_tag ON track_tags(tag_id);
         "#,
-    )
+    )?;
+
+    let mut columns = conn.prepare("PRAGMA table_info(tracks)")?;
+    let has_loudness = columns
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == "loudness_lufs");
+    if !has_loudness {
+        conn.execute("ALTER TABLE tracks ADD COLUMN loudness_lufs REAL", [])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initialize_schema;
+    use rusqlite::Connection;
+
+    #[test]
+    fn schema_adds_loudness_column_idempotently() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        initialize_schema(&conn).expect("first schema init");
+        initialize_schema(&conn).expect("second schema init");
+
+        let mut stmt = conn.prepare("PRAGMA table_info(tracks)").expect("table info");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .expect("query columns")
+            .collect::<Result<_, _>>()
+            .expect("collect columns");
+        assert!(columns.iter().any(|name| name == "loudness_lufs"));
+    }
 }

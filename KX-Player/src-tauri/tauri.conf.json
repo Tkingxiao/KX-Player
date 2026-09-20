@@ -5,7 +5,7 @@
   "identifier": "com.kxplayer.music",
   "build": {
     "beforeDevCommand": "npm run dev:vite",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://127.0.0.1:5173",
     "beforeBuildCommand": "npm run build:fe",
     "frontendDist": "../dist"
   },

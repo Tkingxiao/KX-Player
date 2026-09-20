@@ -63,7 +63,7 @@ function seekTo(time: number): void {
 }
 
 function goBack(): void {
-  ui.view = 'smart'
+  ui.goBack()
 }
 
 const tab = ref<'lyrics' | 'info'>('lyrics')

@@ -2,14 +2,16 @@
  *  引擎在 Rust 侧（libmpv），本 store 只镜像 `player:state` 事件并转发命令。 */
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed } from 'vue'
-import type { Track, Bookmark, AudioDevice, MpvPlayerState } from '@/contracts/api'
+import type { Track, Bookmark, AudioDevice, MpvPlayerState, SubtitleTrack } from '@/contracts/api'
 import { api, onEvent } from '@/bridge/ipc'
 import { useLibraryStore } from '@/stores/library'
 import { useSettingsStore } from '@/stores/settings'
 import { loadLyricsForTrack, type LoadedLyrics } from '@/utils/lyricsLoader'
 import { nextIndex, prevIndex, onEnded } from '@/utils/queue'
+import { completedOnWrite } from '@/utils/playback'
 import { trackName } from '@/utils/format'
 import type { LyricLine } from '@/utils/parsers/lyrics'
+import type { SubStyle } from '@/contracts/api'
 
 export interface SleepState {
   active: boolean
@@ -40,6 +42,9 @@ export const usePlayerStore = defineStore('player', () => {
   const sleepRemaining = ref(0)
   const bookmarks = shallowRef<Bookmark[]>([])
   const videoMode = ref<'audio' | 'video'>('audio')
+  const subtitleTracks = shallowRef<SubtitleTrack[]>([])
+  const subtitleVisible = ref(true)
+  const subtitleDelay = ref(0)
   const audioOnly = ref(false) // P0-30：仅音频模式（vid=no，位置不丢）
   const error = ref('')
 
@@ -53,8 +58,13 @@ export const usePlayerStore = defineStore('player', () => {
   const currentArtist = computed(() => (current.value ? (current.value.metaArtist || current.value.artist || '佚名') : ''))
 
   // ── 输出设备 ──
+  /** 拉取输出设备列表。mpv 在首次播放后才存在，因此启动时可能只拿到默认项；
+   *  失败时保留已有列表（不要清空成空数组，否则 UI 显示「未枚举到设备」）。 */
   async function refreshDevices(): Promise<void> {
-    try { devices.value = await api.playerListDevices() } catch { devices.value = [] }
+    try {
+      const list = await api.playerListDevices()
+      if (list && list.length) devices.value = list
+    } catch { /* 保留上一次结果 */ }
   }
 
   // ── mpv 状态镜像 ──
@@ -74,7 +84,7 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   // ── 加载与播放 ──
-  async function loadTrack(track: Track, resumeMs: number, autoplay: boolean): Promise<void> {
+  async function loadTrack(track: Track, resumeMs: number, autoplay: boolean): Promise<boolean> {
     const gen = ++loadGeneration
     loading.value = true
     position.value = resumeMs / 1000
@@ -97,19 +107,20 @@ export const usePlayerStore = defineStore('player', () => {
     } catch (e) {
       error.value = String(e)
       loading.value = false
-      return
+      return false
     }
-    if (gen !== loadGeneration) return
+    if (gen !== loadGeneration) return false // 已被更新的加载取代，交由新流程收尾
     loading.value = false
+    return true
   }
 
   /** 播放指定曲目（带队列上下文）。fromLast=true 时从上次进度续播。 */
   async function playTrack(track: Track, list: string[], name: string, opts?: { fromLast?: boolean; video?: boolean }): Promise<void> {
     if (!track) return
-    ending = false
     queue.value = list
     queueName.value = name
     currentId.value = track.id
+    ending = false
     videoMode.value = opts?.video && track.isVideo ? 'video' : 'audio'
     const prevProgress = library.progress.get(track.id)
     const resumeMs = opts?.fromLast ? prevProgress?.positionMs ?? 0 : 0
@@ -122,8 +133,20 @@ export const usePlayerStore = defineStore('player', () => {
     bookmarks.value = []
     error.value = ''
     void refreshBookmarks(track.id)
-    await loadTrack(track, resumeMs, true)
+    if (!await loadTrack(track, resumeMs, true)) {
+      // 加载失败：不查询字幕轨、不启动进度写入，避免为无法播放的条目写入假进度
+      playing.value = false
+      return
+    }
+    // 字幕轨要等 mpv 载入文件后才有，稍后刷新
+    window.setTimeout(() => void refreshSubtitles(), 900)
+    await api.playerApplyLoudnessGain(
+      settings.loudnessEnabled ? (track.loudnessLufs ?? null) : null,
+      settings.loudnessTarget,
+    )
     startProgressWriter()
+    // mpv 此时已初始化完成：此时才能枚举到全部输出设备，刷新一次设备列表
+    void refreshDevices()
     // 视频舞台几何在 StageView 挂载时同步；这里若已在舞台视图先刷新一次
     void api.playerSetVideoEnabled(videoMode.value === 'video' && track.isVideo && !audioOnly.value).catch(() => false)
   }
@@ -149,7 +172,7 @@ export const usePlayerStore = defineStore('player', () => {
     const idx = queue.value.indexOf(currentId.value ?? '')
     const n = nextIndex(settings.mode, idx, queue.value.length)
     if (n === null) return
-    await playFromList(queue.value, n, queueName.value, { fromLast: true })
+    await playFromList(queue.value, n, queueName.value, { fromLast: true, video: videoMode.value === 'video' })
   }
 
   async function prev(): Promise<void> {
@@ -157,7 +180,7 @@ export const usePlayerStore = defineStore('player', () => {
     const idx = queue.value.indexOf(currentId.value ?? '')
     const p = prevIndex(settings.mode, idx, queue.value.length)
     if (p === null) return
-    await playFromList(queue.value, p, queueName.value, { fromLast: true })
+    await playFromList(queue.value, p, queueName.value, { fromLast: true, video: videoMode.value === 'video' })
   }
 
   function seek(sec: number): void {
@@ -175,18 +198,23 @@ export const usePlayerStore = defineStore('player', () => {
   function writeProgress(finished: boolean): void {
     const id = currentId.value
     if (!id) return
-    const dur = duration.value || 0
-    const ratio = dur > 0 ? position.value / dur : 0
-    const completed = finished && ratio >= 0.05 ? ratio >= 0.95 : undefined
+    const completed = completedOnWrite(position.value, duration.value || 0, finished)
     void api.setProgress(id, Math.round(position.value * 1000), completed ?? null, settings.speed)
     library.updateProgressLocal(id, Math.round(position.value * 1000), completed)
   }
 
   function startProgressWriter(): void {
-    if (progressTimer) clearInterval(progressTimer)
+    stopProgressWriter()
     progressTimer = setInterval(() => {
       if (playing.value && currentId.value) writeProgress(false)
     }, 5000)
+  }
+
+  function stopProgressWriter(): void {
+    if (progressTimer) {
+      clearInterval(progressTimer)
+      progressTimer = null
+    }
   }
 
   // ── mpv 事件（唯一事实源）──
@@ -223,7 +251,46 @@ export const usePlayerStore = defineStore('player', () => {
     onEvent<{ message: string }>('player:error', ({ message }) => {
       error.value = message
       playing.value = false
+      loading.value = false
     })
+  }
+
+  // ── 字幕（mpv + libass 属性遥控）─────────────────────────────
+  async function refreshSubtitles(): Promise<void> {
+    try {
+      subtitleTracks.value = await api.playerSubtitleTracks()
+      if (subtitleTracks.value.length === 0) subtitleVisible.value = true
+    } catch {
+      subtitleTracks.value = []
+    }
+  }
+
+  async function selectSubtitle(id: number): Promise<void> {
+    subtitleTracks.value = subtitleTracks.value.map((t) => ({ ...t, selected: t.id === id }))
+    await api.playerSetSubtitleTrack(id)
+    subtitleVisible.value = id > 0
+  }
+
+  async function toggleSubtitleVisible(): Promise<void> {
+    subtitleVisible.value = !subtitleVisible.value
+    await api.playerSetSubtitleVisible(subtitleVisible.value)
+  }
+
+  /** 偏移步进（秒），用于字幕提前/延后 */
+  async function nudgeSubtitleDelay(delta: number): Promise<void> {
+    subtitleDelay.value = Math.round((subtitleDelay.value + delta) * 100) / 100
+    await api.playerSetSubtitleDelay(subtitleDelay.value)
+  }
+
+  /** 字幕样式（mpv sub-* 属性遥控） */
+  async function setSubStyle(style: SubStyle): Promise<void> {
+    await api.playerSetSubStyle(style)
+  }
+
+  /** 响度均衡：按目标 LUFS 与当前曲目 loudness_lufs 差值设置增益 */
+  async function applyLoudnessGain(targetLufs: number): Promise<void> {
+    const lufs = current.value?.loudnessLufs
+    await api.playerApplyLoudnessGain(lufs ?? null, targetLufs)
   }
 
   // ── 音量 / 倍速 ──
@@ -256,6 +323,7 @@ export const usePlayerStore = defineStore('player', () => {
 
   // ── 睡眠定时 ──
   function setSleepTimer(minutes: number, action: SleepState['action'] = 'pause'): void {
+    sleepFading = false
     if (minutes <= 0) {
       sleep.value = { active: false, endAt: 0, action, triggerOnEnded: false }
       if (sleepTicker) { clearInterval(sleepTicker); sleepTicker = null }
@@ -266,14 +334,17 @@ export const usePlayerStore = defineStore('player', () => {
     sleepTicker = setInterval(tickSleep, 1000)
   }
 
+  let sleepFading = false // 防止到点后 tick 每秒重复触发 fadeOut
+
   function tickSleep(): void {
-    if (!sleep.value.active) return
+    if (!sleep.value.active || sleepFading) return
     sleepRemaining.value = Math.max(0, sleep.value.endAt - Date.now())
     if (sleepRemaining.value <= 0) {
       if (sleep.value.action === 'finishTrack') {
         if (!playing.value) stopForSleep()
       } else {
-        void fadeOutAndStop(sleep.value.action === 'stop')
+        sleepFading = true
+        void fadeOutAndStop(sleep.value.action === 'stop').finally(() => { sleepFading = false })
       }
     }
   }
@@ -292,6 +363,7 @@ export const usePlayerStore = defineStore('player', () => {
       step()
     })
     if (hardStop) {
+      stopProgressWriter()
       void api.playerStop()
       currentId.value = null
       playing.value = false
@@ -351,6 +423,8 @@ export const usePlayerStore = defineStore('player', () => {
     queue, queueName, currentId, current, currentTitle, currentArtist,
     playing, position, duration, buffered, loading, videoMode, audioOnly, error,
     lyrics, lyricsInfo, devices, deviceOpen,
+    subtitleTracks, subtitleVisible, subtitleDelay, refreshSubtitles,
+    selectSubtitle, toggleSubtitleVisible, nudgeSubtitleDelay, setSubStyle, applyLoudnessGain,
     sleep, sleepRemaining, bookmarks,
     playTrack, playFromList, togglePlay, next, prev, seek, seekBy,
     setVolume, toggleMute, setSpeed, cycleSpeed, setAudioOnly,

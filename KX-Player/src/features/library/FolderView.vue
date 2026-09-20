@@ -7,6 +7,7 @@ import { useSettingsStore } from '@/stores/settings'
 import { useTrackActions } from '@/composables/useTrackActions'
 import VirtualGrid from '@/components/VirtualGrid.vue'
 import VirtualList from '@/components/VirtualList.vue'
+import SelectMenu from '@/components/SelectMenu.vue'
 import TrackTable from '@/features/library/TrackTable.vue'
 import { normDir, fmtTime } from '@/utils/format'
 import { cachedFolderCover, requestFolderCovers } from '@/utils/covers'
@@ -18,15 +19,23 @@ const library = useLibraryStore()
 const settings = useSettingsStore()
 const { playTrackInContext, showTrackMenu } = useTrackActions()
 
-const currentNode = computed(() => library.nodeByPath(ui.folderPath || library.folderPaths[0] || ''))
 const isRoot = computed(() => !ui.folderPath)
 
-const visibleChildren = computed<FolderNode[]>(() =>
-  (currentNode.value?.children || []).filter((c) => c.trackCount > 0),
+// 根级视图：汇总所有 rootFolders；子级视图：显示当前节点的子文件夹
+const currentNode = computed<FolderNode | null>(() =>
+  isRoot.value ? null : library.nodeByPath(ui.folderPath),
 )
 
+const visibleChildren = computed<FolderNode[]>(() => {
+  if (isRoot.value) return library.rootFolders
+  return (currentNode.value?.children || []).filter((c) => c.trackCount > 0)
+})
+
 const directTracks = computed(() => currentNode.value?.tracks || [])
-const allFolderTracks = computed(() => (currentNode.value ? library.tracksOfFolder(currentNode.value.path) : []))
+const allFolderTracks = computed(() => {
+  if (isRoot.value) return library.allTracks
+  return currentNode.value ? library.tracksOfFolder(currentNode.value.path) : []
+})
 
 // ── 面包屑：从扫描根目录开始显示（曲库根目录/RJ/作品…），不暴露完整物理路径 ──
 const breadcrumbs = computed(() => {
@@ -104,13 +113,25 @@ function cycleSort(): void {
 }
 
 // ── 文件夹卡片封面 ──
+// 一次性把当前可见子目录批量入队（后端合批处理），避免每张卡片各发一次 IPC。
+// coverTick 必须在渲染期被读取，否则封面到达后组件不会重新渲染（图片永远不出现）。
 const coverTick = ref(0)
 function folderCover(node: FolderNode): string | null {
+  void coverTick.value // 建立响应式依赖：封面返回后触发重渲染
   const hit = cachedFolderCover(normDir(node.path))
   if (hit) return hit
-  requestFolderCovers([node.path], () => { coverTick.value++ })
   return null
 }
+
+watch(
+  () => sortedChildren.value.map((c) => normDir(c.path)).join('|'),
+  () => {
+    const paths = sortedChildren.value.map((c) => normDir(c.path))
+    if (!paths.length) return
+    requestFolderCovers(paths, () => { coverTick.value++ })
+  },
+  { immediate: true },
+)
 
 // ── 播放 ──
 function playFolder(node: FolderNode): void {
@@ -194,24 +215,47 @@ function onScroll(top: number): void {
           <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><polygon points="6,3 21,12 6,21" /></svg>
           播放全部
         </button>
-        <button class="icon-btn" :title="'排序：' + sortLabels[settings.folderSort]" @click="cycleSort">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="20" y2="5" /><line x1="12" y1="10" x2="17" y2="10" /><line x1="12" y1="15" x2="14" y2="15" /><path d="M7 4v14M7 18l-3-3M7 18l3-3" /></svg>
-        </button>
-        <button
-          class="icon-btn"
-          :title="settings.folderView === 'grid' ? '切换为列表' : '切换为网格'"
-          @click="settings.folderView = settings.folderView === 'grid' ? 'list' : 'grid'; settings.scheduleSave()"
+        <!-- 排序：选择栏形式（默认名称 A-Z） -->
+        <SelectMenu
+          :model-value="settings.folderSort"
+          variant="text"
+          title="文件夹排序字段"
+          :options="[{ value: 'name', label: '名称' }, { value: 'mtime', label: '修改时间' }, { value: 'count', label: '曲目数' }]"
+          @update:model-value="settings.folderSort = $event as 'name' | 'mtime' | 'count'; settings.scheduleSave()"
+        />
+        <SelectMenu
+          :model-value="settings.folderSortDir"
+          variant="icon"
+          title="排序方向"
+          :options="[{ value: 'asc', label: '升序（A→Z）' }, { value: 'desc', label: '降序（Z→A）' }]"
+          @update:model-value="settings.folderSortDir = $event as 'asc' | 'desc'; settings.scheduleSave()"
         >
-          <svg v-if="settings.folderView === 'grid'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" /><line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" /></svg>
-          <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /></svg>
-        </button>
+          <template #icon>
+            <svg v-if="settings.folderSortDir === 'asc'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="20" y2="5" /><line x1="12" y1="10" x2="17" y2="10" /><line x1="12" y1="15" x2="14" y2="15" /><path d="M7 4v14M7 18l-3-3M7 18l3-3" /></svg>
+            <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="14" y2="5" /><line x1="12" y1="10" x2="17" y2="10" /><line x1="12" y1="15" x2="20" y2="15" /><path d="M7 20V6M7 6l-3 3M7 6l3 3" /></svg>
+          </template>
+        </SelectMenu>
+        <!-- 视图形态：选择栏形式 -->
+        <SelectMenu
+          :model-value="settings.folderView"
+          variant="icon"
+          title="视图形态"
+          :options="[{ value: 'grid', label: '卡片网格' }, { value: 'list', label: '紧凑列表' }]"
+          @update:model-value="settings.folderView = $event as 'grid' | 'list'; settings.scheduleSave()"
+        >
+          <template #icon>
+            <svg v-if="settings.folderView === 'grid'" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /></svg>
+            <svg v-else viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" /><line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" /></svg>
+          </template>
+        </SelectMenu>
       </div>
     </div>
 
-    <!-- 子文件夹网格 -->
+    <!-- 子文件夹网格（底部渐隐，缓和被容器裁切的边缘） -->
     <div v-if="settings.folderView === 'grid' && sortedChildren.length" class="fv-grid-wrap">
       <VirtualGrid
         ref="gridScroller"
+        class="fv-scroll edge-fade"
         :count="sortedChildren.length"
         :card-width="settings.gridSize"
         :card-height="settings.gridSize + 52"
@@ -244,6 +288,7 @@ function onScroll(top: number): void {
     <div v-else-if="sortedChildren.length" class="fv-list-wrap">
       <VirtualList
         ref="listScroller"
+        class="fv-scroll edge-fade"
         :count="sortedChildren.length"
         :row-height="64"
         :row-key="(i: number) => sortedChildren[i]?.path ?? i"
@@ -324,12 +369,22 @@ function onScroll(top: number): void {
   min-height: 0;
   padding: 4px 18px;
 }
+/* 滚动区顶部/底部渐隐：避免内容被容器生硬截断 */
+.fv-scroll {
+  --fade-top: 6px;
+  --fade-bottom: 22px;
+}
 .folder-card {
   cursor: pointer;
   border-radius: var(--radius);
   overflow: hidden;
   background: var(--bg-card);
   border: 1px solid var(--border);
+  /* 固定卡片尺寸：网格列宽由 vgrid 决定，卡片自身必须撑满且不因内容（有无封面）改变大小，
+     否则无图文件夹会显示为异常宽/窄的卡片 */
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
   transition: transform var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .folder-card:hover {
@@ -339,17 +394,34 @@ function onScroll(top: number): void {
 }
 .folder-card-cover {
   position: relative;
+  /* 高度由行内 style 设定（= gridSize）；宽度始终占满 */
+  width: 100%;
   background: var(--bg-input);
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--text-muted);
   overflow: hidden;
+  flex-shrink: 0;
 }
 .folder-card-cover img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+/* 无封面占位图标按比例缩放，避免撑破卡片 */
+.folder-card-cover > svg {
+  width: 32%;
+  height: 32%;
+  max-width: 48px;
+  max-height: 48px;
+}
+.folder-card-info {
+  padding: 8px 10px;
+  min-width: 0;
+  box-sizing: border-box;
 }
 .folder-card-play {
   position: absolute;
@@ -369,7 +441,6 @@ function onScroll(top: number): void {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
 }
 .folder-card:hover .folder-card-play { opacity: 1; transform: translateY(0); }
-.folder-card-info { padding: 8px 10px; }
 .folder-card-name {
   font-size: 12.5px;
   font-weight: 500;

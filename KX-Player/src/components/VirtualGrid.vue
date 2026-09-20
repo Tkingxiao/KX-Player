@@ -134,5 +134,11 @@ defineExpose({ scrollToTop, cols })
 .vgrid-row {
   display: grid;
   gap: inherit;
+  /* 行内所有单元格等高、等宽：卡片内容（有无封面）不得改变格子尺寸 */
+  align-items: stretch;
+}
+.vgrid-row > * {
+  min-width: 0;
+  height: 100%;
 }
 </style>

@@ -134,14 +134,6 @@ pub fn rename_category(id: i64, name: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-pub fn set_category_color(id: i64, color: Option<&str>) -> Result<(), String> {
-    with_db(Path::new(&library_db_path()), |conn| {
-        conn.execute("UPDATE categories SET color = ?1 WHERE id = ?2", params![color, id])?;
-        Ok(())
-    })
-    .map_err(|e| e.to_string())
-}
-
 pub fn delete_category(id: i64) -> Result<(), String> {
     with_db(Path::new(&library_db_path()), |conn| {
         // 级联删除子分类与关联（ON DELETE CASCADE）
@@ -264,6 +256,29 @@ pub fn upsert_tag(name: &str, color: Option<&str>, kind: &str) -> Result<i64, St
         Ok(conn.query_row("SELECT id FROM tags WHERE name = ?1", [name.trim()], |r| r.get(0))?)
     })
     .map_err(|e| e.to_string())
+}
+
+pub fn rename_tag(id: i64, name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("名称不能为空".into());
+    }
+    with_db(Path::new(&library_db_path()), |conn| {
+        let changed = conn.execute("UPDATE tags SET name = ?1 WHERE id = ?2", params![trimmed, id])?;
+        if changed == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    })
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            "已存在同名标签".to_string()
+        } else if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+            "标签不存在".to_string()
+        } else {
+            e.to_string()
+        }
+    })
 }
 
 pub fn delete_tag(id: i64) -> Result<(), String> {

@@ -10,7 +10,7 @@ export function useThemeEffect(): void {
     const root = document.documentElement
     root.setAttribute('data-theme', settings.theme)
 
-    const [r, g, b] = hexToRgb(settings.clr)
+    const [r, g, b] = hexToRgb(settings.clr || '#E63A2E')
     root.style.setProperty('--accent-rgb', `${r} ${g} ${b}`)
     root.style.setProperty('--tb-alpha', String(settings.titlebarOpacity))
     root.style.setProperty('--sb-alpha', String(settings.sidebarOpacity))

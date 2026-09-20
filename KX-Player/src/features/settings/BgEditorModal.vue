@@ -8,7 +8,7 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useUiStore } from '@/stores/ui'
-import { api } from '@/bridge/ipc'
+import { assetUrl } from '@/bridge/ipc'
 
 const settings = useSettingsStore()
 const ui = useUiStore()
@@ -17,9 +17,11 @@ const MIN_ZOOM = 50
 const MAX_ZOOM = 300
 const WHEEL_STEP = 3 // 每次 3%
 
+// 走 asset 协议：CSP 不允许 file://，否则预览显示破图
 const bgUrl = computed(() => {
   if (!settings.bgPath) return null
-  return 'file:///' + settings.bgPath.replace(/\\/g, '/').replace(/^\/+/, '') + '?v=' + settings.bgMtime
+  const base = assetUrl(settings.bgPath)
+  return base ? base + '?v=' + settings.bgMtime : null
 })
 
 const zoomPct = computed(() => settings.imgEditState?.zoomPct ?? 100)
@@ -90,10 +92,44 @@ function onKey(e: KeyboardEvent): void {
   }
 }
 
-const previewStyle = computed(() => ({
-  transform: `translate(${(posX.value - 50) * 0.8}%, ${(posY.value - 50) * 0.8}%) scale(${zoomPct.value / 100})`,
-  filter: `blur(${settings.bgBlur}px)`,
-}))
+/** 预览样式：与主界面一致（适配方式 + 透明度 + 模糊 + 缩放平移） */
+const FIT_MODES = [
+  { value: 'cover', label: '填充', hint: '等比缩放铺满，裁掉溢出部分' },
+  { value: 'contain', label: '适应', hint: '等比缩放到完整可见' },
+  { value: 'stretch', label: '拉伸', hint: '拉伸到窗口尺寸' },
+  { value: 'center', label: '居中', hint: '原始尺寸居中' },
+  { value: 'tile', label: '平铺', hint: '以原始尺寸重复平铺' },
+] as const
+
+const previewStyle = computed<Record<string, string>>(() => {
+  const fit = settings.bgSize
+  const style: Record<string, string> = {
+    opacity: String(Math.max(0, Math.min(1, 1 - settings.ovl))),
+    filter: settings.bgBlur > 0 ? `blur(${settings.bgBlur}px)` : '',
+  }
+  if (fit === 'stretch') style.objectFit = 'fill'
+  else if (fit === 'contain') style.objectFit = 'contain'
+  else if (fit === 'cover') style.objectFit = 'cover'
+  else if (fit === 'center') { style.objectFit = 'none'; style.objectPosition = 'center' }
+  else if (fit === 'tile') {
+    style.objectFit = 'none'
+    style.objectRepeat = 'repeat'
+    style.width = 'auto'
+    style.height = 'auto'
+    style.minWidth = '100%'
+    style.minHeight = '100%'
+  }
+  // 居中/平铺不施加缩放平移（与 repeat/none 冲突）
+  if (fit !== 'tile' && fit !== 'center') {
+    style.transform = `translate(${(posX.value - 50) * 0.8}%, ${(posY.value - 50) * 0.8}%) scale(${zoomPct.value / 100})`
+  }
+  return style
+})
+
+function setFit(v: 'stretch' | 'cover' | 'center' | 'tile' | 'contain'): void {
+  settings.bgSize = v
+  settings.scheduleSave()
+}
 
 onMounted(() => window.addEventListener('keydown', onKey, true))
 onBeforeUnmount(() => {
@@ -105,11 +141,11 @@ onBeforeUnmount(() => {
 <template>
   <Teleport to="body">
     <Transition name="modal">
-      <div v-if="ui.bgEditorOpen" class="bge-overlay" @mousedown.self="close">
+      <div v-if="ui.bgEditorOpen" class="bge-backdrop" @mousedown.self="close">
         <div class="modal-card bge-card">
           <div class="bge-head">
             <h2>编辑背景图</h2>
-            <button class="icon-btn" title="关闭（Esc）" @click="close">✕</button>
+            <button class="icon-btn" title="关闭（Esc）" aria-label="关闭" @click="close">✕</button>
           </div>
 
           <div
@@ -121,12 +157,37 @@ onBeforeUnmount(() => {
           >
             <img v-if="bgUrl" :src="bgUrl" alt="" draggable="false" :style="previewStyle" />
             <div v-else class="bge-empty">尚未设置背景图<br />请先在设置中选择图片</div>
-            <div class="bge-overlay" :style="{ background: `rgba(0,0,0,${settings.ovl})` }" />
-            <span class="bge-hint" v-if="bgUrl">滚轮缩放（每次 {{ WHEEL_STEP }}%） · 拖拽移动位置</span>
+            <span class="bge-hint" v-if="bgUrl && settings.bgSize !== 'tile' && settings.bgSize !== 'center'">滚轮缩放（每次 {{ WHEEL_STEP }}%） · 拖拽移动位置</span>
+          </div>
+
+          <!-- 适配方式：拉伸 / 填充 / 居中 / 平铺 / 适应 -->
+          <div class="bge-fit">
+            <span class="bge-fit-label">适配</span>
+            <div class="bge-fit-modes">
+              <button
+                v-for="m in FIT_MODES"
+                :key="m.value"
+                class="bge-fit-btn"
+                :class="{ active: settings.bgSize === m.value }"
+                :title="m.hint"
+                @click="setFit(m.value)"
+              >{{ m.label }}</button>
+            </div>
           </div>
 
           <div class="bge-controls">
-            <span class="bge-zoom-readout tnum">缩放 {{ zoomPct }}% · 位置 {{ Math.round(posX) }}, {{ Math.round(posY) }}</span>
+            <span class="bge-zoom-readout tnum">缩放 {{ zoomPct }}% · 位置 {{ Math.round(posX) }}, {{ Math.round(posY) }} · 透明度 {{ Math.round(settings.ovl * 100) }}%</span>
+            <div class="slider-row compact bge-alpha">
+              <span class="slider-label">透明度</span>
+              <input
+                type="range"
+                min="0"
+                max="0.9"
+                step="0.01"
+                :value="settings.ovl"
+                @input="settings.ovl = Number(($event.target as HTMLInputElement).value); settings.scheduleSave()"
+              />
+            </div>
           </div>
 
           <div class="bge-actions">
@@ -140,7 +201,9 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.bge-overlay {
+/* 遮罩层：必须能接收指针事件（原先与内层压暗层共用 .bge-overlay 类名，
+   被后者的 pointer-events: none 覆盖，导致整个弹窗鼠标失效、关闭按钮点不到） */
+.bge-backdrop {
   position: fixed;
   inset: 0;
   z-index: 925;
@@ -149,6 +212,7 @@ onBeforeUnmount(() => {
   justify-content: center;
   background: var(--modal-overlay);
 }
+/* 弹窗需要更高的层级与独立的指针行为：z-index 高于 settings 弹窗（920） */
 .bge-card {
   width: 680px;
   max-width: calc(100vw - 80px);
@@ -156,6 +220,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-pop);
+  pointer-events: auto;
 }
 .bge-head {
   display: flex;
@@ -197,11 +262,35 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   line-height: 2;
 }
-.bge-overlay {
+.bge-shade {
   position: absolute;
   inset: 0;
   pointer-events: none;
 }
+
+/* 适配方式选择栏 */
+.bge-fit {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 22px 0;
+}
+.bge-fit-label { font-size: 11.5px; color: var(--text-sub); flex-shrink: 0; }
+.bge-fit-modes { display: flex; gap: 5px; flex-wrap: wrap; }
+.bge-fit-btn {
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-sub);
+}
+.bge-fit-btn:hover { border-color: var(--border-strong); color: var(--text); }
+.bge-fit-btn.active {
+  border-color: rgb(var(--accent-rgb));
+  color: rgb(var(--accent-rgb));
+  background: var(--bg-selected);
+}
+.bge-alpha { margin-top: 8px; }
 .bge-hint {
   position: absolute;
   left: 50%;

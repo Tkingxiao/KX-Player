@@ -15,7 +15,7 @@ fn load_track_rows(conn: &Connection) -> Result<Vec<TrackRow>> {
     let mut stmt = conn.prepare(
         "SELECT t.id, t.album_id, t.name, t.path, t.duration, t.artist, t.album,
                 t.format, t.is_video, t.cover_path, t.lyrics_path, t.file_mtime, t.file_size,
-                t.meta_title, t.meta_artist, t.genre, t.bitrate, t.sample_rate
+                t.meta_title, t.meta_artist, t.genre, t.bitrate, t.sample_rate, t.loudness_lufs
          FROM tracks t
          ORDER BY t.artist COLLATE NOCASE, t.album COLLATE NOCASE, t.name COLLATE NOCASE",
     )?;
@@ -41,6 +41,7 @@ fn load_track_rows(conn: &Connection) -> Result<Vec<TrackRow>> {
                 genre: r.get(15)?,
                 bitrate: r.get(16)?,
                 sample_rate: r.get(17)?,
+                loudness_lufs: r.get(18)?,
                 album_cover_data: None,
             },
         })
@@ -230,6 +231,11 @@ fn folder_track_rows(conn: &Connection) -> Result<Vec<(String, String)>> {
 pub fn save_snapshot(db_path: &Path, snapshot: &ScanResult) -> Result<()> {
     with_db(db_path, |conn| {
         initialize_schema(conn)?;
+        let existing_loudness: HashMap<String, f64> = {
+            let mut stmt = conn.prepare("SELECT id, loudness_lufs FROM tracks WHERE loudness_lufs IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?;
+            rows.collect::<Result<HashMap<_, _>>>()?
+        };
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(
             "DELETE FROM folder_tracks;
@@ -254,8 +260,8 @@ pub fn save_snapshot(db_path: &Path, snapshot: &ScanResult) -> Result<()> {
                 "INSERT INTO tracks (
                     id, artist_id, album_id, name, path, duration, artist, album, format, is_video,
                     cover_path, cover_data, lyrics_path, file_mtime, file_size, meta_title, meta_artist,
-                    genre, bitrate, sample_rate, album_cover_data
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13,?14,?15,?16,?17,?18,?19,NULL)",
+                    genre, bitrate, sample_rate, loudness_lufs, album_cover_data
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13,?14,?15,?16,?17,?18,?19,?20,NULL)",
             )?;
             for artist in &snapshot.artists {
                 ins_artist.execute(rusqlite::params![artist.name, normalize_root(&artist.path)])?;
@@ -269,6 +275,7 @@ pub fn save_snapshot(db_path: &Path, snapshot: &ScanResult) -> Result<()> {
                             t.duration as i64, t.artist, t.album, t.format, t.is_video as i64,
                             t.cover_path, t.lyrics_path, t.file_mtime, t.file_size,
                             t.meta_title, t.meta_artist, t.genre, t.bitrate, t.sample_rate,
+                            t.loudness_lufs.or_else(|| existing_loudness.get(&t.id).copied()),
                         ])?;
                     }
                 }
@@ -311,6 +318,18 @@ pub fn save_snapshot(db_path: &Path, snapshot: &ScanResult) -> Result<()> {
 
 fn normalize_root(p: &str) -> String {
     crate::model::normalize_path(p)
+}
+
+/// 后台响度分析结果写回（单行 UPDATE，不动快照重建链路）
+pub fn set_track_loudness(db_path: &Path, track_id: &str, lufs: f64) -> Result<bool> {
+    with_db(db_path, |conn| {
+        initialize_schema(conn)?;
+        let n = conn.execute(
+            "UPDATE tracks SET loudness_lufs = ?1 WHERE id = ?2",
+            rusqlite::params![lufs, track_id],
+        )?;
+        Ok(n > 0)
+    })
 }
 
 /// 扫描用元数据索引：path → (duration, hasCover, title, artist, mtime, size, genre, bitrate, sampleRate)

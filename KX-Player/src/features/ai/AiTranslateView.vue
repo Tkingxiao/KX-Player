@@ -18,6 +18,21 @@ const testResult = ref('')
 const modelList = ref<string[]>([])
 const fetchingModels = ref(false)
 const modelError = ref('')
+const modelOpen = ref(false)
+const modelFilter = ref('')
+
+/** 已获取的模型按输入过滤（不区分大小写），用于下拉展示 */
+const visibleModels = computed(() => {
+  const q = modelFilter.value.trim().toLowerCase()
+  if (!q) return modelList.value
+  return modelList.value.filter((m) => m.toLowerCase().includes(q))
+})
+
+function pickModel(m: string): void {
+  settings.aiModel = m
+  settings.scheduleSave()
+  modelOpen.value = false
+}
 
 async function fetchModels(): Promise<void> {
   if (!settings.aiBaseURL.trim()) { modelError.value = '请先填写接口地址'; return }
@@ -31,9 +46,14 @@ async function fetchModels(): Promise<void> {
         settings.aiModel = r.models[0]
         settings.scheduleSave()
       }
+      ui.toast(`已获取 ${r.models.length} 个模型`, 'success')
+      modelOpen.value = true
     } else {
       modelError.value = r.error || '未获取到模型'
     }
+  } catch (e) {
+    // 之前只有 try/finally：invoke 失败会被静默吞掉，按钮看起来「无效」
+    modelError.value = String(e)
   } finally {
     fetchingModels.value = false
   }
@@ -271,17 +291,61 @@ onBeforeUnmount(() => { cancelFlag = true })
         <label class="ai-field">
           <span>模型</span>
           <div class="ai-model-row">
-            <input v-model="settings.aiModel" list="fetched-models" @change="settings.scheduleSave()" />
+            <div class="ai-model-combo">
+              <input
+                v-model="settings.aiModel"
+                :placeholder="modelList.length ? '选择或输入模型' : '例如 gpt-4o-mini'"
+                @change="settings.scheduleSave()"
+                @focus="modelOpen = modelList.length > 0"
+              />
+              <button
+                v-if="modelList.length"
+                class="ai-model-toggle"
+                title="展开模型列表"
+                aria-label="展开模型列表"
+                @click="modelOpen = !modelOpen"
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="6,9 12,15 18,9" /></svg>
+              </button>
+            </div>
             <button
               class="btn-ghost ai-model-btn"
               :disabled="fetchingModels || !settings.aiBaseURL.trim()"
-              :title="'从接口获取可用模型列表'"
+              title="从接口获取可用模型列表"
               @click="fetchModels"
             >{{ fetchingModels ? '获取中…' : '获取模型' }}</button>
           </div>
-          <datalist id="fetched-models">
-            <option v-for="m in modelList" :key="m" :value="m" />
-          </datalist>
+
+          <!-- 模型下拉：完整列出，可滚动、可过滤（替代原生 datalist 的截断显示） -->
+          <Transition name="pop-scale">
+            <div v-if="modelOpen && modelList.length" class="ai-model-menu">
+              <div class="ai-model-menu-head">
+                <input
+                  v-model="modelFilter"
+                  class="ai-model-search"
+                  type="text"
+                  placeholder="过滤模型…"
+                  aria-label="过滤模型"
+                />
+                <span class="ai-model-count tnum">{{ visibleModels.length }}/{{ modelList.length }}</span>
+              </div>
+              <div class="ai-model-list">
+                <button
+                  v-for="m in visibleModels"
+                  :key="m"
+                  class="ai-model-item"
+                  :class="{ active: m === settings.aiModel }"
+                  :title="m"
+                  @click="pickModel(m)"
+                >
+                  <span class="ai-model-name">{{ m }}</span>
+                  <svg v-if="m === settings.aiModel" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.6"><polyline points="20,6 9,17 4,12" /></svg>
+                </button>
+                <div v-if="!visibleModels.length" class="ai-model-empty">没有匹配的模型</div>
+              </div>
+            </div>
+          </Transition>
+
           <span v-if="modelError" class="ai-field-error">{{ modelError }}</span>
         </label>
         <label class="ai-field">
@@ -545,9 +609,107 @@ onBeforeUnmount(() => { cancelFlag = true })
   gap: 6px;
   align-items: center;
 }
-.ai-model-row input { flex: 1; min-width: 0; }
+/* 输入框 + 展开箭头组合（占满剩余宽度） */
+.ai-model-combo {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+.ai-model-combo input {
+  flex: 1;
+  min-width: 0;
+  padding-right: 26px;
+}
+.ai-model-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--text-muted);
+}
+.ai-model-toggle:hover { background: var(--bg-hover); color: var(--text); }
 .ai-model-btn { flex-shrink: 0; padding: 6px 10px; font-size: 11px; }
 .ai-field-error { font-size: 10.5px; color: #e6685f; }
+
+/* ── 模型下拉列表：完整展示、可滚动、可过滤 ── */
+.ai-field { position: relative; }
+.ai-model-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 60;
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+}
+.ai-model-menu-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.ai-model-search {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px !important;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  font-size: 12px;
+}
+.ai-model-count {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+/* 固定最大高度并滚动，保证长列表每一项都能看到 */
+.ai-model-list {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 5px;
+}
+.ai-model-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-sub);
+  text-align: left;
+}
+.ai-model-item:hover { background: var(--bg-hover); color: var(--text); }
+.ai-model-item.active {
+  color: rgb(var(--accent-rgb));
+  background: var(--bg-selected);
+  font-weight: 500;
+}
+.ai-model-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-model-empty {
+  padding: 14px 10px;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
 
 .ai-dir-check { flex-shrink: 0; accent-color: rgb(var(--accent-rgb)); }
 .ai-dir-arrow { flex-shrink: 0; color: var(--text-muted); font-size: 11px; }

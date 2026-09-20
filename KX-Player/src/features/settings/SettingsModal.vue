@@ -2,12 +2,25 @@
 /** 设置中心：主题 / 主题色（HSV 取色器+预设）/ 三处透明度 / 背景图（选择、缩放、拖拽、模糊、明度自适应）/ 快捷键开关。 */
 import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
+import { usePlayerStore } from '@/stores/player'
+import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
-import { api } from '@/bridge/ipc'
+import { api, assetUrl } from '@/bridge/ipc'
 import { hexToHsv, hsvToHex } from '@/utils/color'
 
 const settings = useSettingsStore()
+const player = usePlayerStore()
+const library = useLibraryStore()
 const ui = useUiStore()
+
+// ── 响度分析（后台 ffmpeg ebur128）──
+const missingLoudnessCount = computed(() => library.allTracks.filter((t) => t.loudnessLufs == null).length)
+const loudnessPct = computed(() =>
+  library.loudnessScan.total > 0 ? Math.round((library.loudnessScan.completed / library.loudnessScan.total) * 100) : 0,
+)
+function startLoudness(): void {
+  if (!library.startLoudnessAnalysis(true)) ui.toast('没有待分析的条目', 'info')
+}
 
 const PRESETS = ['#7c6cf6', '#e63a2e', '#e67e22', '#f1c40f', '#2ecc71', '#1abc9c', '#3498db', '#e84393']
 
@@ -121,9 +134,46 @@ onMounted(() => {
 })
 
 // ── 背景图 ──
+/** 适配方式：与 CSS object-fit 语义对齐 */
+const BG_FIT_MODES = [
+  { value: 'cover', label: '填充', hint: '等比缩放铺满，裁掉溢出部分（默认）' },
+  { value: 'contain', label: '适应', hint: '等比缩放到完整可见，可能留白' },
+  { value: 'stretch', label: '拉伸', hint: '拉伸到窗口尺寸，不保持比例' },
+  { value: 'center', label: '居中', hint: '原始尺寸居中显示，不缩放' },
+  { value: 'tile', label: '平铺', hint: '以原始尺寸重复平铺' },
+] as const
+// 必须走 asset 协议（convertFileSrc）：CSP 的 img-src 不允许 file://，否则 <img> 显示破图图标。
 const bgUrl = computed(() => {
   if (!settings.bgPath) return null
-  return 'file:///' + settings.bgPath.replace(/\\/g, '/').replace(/^\/+/, '') + '?v=' + settings.bgMtime
+  const base = assetUrl(settings.bgPath)
+  if (!base) return null
+  return base + '?v=' + settings.bgMtime
+})
+
+/** 预览样式：与主界面背景层保持一致（适配方式 + 透明度 + 模糊 + 缩放平移） */
+const bgPreviewStyle = computed<Record<string, string>>(() => {
+  const fit = settings.bgSize
+  const style: Record<string, string> = {
+    opacity: String(Math.max(0, Math.min(1, 1 - settings.ovl))),
+    filter: settings.bgBlur > 0 ? `blur(${settings.bgBlur}px)` : '',
+  }
+  if (fit === 'stretch') style.objectFit = 'fill'
+  else if (fit === 'contain') style.objectFit = 'contain'
+  else if (fit === 'cover') style.objectFit = 'cover'
+  else if (fit === 'center') { style.objectFit = 'none'; style.objectPosition = 'center' }
+  else if (fit === 'tile') {
+    style.objectFit = 'none'
+    style.objectRepeat = 'repeat'
+    style.width = 'auto'
+    style.height = 'auto'
+    style.minWidth = '100%'
+    style.minHeight = '100%'
+  }
+  const e = settings.imgEditState
+  if (e && fit !== 'tile' && fit !== 'center') {
+    style.transform = `translate(${(e.posX - 50) * 0.8}%, ${(e.posY - 50) * 0.8}%) scale(${e.zoomPct / 100})`
+  }
+  return style
 })
 
 async function pickBg(): Promise<void> {
@@ -133,14 +183,20 @@ async function pickBg(): Promise<void> {
     settings.bgMtime = picked.mtime ?? Date.now()
     settings.imgEditState = null
     settings.scheduleSave()
+    settings.flushOnExit()
   }
 }
 
 async function removeBg(): Promise<void> {
   await api.removeBgImage()
   settings.bgPath = ''
+  // 清空 mtime：否则残留的 ?v= 会让派生 URL 看似未变，UI 不刷新
+  settings.bgMtime = 0
   settings.imgEditState = null
+  ui.bgEditorOpen = false
   settings.scheduleSave()
+  // 立刻同步落盘，避免「重启后背景图还在」
+  settings.flushOnExit()
 }
 
 // ── 明度自适应（背景图改变时重采样）──
@@ -245,17 +301,59 @@ const themeRows = [
               </div>
             </section>
 
+            <section class="set-section">
+              <h3 class="section-title">播放</h3>
+              <label class="check-row">
+                <input
+                  v-model="settings.loudnessEnabled"
+                  type="checkbox"
+                  @change="player.applyLoudnessGain(settings.loudnessTarget); settings.scheduleSave()"
+                />
+                响度均衡
+              </label>
+              <div class="slider-row" :class="{ disabled: !settings.loudnessEnabled }">
+                <span class="slider-label">目标响度</span>
+                <input
+                  v-model.number="settings.loudnessTarget"
+                  type="range"
+                  min="-30"
+                  max="-12"
+                  step="1"
+                  :disabled="!settings.loudnessEnabled"
+                  @input="player.applyLoudnessGain(settings.loudnessTarget); settings.scheduleSave()"
+                />
+                <span class="slider-val tnum">{{ settings.loudnessTarget }} LUFS</span>
+              </div>
+              <p class="set-hint">仅对已分析出响度的条目自动调整；未分析条目保持原音量。</p>
+              <div class="loudness-row">
+                <template v-if="!library.loudnessScan.active">
+                  <button class="btn-ghost" @click="startLoudness">
+                    分析缺失响度（{{ missingLoudnessCount }} 条）
+                  </button>
+                  <span v-if="!missingLoudnessCount" class="set-hint">全部条目已分析</span>
+                </template>
+                <template v-else>
+                  <div class="loudness-progress">
+                    <div class="loudness-bar">
+                      <div class="loudness-bar-fill" :style="{ width: loudnessPct + '%' }" />
+                    </div>
+                    <span class="tnum">{{ library.loudnessScan.completed }}/{{ library.loudnessScan.total }}</span>
+                    <button class="btn-ghost" @click="library.cancelLoudnessAnalysis()">取消</button>
+                  </div>
+                  <p class="set-hint loudness-current" :title="library.loudnessScan.current">
+                    {{ library.loudnessScan.current || '分析中…' }}
+                  </p>
+                </template>
+              </div>
+            </section>
+
             <!-- 背景图 -->
             <section class="set-section">
               <h3 class="section-title">背景图</h3>
               <div class="bg-row">
                 <div class="bg-preview">
-                  <img v-if="bgUrl" :src="bgUrl" alt="" :style="{
-                    transform: `translate(${((settings.imgEditState?.posX ?? 50) - 50) * 0.8}%, ${((settings.imgEditState?.posY ?? 50) - 50) * 0.8}%) scale(${(settings.imgEditState?.zoomPct ?? 100) / 100})`,
-                    filter: `blur(${settings.bgBlur}px)`,
-                  }" />
+                  <img v-if="bgUrl" :src="bgUrl" alt="" :style="bgPreviewStyle" />
                   <span v-else class="bg-empty">未设置背景图</span>
-                  <div class="bg-overlay-preview" :style="{ background: `rgba(0,0,0,${settings.ovl})` }" />
                 </div>
                 <div class="bg-controls">
                   <div class="bg-btns">
@@ -264,9 +362,24 @@ const themeRows = [
                     <button v-if="bgUrl" class="btn-ghost" @click="removeBg">移除</button>
                   </div>
                   <template v-if="bgUrl">
+                    <!-- 适配方式：拉伸 / 填充 / 居中 / 平铺 / 适应 -->
+                    <div class="bg-fit-row">
+                      <span class="slider-label">适配</span>
+                      <div class="bg-fit-modes">
+                        <button
+                          v-for="m in BG_FIT_MODES"
+                          :key="m.value"
+                          class="bg-fit-btn"
+                          :class="{ active: settings.bgSize === m.value }"
+                          :title="m.hint"
+                          @click="settings.bgSize = m.value; settings.scheduleSave()"
+                        >{{ m.label }}</button>
+                      </div>
+                    </div>
                     <div class="slider-row compact">
-                      <span class="slider-label">遮罩</span>
+                      <span class="slider-label">透明度</span>
                       <input type="range" min="0" max="0.9" step="0.01" :value="settings.ovl" @input="settings.ovl = Number(($event.target as HTMLInputElement).value); settings.scheduleSave()" />
+                      <span class="slider-val tnum">{{ Math.round(settings.ovl * 100) }}%</span>
                     </div>
                     <div class="slider-row compact">
                       <span class="slider-label">模糊</span>
@@ -330,6 +443,7 @@ const themeRows = [
   display: block;
   margin-bottom: 10px;
 }
+.slider-row.disabled { opacity: 0.5; }
 
 .theme-switch { display: flex; gap: 8px; }
 .theme-opt {
@@ -445,11 +559,6 @@ const themeRows = [
   object-fit: cover;
   pointer-events: none;
 }
-.bg-overlay-preview {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
 .bg-empty { font-size: 11px; color: var(--text-muted); }
 .bg-controls {
   flex: 1;
@@ -460,10 +569,70 @@ const themeRows = [
 }
 .bg-controls .slider-row { width: 100%; }
 .bg-controls .slider-row .slider-label { width: 48px; }
+
+/* 适配方式选择栏 */
+.bg-fit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.bg-fit-row .slider-label { width: 48px; flex-shrink: 0; }
+.bg-fit-modes {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.bg-fit-btn {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-sub);
+}
+.bg-fit-btn:hover { border-color: var(--border-strong); color: var(--text); }
+.bg-fit-btn.active {
+  border-color: rgb(var(--accent-rgb));
+  color: rgb(var(--accent-rgb));
+  background: var(--bg-selected);
+}
 .set-hint {
   margin-top: 10px;
   font-size: 11px;
   color: var(--text-muted);
+}
+
+.loudness-row {
+  margin-top: 10px;
+}
+.loudness-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.loudness-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-input);
+  overflow: hidden;
+}
+.loudness-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: rgb(var(--accent-rgb));
+  transition: width var(--dur-fast) var(--ease);
+}
+.loudness-progress .tnum {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.loudness-current {
+  margin-top: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .check-row {

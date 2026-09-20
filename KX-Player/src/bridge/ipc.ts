@@ -1,6 +1,6 @@
 /** 唯一 IPC 出口：所有 Rust 后端调用都经此模块（Tauri invoke + asset URL 转换）。 */
 import { invoke as tauriInvoke, convertFileSrc } from '@tauri-apps/api/core'
-import type { AppApi, ScanResult, Track, FolderNode, Bookmark, BgImageData, PlayProgress, AudioDevice, DirEntry, Category, Tag, TagSuggestion } from '@/contracts/api'
+import type { AppApi, ScanResult, Track, FolderNode, Bookmark, BgImageData, PlayProgress, AudioDevice, DirEntry, Category, Tag, TagSuggestion, SubtitleTrack, FfmpegInfo, ConvertItem, MpvPlayerState } from '@/contracts/api'
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return tauriInvoke<T>(cmd, args)
@@ -57,6 +57,7 @@ export const api: AppApi = {
   openAudioFiles: () => invoke<string[]>('open_audio_files'),
   scanFoldersWithProgress: (p) => invoke<ScanResult | null>('scan_folders', { paths: p }).then(decorateScan),
   scanFoldersIncremental: (p) => invoke<ScanResult | null>('scan_folders_incremental', { paths: p }).then(decorateScan),
+  startupSync: (p) => invoke<ScanResult | null>('startup_sync', { paths: p }).then(decorateScan),
   removeFolder: (fp, rp) => invoke<ScanResult | null>('remove_folder', { folderPath: fp, remainingPaths: rp }).then(decorateScan),
   loadLibrary: () => invoke<ScanResult | null>('load_library').then(decorateScan),
   loadLibraryFast: () => invoke<ScanResult | null>('load_library_fast').then(decorateScan),
@@ -117,10 +118,16 @@ export const api: AppApi = {
   removeBgImage: () => invoke<boolean>('remove_bg_image'),
   toolsSaveFile: (p, b) => invoke<boolean>('tools_save_file', { path: p, base64Data: b }),
   ffmpegExec: (a) => invoke<{ code: number; stdout?: string; stderr?: string }>('ffmpeg_exec', { args: a }),
+  ffmpegProbe: () =>
+    invoke<FfmpegInfo>('ffmpeg_probe').catch(() => ({ available: false, path: null, version: null })),
+  convertRun: (items: ConvertItem[]) => invoke<number>('convert_run', { items }).catch(() => 0),
+  convertCancel: (taskId: number) => invoke<boolean>('convert_cancel', { taskId }).catch(() => false),
+  // 注意：Tauri 会把 Rust 参数 base_url 归一化为 baseUrl（serde camelCase 同理），
+  // 传 baseURL 会因缺参数直接反序列化失败——这里统一在边界做映射。
   aiChat: (payload) =>
     invoke<{ ok: boolean; content: string; error?: string }>('ai_chat', {
       payload: {
-        baseURL: payload.baseURL,
+        baseUrl: payload.baseURL,
         apiKey: payload.apiKey,
         model: payload.model,
         messages: payload.messages,
@@ -129,11 +136,11 @@ export const api: AppApi = {
     }),
   aiPing: (payload) =>
     invoke<{ ok: boolean; message: string }>('ai_ping', {
-      payload: { baseURL: payload.baseURL, apiKey: payload.apiKey, model: payload.model },
+      payload: { baseUrl: payload.baseURL, apiKey: payload.apiKey, model: payload.model },
     }),
   aiListModels: (payload) =>
     invoke<{ ok: boolean; models: string[]; error?: string }>('ai_list_models', {
-      baseURL: payload.baseURL,
+      baseUrl: payload.baseURL,
       apiKey: payload.apiKey,
     }),
   renameDir: async (oldPath, newPath) => {
@@ -187,9 +194,48 @@ export const api: AppApi = {
       h: Math.round(rect.h),
       visible: rect.visible,
     }).catch(() => false),
+  playerGetState: () => invoke<MpvPlayerState>('player_get_state').catch(() => ({
+    playing: false, position: 0, duration: 0, speed: 1, volume: 85, muted: false,
+    trackPath: null, isVideo: false, videoActive: false,
+  })),
+  pipOpen: (x, y, w, h) =>
+    invoke<boolean>('pip_open', { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) }).catch(() => false),
+  pipClose: () => invoke<boolean>('pip_close').catch(() => false),
+  onPipClosed: (cb) => onEvent('pip:closed', cb),
+  onPipPinned: (cb) => onEvent<boolean>('pip:pinned', cb),
+  pipSetPinned: (pinned) => invoke<boolean>('pip_set_pinned', { pinned }).catch(() => false),
   playerListDevices: () => invoke<AudioDevice[]>('player_list_devices').catch(() => []),
   playerSetDevice: (deviceId) => invoke<boolean>('player_set_device', { deviceId }).catch(() => false),
   toggleFullscreen: () => invoke<boolean>('toggle_fullscreen').catch(() => false),
+
+  // ── 字幕（mpv + libass）──
+  playerSubtitleTracks: () => invoke<SubtitleTrack[]>('player_subtitle_tracks').catch(() => []),
+  playerSetSubtitleTrack: (id) => invoke<boolean>('player_set_subtitle_track', { id }).catch(() => false),
+  playerSetSubtitleVisible: (visible) =>
+    invoke<boolean>('player_set_subtitle_visible', { visible }).catch(() => false),
+  playerSetSubtitleDelay: (sec) => invoke<boolean>('player_set_subtitle_delay', { sec }).catch(() => false),
+  playerSetSubStyle: (style) =>
+    invoke<boolean>('player_set_sub_style', {
+      style: {
+        font: style.font,
+        fontSize: style.fontSize,
+        color: style.color,
+        borderColor: style.borderColor,
+        borderSize: style.borderSize,
+        shadowOffset: style.shadowOffset,
+        pos: style.pos,
+      },
+    }).catch(() => false),
+  playerApplyLoudnessGain: (trackLufs, targetLufs) =>
+    invoke<boolean>('player_apply_loudness_gain', {
+      trackLufs,
+      targetLufs,
+    }).catch(() => false),
+
+  // ── 后台响度分析（任务 + loudness:progress 事件）──
+  analyzeLoudness: (tracks: [string, string][]) =>
+    invoke<boolean>('analyze_loudness', { tracks }).catch(() => false),
+  cancelLoudness: () => invoke<boolean>('cancel_loudness').catch(() => false),
 
   // ── 分类与标签 ──
   taxonomyListCategories: () => invoke<Category[]>('taxonomy_list_categories').catch(() => []),
@@ -205,6 +251,7 @@ export const api: AppApi = {
     invoke<boolean>('taxonomy_unassign_category', { categoryId, trackIds }).catch(() => false),
   taxonomyListTags: () => invoke<Tag[]>('taxonomy_list_tags').catch(() => []),
   taxonomyUpsertTag: (name, color, kind) => invoke<Tag | null>('taxonomy_upsert_tag', { name, color, kind }).catch(() => null),
+  taxonomyRenameTag: (id, name) => invoke<void>('taxonomy_rename_tag', { id, name }).then(() => true).catch(() => false),
   taxonomyDeleteTag: (id) => invoke<boolean>('taxonomy_delete_tag', { id }).catch(() => false),
   taxonomyTagTracks: (tagIds, trackIds, mode) =>
     invoke<boolean>('taxonomy_tag_tracks', { tagIds, trackIds, mode: mode ?? 'add' }).catch(() => false),

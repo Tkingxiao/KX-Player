@@ -81,12 +81,36 @@ export const useTaxonomyStore = defineStore('taxonomy', () => {
   }
 
   async function renameCategory(id: number, name: string): Promise<void> {
-    if (await api.taxonomyRenameCategory(id, name)) await refresh()
+    if (await api.taxonomyRenameCategory(id, name)) {
+      await refresh()
+    } else {
+      ui.toast('分类重命名失败，名称可能已存在', 'error')
+    }
   }
 
   async function deleteCategory(id: number): Promise<void> {
     if (await api.taxonomyDeleteCategory(id)) {
-      if (ui.categoryId === id) ui.categoryId = null
+      // 当前筛选命中的分类（或其子孙）被删除时，清空分类筛选，避免悬空 id 导致结果恒为空
+      if (ui.categoryId !== null) {
+        const doomed = new Set<number>([id])
+        const collect = (nodes: Category[]): void => {
+          for (const n of nodes) {
+            doomed.add(n.id)
+            collect(n.children)
+          }
+        }
+        const findNode = (nodes: Category[]): Category | null => {
+          for (const n of nodes) {
+            if (n.id === id) return n
+            const hit = findNode(n.children)
+            if (hit) return hit
+          }
+          return null
+        }
+        const target = findNode(categories.value)
+        if (target) collect(target.children)
+        if (doomed.has(ui.categoryId)) ui.categoryId = null
+      }
       ui.toast('已删除分类', 'success')
       await refresh()
     }
@@ -116,8 +140,21 @@ export const useTaxonomyStore = defineStore('taxonomy', () => {
 
   async function upsertTag(name: string, color?: string | null): Promise<Tag | null> {
     const t = await api.taxonomyUpsertTag(name, color ?? null)
-    if (t) await refresh()
+    if (t) {
+      await refresh()
+    } else {
+      ui.toast('新建标签失败', 'error')
+    }
     return t
+  }
+
+  async function renameTag(id: number, name: string): Promise<void> {
+    if (await api.taxonomyRenameTag(id, name)) {
+      ui.toast(`已重命名为「${name.trim()}」`, 'success')
+      await refresh()
+    } else {
+      ui.toast('标签重命名失败，名称可能已存在', 'error')
+    }
   }
 
   async function deleteTag(id: number): Promise<void> {
@@ -147,6 +184,6 @@ export const useTaxonomyStore = defineStore('taxonomy', () => {
     categories, tags, tracksByTag, tracksByCategory, flatCategories, loaded,
     refresh, tagsOfTrack, createCategory, renameCategory, deleteCategory,
     assignCategory, unassignCategory, tagTracks, untagTracks,
-    upsertTag, deleteTag, suggestTags, applySuggested,
+    upsertTag, renameTag, deleteTag, suggestTags, applySuggested,
   }
 })

@@ -14,15 +14,17 @@ export interface BgEditState {
 export const useSettingsStore = defineStore('settings', () => {
   // ── 外观 ──
   const theme = ref<'dark' | 'light'>('dark')
-  const clr = ref('#7c6cf6')
+  const clr = ref('#e63a2e')
   const titlebarOpacity = ref(0.72)
   const sidebarOpacity = ref(0.8)
   const playerOpacity = ref(0.9)
+  /** 背景图不透明度（1 = 完全不透明，0 = 完全透明）。语义为「透明度」而非黑色遮罩。 */
   const ovl = ref(0.4)
   const bgBlur = ref(0)
   const bgPath = ref('')
   const bgMtime = ref(0)
-  const bgSize = ref<'cover' | 'contain'>('cover')
+  /** 背景图适配方式：拉伸 / 填充 / 居中 / 平铺 / 适应 */
+  const bgSize = ref<'stretch' | 'cover' | 'center' | 'tile' | 'contain'>('cover')
   const imgEditState = ref<BgEditState | null>(null)
 
   // ── 播放偏好 ──
@@ -42,8 +44,14 @@ export const useSettingsStore = defineStore('settings', () => {
   const folderView = ref<'grid' | 'list'>('grid')
   const folderSort = ref<'name' | 'mtime' | 'count'>('name')
   const folderSortDir = ref<'asc' | 'desc'>('asc')
+  /** 智能集合/列表视图排序（默认名称 A-Z） */
+  const trackSort = ref<'name' | 'artist' | 'duration' | 'mtime' | 'playedAt'>('name')
+  const trackSortDir = ref<'asc' | 'desc'>('asc')
   const folderStack = ref<string[]>([])
   const gridSize = ref<132 | 176 | 220>(176)
+  const sidebarCollapsed = ref(false)
+  const loudnessTarget = ref(-23)
+  const loudnessEnabled = ref(false)
 
   // ── AI 翻译（API Key 仅存内存，不落盘）──
   const aiBaseURL = ref('')
@@ -65,7 +73,9 @@ export const useSettingsStore = defineStore('settings', () => {
       keyboardEnabled: keyboardEnabled.value,
       recents: recents.value, favs: favs.value, pls: pls.value,
       folderView: folderView.value, folderSort: folderSort.value, folderSortDir: folderSortDir.value,
-      folderStack: folderStack.value, gridSize: gridSize.value,
+      folderStack: folderStack.value, gridSize: gridSize.value, sidebarCollapsed: sidebarCollapsed.value,
+      trackSort: trackSort.value, trackSortDir: trackSortDir.value,
+      loudnessEnabled: loudnessEnabled.value, loudnessTarget: loudnessTarget.value,
       aiBaseURL: aiBaseURL.value, aiModel: aiModel.value,
       sidebarWidth: sidebarWidth.value, inspectorWidth: inspectorWidth.value,
       _v: 2,
@@ -99,11 +109,13 @@ export const useSettingsStore = defineStore('settings', () => {
     }
     const rawTheme = String(s.theme ?? 'dark')
     theme.value = rawTheme === 'light' ? 'light' : 'dark'
-    clr.value = g('clr', '#7c6cf6')
+    clr.value = g('clr', '#e63a2e')
     ovl.value = ratio('ovl', 0.4, 0, 0.9)
     bgPath.value = g('bgPath', '') || ''
     bgMtime.value = g('bgMtime', 0)
-    bgSize.value = g<'cover' | 'contain'>('bgSize', 'cover')
+    bgSize.value = (['stretch', 'cover', 'center', 'tile', 'contain'] as const).includes(String(s.bgSize) as never)
+      ? (String(s.bgSize) as 'stretch' | 'cover' | 'center' | 'tile' | 'contain')
+      : 'cover'
     bgBlur.value = ratio('bgBlur', 0, 0, 40)
     imgEditState.value = g<BgEditState | null>('_imgEditState', null)
     titlebarOpacity.value = ratio('titlebarOpacity', 0.72, 0.2, 1)
@@ -126,6 +138,15 @@ export const useSettingsStore = defineStore('settings', () => {
     folderSort.value = (['name', 'mtime', 'count'] as const).includes(rawSort as never) ? (rawSort as 'name' | 'mtime' | 'count') : 'name'
     folderSortDir.value = String(s.folderSortDir ?? 'asc') === 'desc' ? 'desc' : 'asc'
     folderStack.value = g('folderStack', [])
+    const rawTrackSort = String(s.trackSort ?? 'name')
+    trackSort.value = (['name', 'artist', 'duration', 'mtime', 'playedAt'] as const).includes(rawTrackSort as never)
+      ? (rawTrackSort as 'name' | 'artist' | 'duration' | 'mtime' | 'playedAt')
+      : 'name'
+    trackSortDir.value = String(s.trackSortDir ?? 'asc') === 'desc' ? 'desc' : 'asc'
+    sidebarCollapsed.value = !!g('sidebarCollapsed', false)
+    loudnessEnabled.value = !!g('loudnessEnabled', false)
+    const rawLoudnessTarget = Number(s.loudnessTarget ?? -23)
+    loudnessTarget.value = isFinite(rawLoudnessTarget) ? Math.max(-30, Math.min(-12, rawLoudnessTarget)) : -23
     const rawGrid = Number(s.gridSize ?? 176)
     gridSize.value = (rawGrid === 132 || rawGrid === 220 ? rawGrid : 176) as 132 | 176 | 220
     aiBaseURL.value = String(s.aiBaseURL ?? '')
@@ -150,7 +171,9 @@ export const useSettingsStore = defineStore('settings', () => {
     ovl, bgBlur, bgPath, bgMtime, bgSize, imgEditState,
     vol, muted, mode, speed, devId, keyboardEnabled,
     recents, favs, pls,
-    folderView, folderSort, folderSortDir, folderStack, gridSize,
+    folderView, folderSort, folderSortDir, folderStack, gridSize, sidebarCollapsed,
+    trackSort, trackSortDir,
+    loudnessEnabled, loudnessTarget,
     aiBaseURL, aiModel,
     sidebarWidth, inspectorWidth,
     load, scheduleSave, flushOnExit,

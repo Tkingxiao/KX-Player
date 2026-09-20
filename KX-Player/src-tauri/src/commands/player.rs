@@ -1,7 +1,7 @@
 //! 命令层：播放控制（前端遥控器 → mpv）。
 
-use crate::model::{AudioDevice, PlayerState};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use crate::model::{AudioDevice, PlayerState, SubtitleTrack, SubStyle};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::player::PlayerCore;
 use crate::state::AppWindowsState;
@@ -89,6 +89,64 @@ pub async fn player_set_video_enabled(app: AppHandle, enabled: bool) -> Result<(
         .unwrap_or(Err("任务失败".into()))
 }
 
+// ── 字幕子系统（mpv 自带 libass，这里做属性遥控）──
+
+#[tauri::command]
+pub async fn player_subtitle_tracks(app: AppHandle) -> Vec<SubtitleTrack> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || app2.state::<PlayerCore>().subtitle_tracks())
+        .await
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn player_set_subtitle_track(app: AppHandle, id: i64) -> Result<(), String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || app2.state::<PlayerCore>().set_subtitle_track(id))
+        .await
+        .unwrap_or(Err("任务失败".into()))
+}
+
+#[tauri::command]
+pub async fn player_set_subtitle_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || app2.state::<PlayerCore>().set_subtitle_visible(visible))
+        .await
+        .unwrap_or(Err("任务失败".into()))
+}
+
+#[tauri::command]
+pub async fn player_set_subtitle_delay(app: AppHandle, sec: f64) -> Result<(), String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app2.state::<PlayerCore>().set_subtitle_delay(sec.clamp(-600.0, 600.0))
+    })
+    .await
+    .unwrap_or(Err("任务失败".into()))
+}
+
+#[tauri::command]
+pub async fn player_set_sub_style(app: AppHandle, style: SubStyle) -> Result<(), String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || app2.state::<PlayerCore>().set_sub_style(style))
+        .await
+        .unwrap_or(Err("任务失败".into()))
+}
+
+#[tauri::command]
+pub async fn player_apply_loudness_gain(
+    app: AppHandle,
+    track_lufs: Option<f64>,
+    target_lufs: f64,
+) -> Result<(), String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app2.state::<PlayerCore>().apply_loudness_gain(track_lufs, target_lufs)
+    })
+    .await
+    .unwrap_or(Err("任务失败".into()))
+}
+
 /// 舞台几何：只投递命令（不阻塞），Win32 操作由 kx-stage 线程执行
 #[tauri::command]
 pub async fn player_set_stage_rect(
@@ -140,4 +198,68 @@ pub fn app_force_quit(app: tauri::AppHandle, state: State<'_, AppWindowsState>) 
         crate::fftools::kill_all();
         app.exit(0);
     });
+}
+
+// ── 独立悬浮窗（画中画）──────────────────────────────────────
+// 悬浮窗是独立的系统窗口（label="pip"），mpv 覆盖窗口动态挂靠到它上面：
+// 几何由 pip 窗口内的 PipRoot 以「相对 pip 客户区」的物理像素下发，
+// 与主窗口舞台互斥（挂靠时主窗口不再下发舞台矩形）。
+
+/// 打开/显示独立悬浮窗。x/y/w/h 为物理像素；窗口复用（首次创建后只显示+定位）。
+#[tauri::command]
+pub async fn pip_open(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> bool {
+    let pip = match app.get_webview_window("pip") {
+        Some(win) => win,
+        None => match WebviewWindowBuilder::new(
+            &app,
+            "pip",
+            WebviewUrl::App("index.html#/pip".into()),
+        )
+        .title("KX 悬浮窗")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(true)
+        .min_inner_size(200.0, 150.0)
+        .focused(false)
+        .build()
+        {
+            Ok(win) => win,
+            Err(e) => {
+                crate::paths::append_log(&format!("[pip] 创建悬浮窗失败: {e}"));
+                return false;
+            }
+        },
+    };
+    let _ = pip.show();
+    let _ = pip.set_position(tauri::PhysicalPosition::new(x, y));
+    let _ = pip.set_size(tauri::PhysicalSize::new(w, h));
+    let hwnd = pip.hwnd().ok().map(|h| h.0 as isize);
+    let player = app.state::<PlayerCore>();
+    player.attach_overlay(hwnd);
+    // 通知 pip 窗口内的 PipRoot：窗口已显示，重新对齐 mpv 覆盖窗口
+    let _ = app.emit("pip:shown", ());
+    true
+}
+
+/// 关闭/隐藏悬浮窗，mpv 覆盖窗口挂回主窗口。
+#[tauri::command]
+pub async fn pip_close(app: AppHandle) -> bool {
+    {
+        let player = app.state::<PlayerCore>();
+        player.attach_overlay(None);
+    }
+    if let Some(pip) = app.get_webview_window("pip") {
+        let _ = pip.hide();
+    }
+    let _ = app.emit("pip:closed", ());
+    true
+}
+
+/// 钉住状态变更（pip 窗口内切换时同步到主窗口）
+#[tauri::command]
+pub async fn pip_set_pinned(app: AppHandle, pinned: bool) -> bool {
+    let _ = app.emit("pip:pinned", pinned);
+    true
 }

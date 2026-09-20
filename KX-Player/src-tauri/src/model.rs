@@ -33,6 +33,8 @@ pub struct Track {
     pub bitrate: Option<i64>,
     pub sample_rate: Option<i64>,
     #[serde(default)]
+    pub loudness_lufs: Option<f64>,
+    #[serde(default)]
     pub album_cover_data: Option<String>,
 }
 
@@ -156,6 +158,16 @@ pub struct AiModelsResult {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct SubtitleTrack {
+    /// mpv 轨 id（<=0 表示「关闭字幕」）
+    pub id: i64,
+    pub title: String,
+    pub lang: String,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct PlayerState {
     pub playing: bool,
     pub position: f64,
@@ -166,4 +178,17 @@ pub struct PlayerState {
     pub track_path: Option<String>,
     pub is_video: bool,
     pub video_active: bool,
+}
+
+/// 字幕样式（mpv sub-* 属性遥控）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubStyle {
+    pub font: Option<String>,
+    pub font_size: Option<f64>,
+    pub color: Option<String>,
+    pub border_color: Option<String>,
+    pub border_size: Option<f64>,
+    pub shadow_offset: Option<f64>,
+    pub pos: Option<f64>,
 }

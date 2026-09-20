@@ -8,7 +8,7 @@ use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Format, Mpv};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, WebviewWindow};
@@ -23,6 +23,8 @@ pub struct PlayerCore {
     last_emit_ms: AtomicU64,
     /// 最后已知的舞台矩形（主窗口移动/缩放/聚焦时用于重放）
     last_rect: parking_lot::Mutex<Option<embed::StageRect>>,
+    /// 覆盖窗口当前是否挂靠在独立悬浮窗（pip）上
+    pip_active: AtomicBool,
 }
 
 impl PlayerCore {
@@ -39,6 +41,7 @@ impl PlayerCore {
             })),
             last_emit_ms: AtomicU64::new(0),
             last_rect: parking_lot::Mutex::new(None),
+            pip_active: AtomicBool::new(false),
         }
     }
 
@@ -166,8 +169,98 @@ impl PlayerCore {
         Ok(())
     }
 
+    /// 字幕轨列表（id / 标题 / 语言），mpv 的 track-list 是字典数组
+    pub fn subtitle_tracks(&self) -> Vec<crate::model::SubtitleTrack> {
+        let mpv = match self.mpv.get() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        // track-list 是节点数组，字符串化后不易解析；改用 sid 探测 + 逐个取属性更稳，
+        // 这里用 mpv 的 "track-list/count" + "/N/id|title|lang" 属性路径读取。
+        let count: i64 = mpv.get_property("track-list/count").unwrap_or(0);
+        let mut out = Vec::new();
+        for i in 0..count.max(0) {
+            let type_: String = match mpv.get_property(&format!("track-list/{i}/type")) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if type_ != "sub" {
+                continue;
+            }
+            let id: i64 = mpv.get_property(&format!("track-list/{i}/id")).unwrap_or(0);
+            let title: String = mpv.get_property(&format!("track-list/{i}/title")).unwrap_or_default();
+            let lang: String = mpv.get_property(&format!("track-list/{i}/lang")).unwrap_or_default();
+            let selected: bool = mpv.get_property(&format!("track-list/{i}/selected")).unwrap_or(false);
+            out.push(crate::model::SubtitleTrack {
+                id,
+                title: if title.is_empty() { format!("字幕 {id}") } else { title },
+                lang,
+                selected,
+            });
+        }
+        out
+    }
+
+    /// 选择字幕轨（id<=0 表示关闭字幕）
+    pub fn set_subtitle_track(&self, id: i64) -> Result<(), String> {
+        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+        let v = if id > 0 { id.to_string() } else { "no".to_string() };
+        mpv.set_property("sid", v).map_err(mpv_err)?;
+        // 记住选择（mpv 会持久化 sub-visibility）
+        mpv.set_property("sub-visibility", id > 0).map_err(mpv_err)?;
+        Ok(())
+    }
+
+    /// 字幕开关（不改变当前轨）
+    pub fn set_subtitle_visible(&self, visible: bool) -> Result<(), String> {
+        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+        mpv.set_property("sub-visibility", visible).map_err(mpv_err)
+    }
+
+    /// 字幕时间偏移（秒，正=延后显示）
+    pub fn set_subtitle_delay(&self, sec: f64) -> Result<(), String> {
+        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+        mpv.set_property("sub-delay", sec).map_err(mpv_err)
+    }
+
+    /// 字幕样式（mpv sub-* 属性遥控）
+    pub fn set_sub_style(&self, style: crate::model::SubStyle) -> Result<(), String> {
+        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+        if let Some(v) = style.font {
+            mpv.set_property("sub-font", v).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.font_size {
+            mpv.set_property("sub-font-size", v).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.color {
+            mpv.set_property("sub-color", v).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.border_color {
+            mpv.set_property("sub-border-color", v).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.border_size {
+            mpv.set_property("sub-border-size", v).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.shadow_offset {
+            mpv.set_property("sub-shadow-offset", v).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.pos {
+            mpv.set_property("sub-pos", v).map_err(mpv_err)?;
+        }
+        Ok(())
+    }
+
+    /// 响度均衡：volume-gain 叠加在用户音量之上；无分析值时必须清零上一首的增益。
+    pub fn apply_loudness_gain(&self, track_lufs: Option<f64>, target_lufs: f64) -> Result<(), String> {
+        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+        mpv.set_property("volume-gain", loudness_gain_db(track_lufs, target_lufs))
+            .map_err(mpv_err)?;
+        Ok(())
+    }
+
     /// 「仅音频」= vid=no（引擎始终是 mpv，播放位置不丢）
     pub fn set_video_enabled(&self, enabled: bool) -> Result<(), String> {
+
         let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
         mpv.set_property("vid", if enabled { "auto".to_string() } else { "no".to_string() })
             .map_err(mpv_err)?;
@@ -185,6 +278,10 @@ impl PlayerCore {
     }
 
     pub fn set_stage_visible(&self, visible: bool) {
+        // 挂靠在悬浮窗上时，主窗口的可见性不应影响覆盖窗口（悬浮窗独立显示）
+        if !visible && self.pip_active.load(Ordering::SeqCst) {
+            return;
+        }
         let rect = {
             let mut guard = self.last_rect.lock();
             let r = guard.get_or_insert(embed::StageRect { x: 0, y: 0, w: 0, h: 0, visible });
@@ -202,7 +299,11 @@ impl PlayerCore {
     }
 
     /// 主窗口失焦时只隐藏覆盖窗口（矩形状态保留）；聚焦时恢复。
+    /// 悬浮窗挂靠期间不受主窗口焦点影响（浮窗独立于主窗口存在）。
     pub fn focus_changed(&self, focused: bool) {
+        if self.pip_active.load(Ordering::SeqCst) {
+            return;
+        }
         if focused {
             if let Some(rect) = *self.last_rect.lock() {
                 embed::set_stage_rect(rect);
@@ -212,31 +313,57 @@ impl PlayerCore {
         }
     }
 
+    /// 切换覆盖窗口挂靠目标：Some(hwnd)=独立悬浮窗（pip），None=挂回主窗口。
+    /// 同时清空最后矩形——挂靠切换后目标客户区坐标系已变，旧的矩形不再有效，
+    /// 由前端（PipRoot 或舞台）在挂靠完成后重新下发几何。
+    pub fn attach_overlay(&self, target: Option<isize>) {
+        self.pip_active.store(target.is_some(), Ordering::SeqCst);
+        *self.last_rect.lock() = None;
+        embed::attach(target);
+    }
+
+    pub fn is_pip_active(&self) -> bool {
+        self.pip_active.load(Ordering::SeqCst)
+    }
+
     /// 销毁覆盖窗口（应用退出时）
     pub fn destroy_host(&self) {
         embed::destroy();
     }
 
+    /// 输出设备列表访问器（commands/player.rs 的 player_list_devices 调用）。
+    /// 每次调用都重新读取 mpv：mpv 是首次播放时才懒加载的（见 ensure_started），
+    /// 启动期缓存只会拿到单条兜底项，因此这里不做缓存。
     pub fn list_devices(&self) -> Vec<crate::model::AudioDevice> {
+        self.refresh_devices()
+    }
+
+    /// 重新枚举系统输出设备。mpv 的 audio-device-list 是节点数组，
+    /// 字符串化后按 `,` / `/` 切分会把多设备列表解析错（描述文本本身可能含逗号或斜杠），
+    /// 因此改用 "audio-device-list/count" + "/N/name|description" 属性路径逐个读取，
+    /// 与 subtitle_tracks() 读 track-list 的方式一致。
+    pub fn refresh_devices(&self) -> Vec<crate::model::AudioDevice> {
         let mpv = match self.mpv.get() {
             Some(m) => m,
             None => return vec![default_device()],
         };
-        let raw: String = match mpv.get_property("audio-device-list") {
-            Ok(s) => s,
-            Err(_) => return vec![default_device()],
-        };
-        // mpv 的字符串化格式：name1/desc1,name2/desc2,...
-        let mut devices = vec![default_device()];
-        for pair in raw.split(',') {
-            if let Some((name, desc)) = pair.split_once('/') {
-                if name == "auto" || name.is_empty() {
-                    continue;
-                }
-                devices.push(crate::model::AudioDevice { device_id: name.to_string(), label: desc.to_string() });
+        let count: i64 = mpv.get_property("audio-device-list/count").unwrap_or(0);
+        let mut devices: Vec<crate::model::AudioDevice> = Vec::new();
+        for i in 0..count.max(0) {
+            let name: String = mpv.get_property(&format!("audio-device-list/{i}/name")).unwrap_or_default();
+            let name = name.trim().to_string();
+            if name.is_empty() || devices.iter().any(|d| d.device_id == name) {
+                continue;
             }
+            let desc: String = match mpv.get_property::<String>(&format!("audio-device-list/{i}/description")) {
+                Ok(v) => v.trim().to_string(),
+                Err(_) => String::new(),
+            };
+            let label = if desc.is_empty() { name.clone() } else { desc };
+            devices.push(crate::model::AudioDevice { device_id: name, label });
         }
-        devices
+        // 始终保留一条「系统默认」入口；mpv 自身已返回 auto 条目不重复添加。
+        ensure_default_device(devices)
     }
 
     pub fn set_device(&self, id: &str) -> Result<(), String> {
@@ -249,8 +376,83 @@ impl PlayerCore {
     }
 }
 
+fn loudness_gain_db(track_lufs: Option<f64>, target_lufs: f64) -> f64 {
+    track_lufs.map(|lufs| (target_lufs - lufs).clamp(-12.0, 12.0)).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_default_device, loudness_gain_db};
+    use crate::model::AudioDevice;
+
+    fn dev(id: &str, label: &str) -> AudioDevice {
+        AudioDevice { device_id: id.into(), label: label.into() }
+    }
+
+    #[test]
+    fn loudness_gain_is_zero_without_measurement() {
+        assert_eq!(loudness_gain_db(None, -23.0), 0.0);
+    }
+
+    #[test]
+    fn loudness_gain_uses_target_difference_and_clamps() {
+        assert_eq!(loudness_gain_db(Some(-28.0), -23.0), 5.0);
+        assert_eq!(loudness_gain_db(Some(-50.0), -23.0), 12.0);
+        assert_eq!(loudness_gain_db(Some(-5.0), -23.0), -12.0);
+    }
+
+    #[test]
+    fn device_list_keeps_real_devices_and_prepends_default() {
+        let out = ensure_default_device(vec![dev("wasapi/{abc}", "扬声器 (Realtek)")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].device_id, "auto");
+        assert_eq!(out[0].label, "系统默认输出");
+        assert_eq!(out[1].device_id, "wasapi/{abc}");
+        assert_eq!(out[1].label, "扬声器 (Realtek)");
+    }
+
+    #[test]
+    fn device_list_does_not_duplicate_mpv_auto_entry() {
+        let out = ensure_default_device(vec![dev("auto", "Autoselect device"), dev("null", "Null")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].device_id, "auto");
+        assert_eq!(out[0].label, "Autoselect device");
+        assert_eq!(out[1].device_id, "null");
+    }
+
+    #[test]
+    fn device_list_falls_back_to_chinese_label_for_empty_auto_description() {
+        let out = ensure_default_device(vec![dev("auto", "   ")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "系统默认输出");
+    }
+
+    #[test]
+    fn empty_device_list_still_yields_default() {
+        let out = ensure_default_device(Vec::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].device_id, "auto");
+    }
+}
+
 fn default_device() -> crate::model::AudioDevice {
     crate::model::AudioDevice { device_id: "auto".into(), label: "系统默认输出".into() }
+}
+
+/// 归一化输出设备列表：保证存在且仅存在一条 device_id == "auto" 的入口，并置于首位。
+/// 纯函数（不依赖 mpv），便于单元测试；供 list_devices/refresh_devices 复用。
+fn ensure_default_device(mut devices: Vec<crate::model::AudioDevice>) -> Vec<crate::model::AudioDevice> {
+    match devices.iter().position(|d| d.device_id == "auto") {
+        Some(pos) => {
+            let mut auto = devices.remove(pos);
+            if auto.label.trim().is_empty() {
+                auto.label = default_device().label;
+            }
+            devices.insert(0, auto);
+        }
+        None => devices.insert(0, default_device()),
+    }
+    devices
 }
 
 fn mpv_err(e: libmpv2::Error) -> String {

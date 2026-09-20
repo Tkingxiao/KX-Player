@@ -89,6 +89,24 @@ pub fn ffmpeg_exec(args: Vec<String>) -> crate::fftools::ExecResult {
     crate::fftools::exec_ffmpeg(&args)
 }
 
+/// ffmpeg 可用性探测（转换页据此降级）
+#[tauri::command]
+pub fn ffmpeg_probe() -> crate::fftools::FfmpegInfo {
+    crate::fftools::probe_ffmpeg()
+}
+
+/// 启动转换队列（任务 + convert:progress 事件），返回 taskId
+#[tauri::command]
+pub fn convert_run(app: AppHandle, items: Vec<crate::fftools::ConvertItem>) -> u64 {
+    crate::fftools::run_convert_queue(app, items)
+}
+
+/// 取消转换队列（幂等）
+#[tauri::command]
+pub fn convert_cancel(task_id: u64) -> bool {
+    crate::fftools::cancel_convert_queue(task_id)
+}
+
 // ── AI ──────────────────────────────────────────────────────────
 
 #[tauri::command]

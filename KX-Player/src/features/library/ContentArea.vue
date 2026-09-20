@@ -1,19 +1,21 @@
 <script setup lang="ts">
-/** 内容区分发：按 ui.view 渲染对应视图 + 顶部筛选 chips。 */
-import { computed } from 'vue'
+/** 内容区分发：按 ui.view 渲染对应视图 + 顶部筛选 chips。
+ *  仅首屏默认视图（SmartView）同步加载，其余视图按需异步拉取，
+ *  避免启动时解析整棵视图树（AI 翻译/转换/歌词等体积较大）。 */
+import { computed, defineAsyncComponent } from 'vue'
 import { useUiStore } from '@/stores/ui'
 import { useLibraryStore } from '@/stores/library'
-import FolderView from '@/features/library/FolderView.vue'
 import SmartView from '@/features/library/SmartView.vue'
-import RecentView from '@/features/library/RecentView.vue'
-import ListView from '@/features/playlists/ListView.vue'
-import SearchView from '@/features/search/SearchView.vue'
-import ConvertView from '@/features/convert/ConvertView.vue'
-import AiTranslateView from '@/features/ai/AiTranslateView.vue'
-import LyricsView from '@/features/lyrics/LyricsView.vue'
-import StageView from '@/features/stage/StageView.vue'
 import { DURATION_BUCKETS, SMART_LABELS, type SmartCollection } from '@/utils/collections'
 import { useTaxonomyStore } from '@/stores/taxonomy'
+
+const FolderView = defineAsyncComponent(() => import('@/features/library/FolderView.vue'))
+const RecentView = defineAsyncComponent(() => import('@/features/library/RecentView.vue'))
+const ListView = defineAsyncComponent(() => import('@/features/playlists/ListView.vue'))
+const SearchView = defineAsyncComponent(() => import('@/features/search/SearchView.vue'))
+const ConvertView = defineAsyncComponent(() => import('@/features/convert/ConvertView.vue'))
+const AiTranslateView = defineAsyncComponent(() => import('@/features/ai/AiTranslateView.vue'))
+const LyricsView = defineAsyncComponent(() => import('@/features/lyrics/LyricsView.vue'))
 
 const ui = useUiStore()
 const library = useLibraryStore()
@@ -70,20 +72,19 @@ const chipLabels = computed(() => {
     </div>
 
     <div class="content-area">
-      <FolderView v-if="ui.view === 'folder'" />
-      <SmartView v-else-if="ui.view === 'smart'" />
-      <RecentView v-else-if="ui.view === 'recent'" />
-      <ListView v-else-if="ui.view === 'fav' || ui.view === 'playlist'" />
-      <SearchView v-else-if="ui.view === 'search'" />
-      <ConvertView v-else-if="ui.view === 'tools'" />
-      <AiTranslateView v-else-if="ui.view === 'ai'" />
-      <template v-else>
-        <SmartView />
-      </template>
+      <Transition name="view" mode="out-in">
+        <FolderView v-if="ui.view === 'folder'" key="folder" />
+        <SmartView v-else-if="ui.view === 'smart'" key="smart" />
+        <RecentView v-else-if="ui.view === 'recent'" key="recent" />
+        <ListView v-else-if="ui.view === 'fav' || ui.view === 'playlist'" key="list" />
+        <SearchView v-else-if="ui.view === 'search'" key="search" />
+        <ConvertView v-else-if="ui.view === 'tools'" key="tools" />
+        <AiTranslateView v-else-if="ui.view === 'ai'" key="ai" />
+        <SmartView v-else key="fallback" />
+      </Transition>
     </div>
 
     <LyricsView v-if="ui.view === 'lyrics'" />
-    <StageView v-else-if="ui.view === 'stage'" />
   </main>
 </template>
 
@@ -92,6 +93,7 @@ const chipLabels = computed(() => {
   position: relative;
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   background: transparent;
@@ -135,5 +137,9 @@ const chipLabels = computed(() => {
   flex: 1;
   min-height: 0;
   position: relative;
+}
+/* 视图切换：淡入 + 轻微上浮，避免内容瞬切 */
+.content-area > * {
+  height: 100%;
 }
 </style>

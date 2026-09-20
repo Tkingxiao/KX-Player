@@ -7,13 +7,15 @@ pub mod meta;
 use crate::db;
 use crate::model::{normalize_path, Album, Artist, FolderNode, ScanResult, Track};
 use crate::scanner::meta::*;
+use crate::scanner::meta::ScanMeta;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-const MAX_DIR_COUNT: usize = 10000;
+const MAX_DIR_COUNT: usize = 2000;
 
 /// >240 字符路径加 \\?\ 前缀（Windows MAX_PATH 旁路）
 fn long_path(p: &str) -> String {
@@ -33,9 +35,15 @@ fn discover_files(folder_paths: &[String]) -> Vec<String> {
     let mut results: Vec<String> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = folder_paths.iter().map(|p| normalize_path(p)).collect();
+    let start = std::time::Instant::now();
     while let Some(dir) = stack.pop() {
         if visited.contains(&dir) || visited.len() >= MAX_DIR_COUNT {
             continue;
+        }
+        // 防止极深目录/软链接循环卡住：单目录遍历限时 30 秒
+        if start.elapsed().as_secs() > 30 {
+            crate::paths::append_log("[scan] discover_files timed out (30s), returning partial results");
+            break;
         }
         visited.insert(dir.clone());
         let entries = match std::fs::read_dir(Path::new(&long_path(&dir))) {
@@ -53,6 +61,11 @@ fn discover_files(folder_paths: &[String]) -> Vec<String> {
                 stack.push(full);
             } else if is_media_file(&name) {
                 results.push(full);
+                if results.len() >= 100_000 {
+                    crate::paths::append_log("[scan] hit max 100000 media files limit");
+                    results.sort();
+                    return results;
+                }
             }
         }
     }
@@ -78,60 +91,302 @@ fn emit_stage(app: &AppHandle, stage: &str) {
     let _ = app.emit("scanner:stage", stage.to_string());
 }
 
-/// 并行解析（scoped threads，worker 数与 Electron 版一致：min(4, max(2, cpu*0.75))），
-/// 进度每 120ms 节流上报。
-fn parse_files_parallel(files: &[String], app: &AppHandle, total_hint: i64, done_offset: i64) -> HashMap<String, FileMeta> {
-    let total = files.len();
-    let counter = Arc::new(AtomicUsize::new(0));
-    let results: Arc<std::sync::Mutex<HashMap<String, FileMeta>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+/// 单文件解析硬超时（与旧实现一致：10 秒），由主线程巡检判定并兜底。
+const PARSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 主线程巡检间隔：50ms 足以在超时后第一时间接管，开销可忽略。
+const WATCHDOG_TICK: Duration = Duration::from_millis(50);
+/// 进度事件节流间隔（保持原实现的 120ms）。
+const PROGRESS_TICK: Duration = Duration::from_millis(120);
 
+/// worker 的当前工作登记：(文件索引, 所属 chunk 结束索引, 开始时刻)。
+/// 主线程巡检读取它，判断某个 worker 是否卡在同一文件上超过 `PARSE_TIMEOUT`。
+type WorkerSlot = Arc<Mutex<Option<(usize, usize, Instant)>>>;
+
+/// 活跃 worker 计数守卫：无论正常退出还是 panic 展开都会递减，
+/// 主线程因此不会在 worker 全部消失后继续空等。
+struct ActiveWorkers(Arc<AtomicUsize>);
+
+impl Drop for ActiveWorkers {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn meta_to_file_meta(m: ScanMeta) -> FileMeta {
+    FileMeta {
+        duration: m.duration,
+        title: m.title,
+        artist: m.artist,
+        genre: m.genre,
+        bitrate: m.bitrate,
+        sample_rate: m.sample_rate,
+    }
+}
+
+/// 解析单个文件并把结果计入共享状态。
+/// - `parse` 的 panic 被捕获后降级为兜底元数据，扫描不会因此中断；
+/// - 结果认领用 `finished[idx]` 的 CAS 完成：worker 正常完成与 watchdog 超时兜底
+///   只有一方能计数；已判超时的文件不会被 worker 迟到的真实结果覆盖（与旧版语义一致）。
+fn parse_one_guarded(
+    idx: usize,
+    chunk_end: usize,
+    files: &[String],
+    parse: &(dyn Fn(&str) -> ScanMeta + Send + Sync),
+    slot: &Mutex<Option<(usize, usize, Instant)>>,
+    finished: &[AtomicBool],
+    results: &Mutex<HashMap<String, FileMeta>>,
+    counter: &AtomicUsize,
+) {
+    let path = &files[idx];
+    // 已被 watchdog 兜底或其它 worker 认领（重复退回项）→ 不再解析
+    if finished[idx].load(Ordering::Acquire) {
+        return;
+    }
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((idx, chunk_end, Instant::now()));
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse(path)));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+    let meta = match parsed {
+        Ok(m) => meta_to_file_meta(m),
+        Err(_) => {
+            crate::paths::append_log(&format!("[scan] parse failed: {path}"));
+            meta_to_file_meta(timeout_meta(path))
+        }
+    };
+    if finished[idx]
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        results.lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone(), meta);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 并行解析池：固定 worker 池 + 共享 chunk 游标 + 主线程超时巡检。
+///
+/// 与旧实现的关键区别：不再为**每个文件** spawn 一个线程（旧版每文件一线程 +
+/// `recv_timeout`，大库下线程创建/销毁是纯开销），改为 worker 只创建一次、
+/// 各自从共享游标领取 chunk；单文件超时改由主线程巡检（watchdog）负责：
+/// 某个 worker 在同一个文件上停留超过 `timeout`，即记日志、写兜底元数据、计入进度，
+/// 并把该 chunk 剩下的文件退回队列 + 补一个 worker 维持并发度。
+/// 只有真正卡死的文件才会触发补位，因此不会退化成「每文件一线程」。
+///
+/// `parse` 与 `report` 以 trait object 注入，便于单测；生产入口见 `parse_files_parallel`。
+fn parse_pool(
+    files: &[String],
+    timeout: Duration,
+    report: Arc<dyn Fn(usize) + Send + Sync>,
+    parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync>,
+) -> HashMap<String, FileMeta> {
+    let total = files.len();
     if total == 0 {
-        emit_progress(app, done_offset, total_hint);
+        report(0);
         return HashMap::new();
     }
 
-    let threads = std::cmp::min(4, std::cmp::max(2, std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)));
-    let chunk_size = total.div_ceil(threads);
+    // worker 数：min(cpu, 8)，下限 2（宪法：扫描解码并发 min(cpu, 8)）。
+    // 上限 8 避免解码/IO 争抢与内存峰值；下限 2 让单核机器也能让 IO 与 CPU 重叠。
+    let threads = std::cmp::min(
+        8,
+        std::cmp::max(
+            2,
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+        ),
+    );
+    // 领取粒度：把任务切成约 4 个 chunk/worker —— chunk 越小负载越均衡（个别慢文件不至于
+    // 形成长尾），但每个 chunk 至少 1 个文件。worker 数再按 chunk 数封顶，
+    // 于是小库（total < threads*4）不会 spawn 一堆空转线程，也不会出现空 chunk。
+    let chunk_size = std::cmp::max(1, total.div_ceil(threads * 4));
+    let chunk_count = total.div_ceil(chunk_size);
+    let worker_count = std::cmp::min(threads, chunk_count);
 
-    std::thread::scope(|scope| {
-        // 进度上报线程
-        {
-            let counter = Arc::clone(&counter);
-            let app = app.clone();
-            scope.spawn(move || loop {
-                let done = counter.load(Ordering::Relaxed);
-                emit_progress(&app, done_offset + done as i64, total_hint);
-                if done >= total {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(120));
-            });
-        }
-        for chunk in files.chunks(chunk_size) {
-            let counter = Arc::clone(&counter);
+    let files: Arc<Vec<String>> = Arc::new(files.to_vec());
+    let results: Arc<Mutex<HashMap<String, FileMeta>>> = Arc::new(Mutex::new(HashMap::with_capacity(total)));
+    let counter = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    // 每个文件的「已计入结果」标志：worker 正常完成与 watchdog 超时兜底用它 CAS 竞争唯一认领权
+    let finished: Arc<Vec<AtomicBool>> = Arc::new((0..total).map(|_| AtomicBool::new(false)).collect());
+    // 活跃 worker 的工作登记（补位线程各自一个新槽位，避免旧槽位归还时覆盖新登记）
+    let slots: Arc<Mutex<Vec<WorkerSlot>>> = Arc::new(Mutex::new(Vec::new()));
+    // 共享工作游标（chunk 粒度）
+    let next_chunk = Arc::new(AtomicUsize::new(0));
+    // watchdog 退回的单文件索引（卡死 worker 未处理完的 chunk 尾巴），worker 优先领取
+    let requeued: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // 每次调用都创建独立槽位并启动一个 worker；同时被复用为超时后的补位。
+    // 用 detach 线程（非 scope）：被判定卡死的 worker 不能阻塞整体返回。
+    let spawn_worker = {
+        let files = Arc::clone(&files);
+        let results = Arc::clone(&results);
+        let counter = Arc::clone(&counter);
+        let active = Arc::clone(&active);
+        let finished = Arc::clone(&finished);
+        let slots = Arc::clone(&slots);
+        let next_chunk = Arc::clone(&next_chunk);
+        let requeued = Arc::clone(&requeued);
+        let parse = Arc::clone(&parse);
+        move || {
+            let slot: WorkerSlot = Arc::new(Mutex::new(None));
+            slots.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&slot));
+            active.fetch_add(1, Ordering::Relaxed);
+            let files = Arc::clone(&files);
             let results = Arc::clone(&results);
-            scope.spawn(move || {
-                for f in chunk {
-                    let meta = parse_file(f);
-                    results.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                        f.clone(),
-                        FileMeta {
-                            duration: meta.duration,
-                            title: meta.title,
-                            artist: meta.artist,
-                            genre: meta.genre,
-                            bitrate: meta.bitrate,
-                            sample_rate: meta.sample_rate,
-                        },
-                    );
-                    counter.fetch_add(1, Ordering::Relaxed);
+            let counter = Arc::clone(&counter);
+            let finished = Arc::clone(&finished);
+            let next_chunk = Arc::clone(&next_chunk);
+            let requeued = Arc::clone(&requeued);
+            let parse = Arc::clone(&parse);
+            let worker_active = Arc::clone(&active);
+            let spawned = std::thread::Builder::new().name("scan-parse".into()).spawn(move || {
+                let _guard = ActiveWorkers(worker_active);
+                loop {
+                    // 优先处理 watchdog 退回的单文件尾巴
+                    let single = requeued.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                    match single {
+                        Some(idx) => parse_one_guarded(
+                            idx,
+                            idx + 1,
+                            &files,
+                            parse.as_ref(),
+                            &slot,
+                            finished.as_slice(),
+                            &results,
+                            &counter,
+                        ),
+                        None => {
+                            let c = next_chunk.fetch_add(1, Ordering::Relaxed);
+                            if c >= chunk_count {
+                                break;
+                            }
+                            let start = c * chunk_size;
+                            let end = std::cmp::min(start + chunk_size, total);
+                            for idx in start..end {
+                                parse_one_guarded(
+                                    idx,
+                                    end,
+                                    &files,
+                                    parse.as_ref(),
+                                    &slot,
+                                    finished.as_slice(),
+                                    &results,
+                                    &counter,
+                                );
+                            }
+                        }
+                    }
                 }
             });
+            if spawned.is_err() {
+                crate::paths::append_log("[scan] failed to spawn parse worker");
+                active.fetch_sub(1, Ordering::Relaxed);
+            }
         }
-    });
-    emit_progress(app, done_offset + total as i64, total_hint);
+    };
+
+    for _ in 0..worker_count {
+        spawn_worker();
+    }
+
+    report(0);
+    let mut last_emit = Instant::now();
+    // 退回队列的补位只做一次：极端情况下（线程创建持续失败）保证循环必然终止
+    let mut respawned_for_requeue = false;
+
+    // 主线程即 watchdog：巡检 worker 登记 + 按 120ms 节流上报进度
+    loop {
+        let observed: Vec<WorkerSlot> = slots.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for slot in observed {
+            // 原子地「取走」一个仍处于超时状态的登记：取走后该 worker 之后的新登记
+            // （下一个文件）不会被这里误清；worker 自己收尾时再写 None 也是幂等的。
+            let stuck = {
+                let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                match *guard {
+                    Some((idx, end, started)) if started.elapsed() >= timeout => {
+                        *guard = None;
+                        Some((idx, end))
+                    }
+                    _ => None,
+                }
+            };
+            let Some((idx, end)) = stuck else { continue };
+            if finished[idx]
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                crate::paths::append_log(&format!("[scan] parse timeout: {}", files[idx]));
+                results.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    files[idx].clone(),
+                    meta_to_file_meta(timeout_meta(&files[idx])),
+                );
+                counter.fetch_add(1, Ordering::Relaxed);
+                // 被放弃的 worker 仍卡在 parse 里回不来：把该 chunk 剩余文件退回队列，
+                // 并补一个 worker，保证这个 chunk 尾巴上的文件不被一个卡死文件拖住。
+                if end > idx + 1 {
+                    let mut q = requeued.lock().unwrap_or_else(|e| e.into_inner());
+                    for j in (idx + 1)..end {
+                        q.push(j);
+                    }
+                }
+                spawn_worker();
+            }
+        }
+
+        let done = counter.load(Ordering::Relaxed);
+        if last_emit.elapsed() >= PROGRESS_TICK {
+            report(done);
+            last_emit = Instant::now();
+        }
+
+        if done >= total {
+            break;
+        }
+        // 没有存活 worker 且仍有文件未计数 → 退出，不无限等待。
+        // 若退回队列还有尾巴（补位线程创建失败等极端情况），先补一次 worker 尝试排空；
+        // 补位也失败则直接退出，保证必然会返回（不会挂死）。
+        if active.load(Ordering::Relaxed) == 0 {
+            let pending = requeued.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if pending > 0 && !respawned_for_requeue {
+                respawned_for_requeue = true;
+                for _ in 0..std::cmp::min(worker_count, pending) {
+                    spawn_worker();
+                }
+                continue;
+            }
+            crate::paths::append_log(&format!("[scan] parse workers exited early: {done}/{total} parsed"));
+            break;
+        }
+        std::thread::sleep(WATCHDOG_TICK);
+    }
+
+    let done = counter.load(Ordering::Relaxed);
+    report(done);
+    crate::paths::append_log(&format!(
+        "[scan] parsed {done}/{total} files ({worker_count} workers, chunk={chunk_size}, cpu={threads})"
+    ));
     let out = results.lock().unwrap_or_else(|e| e.into_inner()).clone();
     out
+}
+
+/// 扫描用并行解析入口：worker 池 + 逐文件 10s 硬超时，进度每 120ms 节流上报。
+fn parse_files_parallel(files: &[String], app: &AppHandle, total_hint: i64, done_offset: i64) -> HashMap<String, FileMeta> {
+    let app = app.clone();
+    let report: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |done: usize| {
+        emit_progress(&app, done_offset + done as i64, total_hint);
+    });
+    parse_pool(files, PARSE_TIMEOUT, report, Arc::new(parse_file))
+}
+
+/// 超时兜底元数据（与旧版 parse_one 的超时分支完全一致）
+fn timeout_meta(path: &str) -> ScanMeta {
+    ScanMeta {
+        duration: 0.0,
+        cover: None,
+        title: Some(crate::scanner::meta::basename_no_ext(path)),
+        artist: None,
+        genre: None,
+        bitrate: None,
+        sample_rate: None,
+    }
 }
 
 struct ScannedAlbum {
@@ -208,6 +463,7 @@ fn group_tracks(files: &[String], metas: &HashMap<String, FileMeta>, roots: &[St
             genre: m.genre.clone(),
             bitrate: m.bitrate,
             sample_rate: m.sample_rate,
+            loudness_lufs: None,
             album_cover_data: None,
         });
     }
@@ -273,6 +529,7 @@ fn build_folder_tree(files: &[String], metas: &HashMap<String, FileMeta>, roots:
                 genre: m.genre.clone(),
                 bitrate: m.bitrate,
                 sample_rate: m.sample_rate,
+                loudness_lufs: None,
                 album_cover_data: None,
             });
         }
@@ -553,11 +810,12 @@ pub fn scan_full(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> Sc
     result
 }
 
-/// 增量扫描：只解析新/变化文件
-pub fn scan_incremental(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> ScanResult {
+/// 增量扫描：只解析新/变化文件。
+/// 返回 (结果, 是否有实际变更)；无变更时完全不发出 stage/progress 事件，
+/// 避免启动时在 UI 上闪出「构建音乐库…」与扫描转圈。
+pub fn scan_incremental_quiet(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> (ScanResult, bool) {
     crate::paths::append_log(&format!("[scan-incr] folders: {folder_paths:?}"));
     let full_meta = db::library::load_full_meta_index(db_path);
-    emit_stage(app, "发现文件...");
     let files = discover_files(folder_paths);
 
     let mut changed: Vec<String> = Vec::new();
@@ -578,7 +836,16 @@ pub fn scan_incremental(app: &AppHandle, folder_paths: &[String], db_path: &Path
             }
         }
     }
+    let has_changes = !changed.is_empty() || files.len() != full_meta.len();
     crate::paths::append_log(&format!("[scan-incr] {}/{} new/changed", changed.len(), files.len()));
+
+    if !has_changes {
+        // 无变化：直接返回快照，不发任何 UI 事件（启动路径静默）
+        if let Some(snapshot) = db::library::load_snapshot(db_path, true) {
+            return (snapshot, false);
+        }
+    }
+
     let total = files.len() as i64;
     emit_progress(app, 0, total);
     emit_stage(app, &format!("解析元数据... ({total} 个文件)"));
@@ -625,7 +892,12 @@ pub fn scan_incremental(app: &AppHandle, folder_paths: &[String], db_path: &Path
         scanned_at: now_ms(),
     };
     persist_snapshot(db_path, &result);
-    result
+    (result, true)
+}
+
+/// 兼容入口：需要变更标志时用 scan_incremental_quiet。
+pub fn scan_incremental(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> ScanResult {
+    scan_incremental_quiet(app, folder_paths, db_path).0
 }
 
 fn persist_snapshot(db_path: &Path, result: &ScanResult) {
@@ -707,4 +979,111 @@ pub fn remove_folder(app: &AppHandle, folder_path: &str, remaining: &[String], d
     };
     persist_snapshot(db_path, &result);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn paths(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("C:/music/track{i}.mp3")).collect()
+    }
+
+    fn noop_report() -> Arc<dyn Fn(usize) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    fn meta_for(p: &str, duration: f64) -> ScanMeta {
+        ScanMeta { duration, title: Some(basename_no_ext(p)), ..Default::default() }
+    }
+
+    #[test]
+    fn pool_parses_every_file_exactly_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> =
+            Arc::new(move |p: &str| {
+                calls_in.fetch_add(1, Ordering::Relaxed);
+                meta_for(p, 1.5)
+            });
+        let meta = parse_pool(&paths(500), PARSE_TIMEOUT, noop_report(), parse);
+        assert_eq!(meta.len(), 500);
+        assert_eq!(calls.load(Ordering::Relaxed), 500, "each file parsed exactly once");
+        assert!(meta.values().all(|m| m.duration == 1.5));
+    }
+
+    #[test]
+    fn pool_handles_empty_input() {
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> = Arc::new(|_| ScanMeta::default());
+        let meta = parse_pool(&[], PARSE_TIMEOUT, noop_report(), parse);
+        assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn pool_small_library_still_completes() {
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> =
+            Arc::new(|p: &str| meta_for(p, 2.0));
+        let meta = parse_pool(&paths(3), PARSE_TIMEOUT, noop_report(), parse);
+        assert_eq!(meta.len(), 3);
+        assert_eq!(meta["C:/music/track0.mp3"].title.as_deref(), Some("track0"));
+    }
+
+    #[test]
+    fn pool_panicking_parse_falls_back_without_losing_the_file() {
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> = Arc::new(|p: &str| {
+            if p.ends_with("track7.mp3") {
+                panic!("boom on track7");
+            }
+            meta_for(p, 9.0)
+        });
+        let meta = parse_pool(&paths(20), PARSE_TIMEOUT, noop_report(), parse);
+        assert_eq!(meta.len(), 20, "panicking file still yields a fallback entry");
+        let fallback = &meta["C:/music/track7.mp3"];
+        assert_eq!(fallback.duration, 0.0);
+        assert_eq!(fallback.title.as_deref(), Some("track7"));
+        assert_eq!(meta["C:/music/track0.mp3"].duration, 9.0);
+    }
+
+    #[test]
+    fn pool_enforces_per_file_timeout_with_fallback_meta() {
+        // 第一个文件卡住远超超时，其余文件必须照常完成
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> = Arc::new(|p: &str| {
+            if p.ends_with("track0.mp3") {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            meta_for(p, 3.0)
+        });
+        let meta = parse_pool(&paths(4), Duration::from_millis(80), noop_report(), parse);
+        assert_eq!(meta.len(), 4, "all files counted despite one timeout");
+        let timed_out = &meta["C:/music/track0.mp3"];
+        assert_eq!(timed_out.duration, 0.0);
+        assert_eq!(timed_out.title.as_deref(), Some("track0"));
+    }
+
+    #[test]
+    fn pool_reports_progress_up_to_total() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let seen_in = Arc::clone(&seen);
+        let report: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |done: usize| {
+            seen_in.lock().unwrap_or_else(|e| e.into_inner()).push(done);
+        });
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> =
+            Arc::new(|p: &str| meta_for(p, 1.0));
+        let meta = parse_pool(&paths(50), PARSE_TIMEOUT, report, parse);
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(meta.len(), 50);
+        assert_eq!(seen.first().copied(), Some(0), "progress starts at 0");
+        assert_eq!(seen.last().copied(), Some(50), "progress ends at total");
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]), "progress is monotonic");
+    }
+
+    #[test]
+    fn timeout_meta_uses_basename_without_extension() {
+        let m = timeout_meta("C:/music/Album/Track 01.flac");
+        assert_eq!(m.duration, 0.0);
+        assert_eq!(m.title.as_deref(), Some("Track 01"));
+        assert!(m.cover.is_none());
+        assert!(m.artist.is_none());
+    }
 }

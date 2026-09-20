@@ -1,11 +1,11 @@
-/* 设计 tokens（尺寸/圆角/动效常量） */
+/* 设计 tokens（尺寸/圆角/动效常量）—— 锁定自 DESIGN.md */
 :root {
-  --titlebar-h: 40px;
+  --titlebar-h: 36px;
   --sidebar-w: 232px;
-  --sidebar-w-collapsed: 60px;
-  --toolbar-h: 48px;
+  --sidebar-w-collapsed: 56px;
+  --toolbar-h: 44px;
   --inspector-w: 320px;
-  --playerbar-h: 84px;
+  --playerbar-h: 76px;
   --grid-min: 176px;
   --card-row-h: 232px;
   --row-h: 46px;
@@ -19,4 +19,14 @@
   --dur: 200ms;
   --dur-slow: 360ms;
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  /* 弹入/滑入用的轻微回弹，避免机械感 */
+  --ease-out-back: cubic-bezier(0.34, 1.32, 0.64, 1);
+  /* 通用过渡时长（按钮/卡片/列表行） */
+  --dur-press: 90ms;
+
+  /* 透明度滑杆映射：存储值 0–1，CSS 用 var(--tb-alpha) 等 */
+  --tb-alpha: 1;
+  --sb-alpha: 1;
+  --pb-alpha: 1;
+  --accent-rgb: 230 58 46;
 }
