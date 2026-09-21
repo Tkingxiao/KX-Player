@@ -235,18 +235,10 @@ export const api: AppApi = {
   playerSetSubtitleVisible: (visible) =>
     invoke('player_set_subtitle_visible', { visible }).catch(() => {}),
   playerSetSubtitleDelay: (sec) => invoke('player_set_subtitle_delay', { sec }).catch(() => {}),
-  playerSetSubStyle: (style) =>
-    invoke('player_set_sub_style', {
-      style: {
-        font: style.font,
-        fontSize: style.fontSize,
-        color: style.color,
-        borderColor: style.borderColor,
-        borderSize: style.borderSize,
-        shadowOffset: style.shadowOffset,
-        pos: style.pos,
-      },
-    }).catch(() => {}),
+  // 整对象透传，**不再逐字段白名单**：白名单曾把 backColor / backOpacity /
+  // assOverride 三个新字段悄悄吃掉，后端实现齐全却永远收不到（P0-24/P0-25 一度因此
+  // 完全失效）。Rust 侧 SubStyle 全是 Option，多余的 undefined 键在 JSON 里本就会消失。
+  playerSetSubStyle: (style) => invoke('player_set_sub_style', { style }).catch(() => {}),
   playerApplyLoudnessGain: (trackLufs, targetLufs) =>
     invoke('player_apply_loudness_gain', {
       trackLufs,

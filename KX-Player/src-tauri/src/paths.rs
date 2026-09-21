@@ -109,16 +109,33 @@ pub fn append_log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
-    // 1MB 轮转
+    // 超过 1MB 时**原地保留尾部 512KB**（不是多文件滚动，注释别写成人话之外的意思）
     if let Ok(meta) = std::fs::metadata(&path) {
         if meta.len() > 1024 * 1024 {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                let keep_from = content.len().saturating_sub(512 * 1024);
+                let keep_from = tail_start(&content, 512 * 1024);
                 let _ = std::fs::write(&path, &content[keep_from..]);
             }
         }
     }
 }
+
+/// 取「保留尾部 `keep` 字节」的起点，且**必须落在字符边界与行首**。
+///
+/// 直接 `&content[content.len() - keep..]` 是字节切片：日志里有中文，切点落在多字节
+/// 字符中间就 panic（本仓在 `ai.rs` 踩过同一类坑，`brief` 是那次留下的）。
+/// 这里再顺带对齐到行首，免得日志开头是半行。
+fn tail_start(content: &str, keep: usize) -> usize {
+    let mut start = content.len().saturating_sub(keep);
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    match content[start..].find('\n') {
+        Some(i) => start + i + 1,
+        None => start,
+    }
+}
+
 
 /// 简单 UTC 时间分解（避免引入 chrono）
 fn epoch_to_utc(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
@@ -137,4 +154,29 @@ fn epoch_to_utc(epoch: u64) -> (u64, u64, u64, u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as u64, m as u64, d as u64, h, mi, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_start;
+
+    /// 老写法 `&content[content.len() - keep..]` 在中文日志上会 panic
+    #[test]
+    fn tail_start_never_splits_a_character() {
+        let mut log = String::new();
+        for i in 0..200 {
+            log.push_str(&format!("[{i:04}] 播放失败：设备被占用\n"));
+        }
+        for keep in 1..4096 {
+            let start = tail_start(&log, keep);
+            assert!(log.is_char_boundary(start), "keep={keep} 切在字符中间");
+            assert!(log[start..].starts_with('[') || start == log.len(), "keep={keep} 没对齐行首");
+        }
+    }
+
+    #[test]
+    fn tail_start_keeps_everything_when_short() {
+        let s = "一行";
+        assert_eq!(tail_start(s, 4096), 0);
+    }
 }

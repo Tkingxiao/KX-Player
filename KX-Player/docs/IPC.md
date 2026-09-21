@@ -57,25 +57,6 @@
 | `start_watching` | `paths: Vec<String>` | `boolean` | src-tauri/src/commands/library.rs |
 | `startup_sync` | `paths: Vec<String>` | `ScanResult ∣ null` | src-tauri/src/commands/library.rs |
 | `stop_watching` | — | `boolean` | src-tauri/src/commands/library.rs |
-| `taxonomy_all_category_items` | — | `[number, string][]` | src-tauri/src/commands/library.rs |
-| `taxonomy_all_track_tags` | — | `[string, number][]` | src-tauri/src/commands/library.rs |
-| `taxonomy_apply_suggested_tags` | `accepted: Vec<(String, String)>` | `number` | src-tauri/src/commands/library.rs |
-| `taxonomy_assign_category` | `categoryId: i64`, `trackIds: Vec<String>` | `number` | src-tauri/src/commands/library.rs |
-| `taxonomy_category_track_ids` | `categoryId: i64`, `includeChildren: Option<bool>` | `string[]` | src-tauri/src/commands/library.rs |
-| `taxonomy_create_category` | `parentId: Option<i64>`, `name: String` | `Category` | src-tauri/src/commands/library.rs |
-| `taxonomy_delete_category` | `id: i64` | `null` | src-tauri/src/commands/library.rs |
-| `taxonomy_delete_tag` | `id: i64` | `null` | src-tauri/src/commands/library.rs |
-| `taxonomy_list_categories` | — | `Category[]` | src-tauri/src/commands/library.rs |
-| `taxonomy_list_tags` | — | `Tag[]` | src-tauri/src/commands/library.rs |
-| `taxonomy_move_category` | `id: i64`, `parentId: Option<i64>`, `sortIndex: i64` | `null` | src-tauri/src/commands/library.rs |
-| `taxonomy_rename_category` | `id: i64`, `name: String` | `null` | src-tauri/src/commands/library.rs |
-| `taxonomy_rename_tag` | `id: i64`, `name: String` | `null` | src-tauri/src/commands/library.rs |
-| `taxonomy_suggest_tags` | `trackIds: Vec<String>` | `[string, TagSuggestion[]][]` | src-tauri/src/commands/library.rs |
-| `taxonomy_tag_tracks` | `tagIds: Vec<i64>`, `trackIds: Vec<String>`, `mode: Option<String>` | `number` | src-tauri/src/commands/library.rs |
-| `taxonomy_track_tags` | `trackIds: Vec<String>` | `Record<string, Tag[]>` | src-tauri/src/commands/library.rs |
-| `taxonomy_unassign_category` | `categoryId: i64`, `trackIds: Vec<String>` | `number` | src-tauri/src/commands/library.rs |
-| `taxonomy_untag_tracks` | `tagId: i64`, `trackIds: Vec<String>` | `number` | src-tauri/src/commands/library.rs |
-| `taxonomy_upsert_tag` | `name: String`, `color: Option<String>`, `kind: Option<String>` | `Tag` | src-tauri/src/commands/library.rs |
 
 ## player
 
@@ -129,6 +110,30 @@
 | `save_settings` | `settings: Value` | `boolean` | src-tauri/src/commands/system.rs |
 | `startup_warnings` | — | `string[]` | src-tauri/src/commands/system.rs |
 | `toggle_fullscreen` | — | `boolean` | src-tauri/src/commands/system.rs |
+
+## taxonomy
+
+| 命令 | 参数（JS 键名 : Rust 类型） | resolve | 位置 |
+|---|---|---|---|
+| `taxonomy_all_category_items` | — | `[number, string][]` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_all_track_tags` | — | `[string, number][]` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_apply_suggested_tags` | `accepted: Vec<(String, String)>` | `number` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_assign_category` | `categoryId: i64`, `trackIds: Vec<String>` | `number` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_category_track_ids` | `categoryId: i64`, `includeChildren: Option<bool>` | `string[]` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_create_category` | `parentId: Option<i64>`, `name: String` | `Category` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_delete_category` | `id: i64` | `null` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_delete_tag` | `id: i64` | `null` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_list_categories` | — | `Category[]` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_list_tags` | — | `Tag[]` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_move_category` | `id: i64`, `parentId: Option<i64>`, `sortIndex: i64` | `null` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_rename_category` | `id: i64`, `name: String` | `null` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_rename_tag` | `id: i64`, `name: String` | `null` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_suggest_tags` | `trackIds: Vec<String>` | `[string, TagSuggestion[]][]` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_tag_tracks` | `tagIds: Vec<i64>`, `trackIds: Vec<String>`, `mode: Option<String>` | `number` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_track_tags` | `trackIds: Vec<String>` | `Record<string, Tag[]>` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_unassign_category` | `categoryId: i64`, `trackIds: Vec<String>` | `number` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_untag_tracks` | `tagId: i64`, `trackIds: Vec<String>` | `number` | src-tauri/src/commands/taxonomy.rs |
+| `taxonomy_upsert_tag` | `name: String`, `color: Option<String>`, `kind: Option<String>` | `Tag` | src-tauri/src/commands/taxonomy.rs |
 
 ## 事件
 

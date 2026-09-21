@@ -6,6 +6,7 @@ pub mod dialog_fs;
 pub mod library;
 pub mod player;
 pub mod system;
+pub mod taxonomy;
 
 /// 收口 `spawn_blocking(..).await` 的双层 `Result`：外层是「后台任务 panic / 被取消」，
 /// 内层才是业务错误。

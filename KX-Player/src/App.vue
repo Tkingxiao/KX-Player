@@ -91,14 +91,23 @@ const bgStyle = computed<Record<string, string>>(() => {
 
 /** 响应式断点（规范 03 §2.1）：<1200 自动折叠右检查器；<1024 侧边栏折叠为图标栏 */
 let ro: ResizeObserver | null = null
+/** 响应式折叠是否由**本函数**触发（用于窗口变宽时还原），不落盘见下 */
+let sidebarAutoCollapsed = false
 function applyResponsive(): void {
   const w = window.innerWidth
   // <1200 自动关闭右检查器，避免内容区被压没
   if (w < 1200 && ui.inspectorOpen) ui.inspectorOpen = false
-  // <1024 侧边栏折叠为图标栏
-  if (w < 1024 && !settings.sidebarCollapsed) {
-    settings.sidebarCollapsed = true
-    settings.scheduleSave()
+  // <1024 侧边栏折叠为图标栏；≥1024 时**只还原自动折叠的那次**，不覆盖用户的主动选择。
+  // 这里两处都**不 scheduleSave()**：曾经是直接写 settings.sidebarCollapsed 并落盘，
+  // 而窗口变宽没有反向恢复 —— 用户只要把窗口拖窄一次，偏好就被永久改写且不可逆。
+  if (w < 1024) {
+    if (!settings.sidebarCollapsed) {
+      settings.sidebarCollapsed = true
+      sidebarAutoCollapsed = true
+    }
+  } else if (sidebarAutoCollapsed) {
+    settings.sidebarCollapsed = false
+    sidebarAutoCollapsed = false
   }
 }
 
