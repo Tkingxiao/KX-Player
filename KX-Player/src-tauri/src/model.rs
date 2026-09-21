@@ -146,9 +146,18 @@ pub struct AiChatResult {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiPingResult {
     pub ok: bool,
     pub message: String,
+    /// 连通性测试顺带回显的档位信息（AI-5）：模型名、本次往返毫秒数、上游报的 token 数。
+    /// 三个都是 `Option` + `skip_serializing_if`：失败时只留 `message` 原文。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,6 +209,14 @@ pub struct SubStyle {
     pub border_size: Option<f64>,
     pub shadow_offset: Option<f64>,
     pub pos: Option<f64>,
+    /// 背景条基色 `#RRGGBB`（P0-24）。与 `back_opacity` 一起由 Rust 合成 mpv 的
+    /// `#AARRGGBB`：`<input type="color">` 只能给 6 位十六进制，透明度必须另传。
+    pub back_color: Option<String>,
+    /// 背景条不透明度 0–100；0 = 完全透明（mpv 默认，即「没有背景条」）。
+    pub back_opacity: Option<f64>,
+    /// `sub-ass-override`（P0-25）：`no`(保留 ASS 样式) / `yes`(本面板样式覆盖) /
+    /// `force` / `scale` / `strip`。非法值由 mpv 自己拒绝，这里不猜。
+    pub ass_override: Option<String>,
 }
 
 #[cfg(test)]

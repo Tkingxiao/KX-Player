@@ -99,7 +99,13 @@ async function testConnection(): Promise<void> {
   testResult.value = ''
   try {
     const r = await api.aiPing({ baseURL: settings.aiBaseURL, apiKey: apiKey.value, model: settings.aiModel })
-    testResult.value = (r.ok ? '✓ ' : '✗ ') + r.message
+    // 成功时把 AI-5 回显的档位信息（模型名/延迟/token）拼在后面，失败时只有原文
+    const facts = [
+      r.model && `模型 ${r.model}`,
+      r.latencyMs != null && `延迟 ${r.latencyMs} ms`,
+      r.totalTokens != null && `tokens ${r.totalTokens}`,
+    ].filter(Boolean)
+    testResult.value = (r.ok ? '✓ ' : '✗ ') + r.message + (facts.length ? `（${facts.join(' · ')}）` : '')
   } finally {
     testing.value = false
   }

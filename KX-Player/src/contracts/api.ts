@@ -6,6 +6,9 @@
  * 与 Rust 命令签名的差异由 `bridge/ipc.ts` 在边界收口。
  */
 import type {
+  AiChatResult,
+  AiModelsResult,
+  AiPingResult,
   AudioDevice,
   BgImageData,
   Bookmark,
@@ -17,6 +20,7 @@ import type {
   MpvPlayerState,
   PlayProgress,
   ScanResult,
+  SubStyle,
   SubtitleTrack,
   Tag,
   TagSuggestion,
@@ -81,9 +85,9 @@ export interface AppApi {
     model: string
     messages: { role: string; content: string }[]
     temperature?: number
-  }) => Promise<{ ok: boolean; content: string; error?: string }>
-  aiPing: (payload: { baseURL: string; apiKey: string; model: string }) => Promise<{ ok: boolean; message: string }>
-  aiListModels: (payload: { baseURL: string; apiKey: string }) => Promise<{ ok: boolean; models: string[]; error?: string }>
+  }) => Promise<AiChatResult>
+  aiPing: (payload: { baseURL: string; apiKey: string; model: string }) => Promise<AiPingResult>
+  aiListModels: (payload: { baseURL: string; apiKey: string }) => Promise<AiModelsResult>
   renameDir: (oldPath: string, newPath: string) => Promise<{ ok: boolean; error?: string }>
   clipboardWriteText: (t: string) => Promise<boolean>
   showItemInFolder: (p: string) => Promise<boolean>
@@ -137,15 +141,7 @@ export interface AppApi {
   playerSetSubtitleTrack: (id: number) => Promise<void>
   playerSetSubtitleVisible: (visible: boolean) => Promise<void>
   playerSetSubtitleDelay: (sec: number) => Promise<void>
-  playerSetSubStyle: (style: {
-    font?: string
-    fontSize?: number
-    color?: string
-    borderColor?: string
-    borderSize?: number
-    shadowOffset?: number
-    pos?: number
-  }) => Promise<void>
+  playerSetSubStyle: (style: SubStyle) => Promise<void>
   playerApplyLoudnessGain: (trackLufs: number | null, targetLufs: number) => Promise<void>
   /** 后台响度分析（任务 + loudness:progress 事件）：[trackId, path] 列表 */
   analyzeLoudness: (tracks: [string, string][]) => Promise<boolean>

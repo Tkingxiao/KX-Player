@@ -1,7 +1,9 @@
 <script setup lang="ts">
 /**
  * 检查器：队列 / 字幕 / 信息 / 书签 四 Tab。
- * 新增字幕样式面板：映射 mpv sub-* 属性（P0-24/25）。
+ * 字幕样式面板：映射 mpv sub-* 属性 9 项 —— sub-font/-font-size/-color/-border-color/
+ * -border-size/-shadow-offset/-pos，加 P0-24 的 sub-back-color（UI 给色 + 不透明度，
+ * Rust 合成 #AARRGGBB）与 P0-25 的 sub-ass-override 五档。
  */
 import { ref, computed, watch, onBeforeUnmount, onMounted } from 'vue'
 import { useUiStore } from '@/stores/ui'
@@ -9,6 +11,7 @@ import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useSettingsStore } from '@/stores/settings'
 import { fmtTime, trackName, trackArtist } from '@/utils/format'
+import SelectMenu from '@/components/SelectMenu.vue'
 import type { Track, SubStyle } from '@/contracts/api'
 
 const ui = useUiStore()
@@ -76,14 +79,21 @@ const SUB_POS_PRESETS = [
   { label: '下', value: 95 },
 ]
 
-const subStyle = ref<SubStyle>({
+/** 面板默认值；`DEFAULT_SUB_STYLE` 让「初次挂载」与「重置」不可能再走岔 */
+const DEFAULT_SUB_STYLE: SubStyle = {
   fontSize: 45,
   color: '#ffffff',
   borderColor: '#000000',
   borderSize: 1.5,
   shadowOffset: 1,
   pos: 95,
-})
+  backColor: "#000000",
+  // 0 = 完全透明 = mpv 默认的「无背景条」，与旧行为一致（P0-24）
+  backOpacity: 0,
+  assOverride: 'yes',
+}
+
+const subStyle = ref<SubStyle>({ ...DEFAULT_SUB_STYLE })
 
 let subDebounce: ReturnType<typeof setTimeout> | null = null
 function pushSubStyle(): void {
@@ -99,14 +109,21 @@ function setSubPos(v: number): void {
 }
 
 function resetSubStyle(): void {
-  subStyle.value = {
-    fontSize: 45,
-    color: '#ffffff',
-    borderColor: '#000000',
-    borderSize: 1.5,
-    shadowOffset: 1,
-    pos: 95,
-  }
+  subStyle.value = { ...DEFAULT_SUB_STYLE }
+  pushSubStyle()
+}
+
+/** P0-25：`sub-ass-override` 五档，标签写清「谁说了算」 */
+const ASS_OVERRIDE_OPTIONS = [
+  { value: 'no', label: '保留 ASS', title: '不覆盖：完全按字幕文件自带的 ASS 样式渲染' },
+  { value: 'yes', label: '面板覆盖', title: '用本面板的字号/颜色/描边覆盖 ASS 样式' },
+  { value: 'force', label: '强制覆盖', title: '连标了「应保留样式」的字幕也一起覆盖' },
+  { value: 'scale', label: '仅缩放', title: '只把 ASS 样式按字号缩放，颜色与描边不动' },
+  { value: 'strip', label: '剥离样式', title: '丢掉全部样式，只留纯文本' },
+]
+
+function setAssOverride(v: string): void {
+  subStyle.value.assOverride = v as SubStyle['assOverride']
   pushSubStyle()
 }
 
@@ -230,12 +247,39 @@ onMounted(() => {
           <input v-model.number="subStyle.shadowOffset" type="range" min="0" max="4" step="0.5" @input="pushSubStyle" />
           <span class="sub-val tnum">{{ subStyle.shadowOffset }}</span>
         </div>
+        <!-- P0-24 背景条：mpv sub-back-color（#AARRGGBB，不透明度在此单独给） -->
+        <div class="sub-group sub-bar">
+          <label>背景条</label>
+          <input v-model="subStyle.backColor" type="color" title="背景条颜色" @input="pushSubStyle" />
+          <input
+            v-model.number="subStyle.backOpacity"
+            type="range"
+            min="0"
+            max="100"
+            step="5"
+            title="背景条不透明度，0% 即不显示背景条"
+            @input="pushSubStyle"
+          />
+          <span class="sub-val tnum">{{ subStyle.backOpacity }}%</span>
+        </div>
+        <!-- P0-25 ASS 覆盖档位：mpv sub-ass-override -->
+        <div class="sub-group sub-ass">
+          <label>ASS 覆盖</label>
+          <SelectMenu
+            :model-value="subStyle.assOverride || 'yes'"
+            variant="text"
+            title="ASS 样式覆盖档位（mpv sub-ass-override）"
+            :options="ASS_OVERRIDE_OPTIONS"
+            @update:model-value="setAssOverride"
+          />
+        </div>
         <div class="sub-actions">
           <button class="btn-ghost" @click="resetSubStyle">重置</button>
         </div>
         <div class="sub-note">
           <p>所有字幕样式由 mpv / libass 渲染，变更即时生效。</p>
           <p>双语字幕：主轨 + 次轨同时加载，次轨字号由 mpv 统一缩放。</p>
+          <p>背景条 0% 即不显示；「ASS 覆盖」决定面板样式与字幕自带 ASS 样式谁优先。</p>
         </div>
       </div>
 
@@ -472,6 +516,17 @@ onMounted(() => {
 }
 .sub-group label {
   color: var(--text-sub);
+}
+/* P0-24 背景条：色块 + 不透明度 + 百分比，比默认那行多一格 */
+.sub-group.sub-bar {
+  grid-template-columns: 56px 34px 1fr 40px;
+}
+/* P0-25 ASS 覆盖：下拉自己占满中间列，右列留给「档位」文字 */
+.sub-group.sub-ass {
+  grid-template-columns: 56px 1fr;
+}
+.sub-group.sub-ass .sel-wrap, .sub-group.sub-ass .sel-trigger {
+  width: 100%;
 }
 .sub-group input[type="range"] {
   width: 100%;

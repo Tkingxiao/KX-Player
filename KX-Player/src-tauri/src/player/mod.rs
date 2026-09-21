@@ -28,6 +28,27 @@ pub struct PlayerCore {
     pip_active: AtomicBool,
 }
 
+/// mpv 的 `sub-back-color` 要 `#AARRGGBB`，而 `<input type="color">` 只给 `#RRGGBB` ——
+/// 不透明度在这里合成。0% = `#00000000`，即 mpv 默认的「无背景条」。
+///
+/// 只吃 ASCII 十六进制字符：`#中文` 这类输入会被过滤成非法长度并退到黑底，
+/// 而不是在 `&hex[..6]` 上按字节切出 panic（本仓已经踩过一次同类坑）。
+fn sub_back_color_value(rgb: &str, opacity_percent: f64) -> String {
+    // 顺手规范成大写：`<input type="color">` 给的是小写，而「同一个颜色两种写法」
+    // 会让属性值比对与日志看起来像变了色。
+    let hex: String = rgb
+        .trim()
+        .trim_start_matches('#')
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(6)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let rgb6 = if hex.len() == 6 { hex } else { "000000".to_string() };
+    let alpha = (opacity_percent.clamp(0.0, 100.0) / 100.0 * 255.0).round() as u32;
+    format!("#{alpha:02X}{rgb6}")
+}
+
 impl PlayerCore {
     pub fn new(app: AppHandle) -> Self {
         Self {
@@ -253,6 +274,14 @@ impl PlayerCore {
         }
         if let Some(v) = style.pos {
             mpv.set_property("sub-pos", v).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.back_color {
+            // 0% 也要下发：用户把不透明度拖回 0 时得真的回到「无背景条」
+            let value = sub_back_color_value(&v, style.back_opacity.unwrap_or(0.0));
+            mpv.set_property("sub-back-color", value).map_err(mpv_err)?;
+        }
+        if let Some(v) = style.ass_override {
+            mpv.set_property("sub-ass-override", v).map_err(mpv_err)?;
         }
         Ok(())
     }
@@ -587,11 +616,25 @@ fn emit_state_shared(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_default_device, loudness_gain_db};
+    use super::{ensure_default_device, loudness_gain_db, sub_back_color_value};
     use crate::model::AudioDevice;
 
     fn dev(id: &str, label: &str) -> AudioDevice {
         AudioDevice { device_id: id.into(), label: label.into() }
+    }
+
+    /// P0-24：UI 给的是 `#RRGGBB` + 不透明度，mpv 要 `#AARRGGBB`。
+    #[test]
+    fn sub_back_color_composes_alpha_in_front() {
+        assert_eq!(sub_back_color_value("#000000", 0.0), "#00000000", "0% = mpv 默认的无背景条");
+        assert_eq!(sub_back_color_value("#000000", 50.0), "#80000000");
+        assert_eq!(sub_back_color_value("#ffffff", 100.0), "#FFFFFFFF");
+        assert_eq!(sub_back_color_value("#FFCC00", 30.0), "#4DFFCC00");
+        assert_eq!(sub_back_color_value("  #12ab34  ", 100.0), "#FF12AB34", "trim + 大小写无关");
+        assert_eq!(sub_back_color_value("#123", 100.0), "#FF000000", "位数不足退回黑底而不是截断越界");
+        assert_eq!(sub_back_color_value("#中文", 50.0), "#80000000", "非十六进制字符不会 panic");
+        assert_eq!(sub_back_color_value("#000000", 999.0), "#FF000000", "越界钳到 100%");
+        assert_eq!(sub_back_color_value("#000000", -5.0), "#00000000", "越界钳到 0%");
     }
 
     #[test]

@@ -209,18 +209,29 @@ fn set_clipboard_win(text: &str) -> bool {
     }
 }
 
-/// 资源管理器中定位文件
+/// 资源管理器中定位文件。
+///
+/// `explorer.exe` 只认**一个**参数 `/select,<路径>`：拆成 `["/select,", path]` 时它把
+/// 第一个参数当成要打开的位置、第二个当成不存在的东西，结果是静默什么都不做
+/// （不报错、不弹窗，用户只看见「点了没反应」）。
+///
+/// 这里用 `std::process::Command` 而不是 `tokio::process`：只是把进程拉起来就走，
+/// 不需要 reactor，也就不该因为取不到运行时（`fftools::runtime()` 失败）而误报 false。
+/// 含空格的路径由 `Command` 按 CreateProcess 规则补引号，explorer 能正确解析。
 #[tauri::command]
 pub fn show_item_in_folder(path: String) -> bool {
-    let arg = format!("/select,{path}");
-    let Ok(rt) = crate::fftools::runtime() else {
+    if path.is_empty() {
         return false;
-    };
-    rt.block_on(async {
-        #[cfg(windows)]
-        {
-            let _ = tokio::process::Command::new("explorer.exe").args(["/select,", &arg]).spawn();
-        }
-    });
-    true
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{path}"))
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }

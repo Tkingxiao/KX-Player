@@ -145,7 +145,16 @@ export interface SubStyle {
   borderSize?: number
   shadowOffset?: number
   pos?: number
+  /** 背景条基色 #RRGGBB（P0-24）；与 backOpacity 一起由 Rust 合成 mpv 的 #AARRGGBB */
+  backColor?: string
+  /** 背景条不透明度 0–100，0 = 无背景条（mpv 默认） */
+  backOpacity?: number
+  /** mpv sub-ass-override（P0-25）：no | yes | force | scale | strip */
+  assOverride?: AssOverride
 }
+
+/** `sub-ass-override` 的五个合法档位（顺序即 UI 展示顺序） */
+export type AssOverride = 'no' | 'yes' | 'force' | 'scale' | 'strip'
 
 // ── ffmpeg 任务 ─────────────────────────────────────────────
 
@@ -210,6 +219,10 @@ export interface AiChatResult {
 export interface AiPingResult {
   ok: boolean
   message: string
+  /** 以下三项由 AI-5 的连通性测试回显；失败时 Rust 侧整键缺席（camelCase，见 model.rs） */
+  model?: string
+  latencyMs?: number
+  totalTokens?: number
 }
 
 export interface AiModelsResult {
