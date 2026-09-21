@@ -1,5 +1,6 @@
 //! 命令层：设置/背景图/窗口/ffmpeg/AI。
 
+use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::model::{AiChatPayload, AiChatResult, AiModelsResult, AiPingResult, BgImageData};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State, WebviewWindow};
@@ -33,6 +34,14 @@ pub fn save_bg_image(data_url: String) -> bool {
 #[tauri::command]
 pub fn remove_bg_image() -> bool {
     crate::bgimage::remove()
+}
+
+// ── 启动自检 ────────────────────────────────────────────────────
+
+/// 取走 setup 阶段收集的降级提示；取一次即清空，重启才会再报。
+#[tauri::command]
+pub fn startup_warnings() -> Vec<String> {
+    crate::state::take_startup_warnings()
 }
 
 // ── 窗口 ────────────────────────────────────────────────────────
@@ -76,9 +85,10 @@ pub fn force_close_window(app: AppHandle, window: WebviewWindow, state: State<'_
 }
 
 #[tauri::command]
-pub fn toggle_fullscreen(window: WebviewWindow) -> Result<bool, String> {
-    let on = !window.is_fullscreen().map_err(|e| e.to_string())?;
-    window.set_fullscreen(on).map_err(|e| e.to_string())?;
+pub fn toggle_fullscreen(window: WebviewWindow) -> IpcResult<bool> {
+    let q = |e: tauri::Error| IpcError::with_detail(AppErrorCode::Internal, "切换全屏失败", e);
+    let on = !window.is_fullscreen().map_err(q)?;
+    window.set_fullscreen(on).map_err(q)?;
     Ok(on)
 }
 

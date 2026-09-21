@@ -118,9 +118,9 @@ export const useSettingsStore = defineStore('settings', () => {
       : 'cover'
     bgBlur.value = ratio('bgBlur', 0, 0, 40)
     imgEditState.value = g<BgEditState | null>('_imgEditState', null)
-    titlebarOpacity.value = ratio('titlebarOpacity', 0.72, 0.2, 1)
-    sidebarOpacity.value = ratio('sidebarOpacity', 0.8, 0.2, 1)
-    playerOpacity.value = ratio('playerOpacity', 0.9, 0.2, 1)
+    titlebarOpacity.value = ratio('titlebarOpacity', 0.72, 0, 1)
+    sidebarOpacity.value = ratio('sidebarOpacity', 0.8, 0, 1)
+    playerOpacity.value = ratio('playerOpacity', 0.9, 0, 1)
     vol.value = ratio('vol', 0.85, 0, 1)
     muted.value = g('muted', false)
     mode.value = (g('mode', 0) as 0 | 1 | 2 | 3) ?? 0

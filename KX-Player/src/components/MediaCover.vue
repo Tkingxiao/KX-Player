@@ -99,7 +99,7 @@ const durationLabel = computed(() => fmtTime(props.track.duration))
   padding: 2px 6px;
   border-radius: 4px;
   background: rgba(0, 0, 0, 0.62);
-  color: #fff;
+  color: var(--on-media);
   font-size: 10px;
   backdrop-filter: blur(4px);
 }

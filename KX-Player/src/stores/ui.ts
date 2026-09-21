@@ -2,6 +2,7 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed, watch } from 'vue'
 import { api } from '@/bridge/ipc'
+import { PIP_GUTTER } from '@/contracts/pip'
 
 export type ViewKind =
   | 'folder' | 'smart' | 'recent' | 'fav' | 'playlist' | 'search' | 'tools' | 'lyrics' | 'stage' | 'ai'
@@ -102,8 +103,9 @@ export const useUiStore = defineStore('ui', () => {
   interface PipRect { x: number; y: number; w: number; h: number }
   function defaultPipRect(): PipRect {
     const dpr = window.devicePixelRatio || 1
-    const w = Math.round(320 * dpr)
-    const h = Math.round(180 * dpr)
+    // 首开尺寸 320x180；实际比例由 PipRoot 打开后按 mpv 画面参数再对齐一次
+    const w = Math.round((320 + PIP_GUTTER * 2) * dpr)
+    const h = Math.round((180 + PIP_GUTTER * 2) * dpr)
     return {
       x: Math.max(0, Math.round((screen.availWidth - w) / 2)),
       y: Math.max(0, Math.round((screen.availHeight - h) / 2) - Math.round(24 * dpr)),
@@ -131,15 +133,30 @@ export const useUiStore = defineStore('ui', () => {
   async function openPip(): Promise<void> {
     const rect = loadPipRect() ?? defaultPipRect()
     const ok = await api.pipOpen(rect.x, rect.y, rect.w, rect.h)
-    if (ok) pipEnabled.value = true
+    if (!ok) return
+    pipEnabled.value = true
+    // 规范 P0-4：悬浮期间库浏览不中断 —— 从舞台切出浮窗后主窗口退回进入前的视图，
+    // 而不是留在一块被浮窗接管画面的黑舞台（否则既看不了库也点不到返回）。
+    if (view.value === 'stage' && previousView.value !== 'stage') {
+      goBack()
+    }
   }
 
-  /** 关闭悬浮窗并复位钉住状态。先等 Rust 把 mpv 覆盖窗口挂回主窗口
-   *  再翻转状态，避免 stage 在挂靠切换完成前抢发旧坐标系下的矩形。 */
+  /** 关闭悬浮窗。先通知 Rust（Rust 会 detach_overlay + hide + emit pip:closed），
+   *  再由 pip:closed 事件回调清 pipEnabled，确保时序正确。
+   *  此函数 await api.pipClose() 后主动清 pipEnabled（兜底，防事件延迟）。 */
   async function closePip(): Promise<void> {
     await api.pipClose()
+    // pip:closed 事件会设 pipEnabled=false；这里也主动设一次（兜底）
     pipEnabled.value = false
     pipPinned.value = false
+  }
+
+  /** 从浮窗还原（双击画面 / Esc）：回到主窗口舞台视图继续播放 */
+  function restoreToStage(): void {
+    pipEnabled.value = false
+    pipPinned.value = false
+    view.value = 'stage'
   }
 
   // ── 独立悬浮窗事件同步 ──────────────────────────────────────
@@ -148,6 +165,9 @@ export const useUiStore = defineStore('ui', () => {
   api.onPipClosed(() => {
     pipEnabled.value = false
     pipPinned.value = false
+  })
+  api.onPipRestored(() => {
+    restoreToStage()
   })
   api.onPipPinned((pinned) => {
     pipPinned.value = pinned
@@ -243,6 +263,6 @@ export const useUiStore = defineStore('ui', () => {
     selectionMode, selection, ctxMenu, toasts,
     openFolder, savedScroll, recordScroll, toast, updateToast, removeToast,
     toggleSelect, clearSelection, toggleTag, toggleExpanded, clearTaxonomy, closeAllPanels,
-    goBack, togglePip, closePip,
+    goBack, togglePip, closePip, restoreToStage,
   }
 })

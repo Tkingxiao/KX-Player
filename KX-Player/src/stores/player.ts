@@ -1,11 +1,13 @@
 /** 播放引擎 store：mpv 内核镜像 + 队列 + 四种模式 + 倍速 + 睡眠定时 + 进度记忆 + 书签。
  *  引擎在 Rust 侧（libmpv），本 store 只镜像 `player:state` 事件并转发命令。 */
 import { defineStore } from 'pinia'
-import { ref, shallowRef, computed } from 'vue'
+import { ref, shallowRef, computed, watch } from 'vue'
 import type { Track, Bookmark, AudioDevice, MpvPlayerState, SubtitleTrack } from '@/contracts/api'
+import { errText } from '@/contracts/result'
 import { api, onEvent } from '@/bridge/ipc'
 import { useLibraryStore } from '@/stores/library'
 import { useSettingsStore } from '@/stores/settings'
+import { useUiStore } from '@/stores/ui'
 import { loadLyricsForTrack, type LoadedLyrics } from '@/utils/lyricsLoader'
 import { nextIndex, prevIndex, onEnded } from '@/utils/queue'
 import { completedOnWrite } from '@/utils/playback'
@@ -24,6 +26,7 @@ export interface SleepState {
 export const usePlayerStore = defineStore('player', () => {
   const library = useLibraryStore()
   const settings = useSettingsStore()
+  const ui = useUiStore()
 
   // ── 状态 ──
   const queue = shallowRef<string[]>([])
@@ -41,7 +44,6 @@ export const usePlayerStore = defineStore('player', () => {
   const sleep = ref<SleepState>({ active: false, endAt: 0, action: 'pause', triggerOnEnded: false })
   const sleepRemaining = ref(0)
   const bookmarks = shallowRef<Bookmark[]>([])
-  const videoMode = ref<'audio' | 'video'>('audio')
   const subtitleTracks = shallowRef<SubtitleTrack[]>([])
   const subtitleVisible = ref(true)
   const subtitleDelay = ref(0)
@@ -54,6 +56,16 @@ export const usePlayerStore = defineStore('player', () => {
   let ending = false
 
   const current = computed<Track | null>(() => (currentId.value ? library.trackIndex.get(currentId.value) ?? null : null))
+
+  /** 是否要画面：有能显示画面的表面（舞台可见 / 悬浮窗打开）且曲目是视频且未开「仅音频」。
+   *  必须由视图状态派生，不能在「播放入口」决定：从队列点击、续播、自动切歌这些入口
+   *  不带视频意图，若据此把 vid 置 no，之后切进舞台或开小窗就只有声音没有画面。 */
+  const videoMode = computed<'audio' | 'video'>(
+    () => ((ui.view === 'stage' || ui.pipEnabled) && !!current.value?.isVideo && !audioOnly.value ? 'video' : 'audio'),
+  )
+  watch(videoMode, (m) => {
+    void api.playerSetVideoEnabled(m === 'video').catch(() => {})
+  })
   const currentTitle = computed(() => (current.value ? trackName(current.value) : '未在播放'))
   const currentArtist = computed(() => (current.value ? (current.value.metaArtist || current.value.artist || '佚名') : ''))
 
@@ -94,7 +106,7 @@ export const usePlayerStore = defineStore('player', () => {
       lyricsInfo.value = info
       lyrics.value = info.lines
     })
-    const videoActive = !!autoplay && videoMode.value === 'video' && track.isVideo && !audioOnly.value
+    const videoActive = !!autoplay && videoMode.value === 'video'
     try {
       await api.playerPlay({
         trackPath: track.path,
@@ -105,7 +117,7 @@ export const usePlayerStore = defineStore('player', () => {
         videoActive,
       })
     } catch (e) {
-      error.value = String(e)
+      error.value = errText(e)
       loading.value = false
       return false
     }
@@ -115,13 +127,12 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   /** 播放指定曲目（带队列上下文）。fromLast=true 时从上次进度续播。 */
-  async function playTrack(track: Track, list: string[], name: string, opts?: { fromLast?: boolean; video?: boolean }): Promise<void> {
+  async function playTrack(track: Track, list: string[], name: string, opts?: { fromLast?: boolean }): Promise<void> {
     if (!track) return
     queue.value = list
     queueName.value = name
     currentId.value = track.id
     ending = false
-    videoMode.value = opts?.video && track.isVideo ? 'video' : 'audio'
     const prevProgress = library.progress.get(track.id)
     const resumeMs = opts?.fromLast ? prevProgress?.positionMs ?? 0 : 0
     if (!library.progress.has(track.id)) library.updateProgressLocal(track.id, 0)
@@ -147,12 +158,12 @@ export const usePlayerStore = defineStore('player', () => {
     startProgressWriter()
     // mpv 此时已初始化完成：此时才能枚举到全部输出设备，刷新一次设备列表
     void refreshDevices()
-    // 视频舞台几何在 StageView 挂载时同步；这里若已在舞台视图先刷新一次
-    void api.playerSetVideoEnabled(videoMode.value === 'video' && track.isVideo && !audioOnly.value).catch(() => false)
+    // loadfile 会沿用上一曲的 vid 设置：新曲目载入后按当前视图重新声明是否要画面
+    void api.playerSetVideoEnabled(videoMode.value === 'video').catch(() => {})
   }
 
   /** 在当前队列中定位播放 */
-  async function playFromList(list: string[], index: number, name: string, opts?: { fromLast?: boolean; video?: boolean }): Promise<void> {
+  async function playFromList(list: string[], index: number, name: string, opts?: { fromLast?: boolean }): Promise<void> {
     if (index < 0 || index >= list.length) return
     const track = library.trackIndex.get(list[index])
     if (!track) return
@@ -172,7 +183,7 @@ export const usePlayerStore = defineStore('player', () => {
     const idx = queue.value.indexOf(currentId.value ?? '')
     const n = nextIndex(settings.mode, idx, queue.value.length)
     if (n === null) return
-    await playFromList(queue.value, n, queueName.value, { fromLast: true, video: videoMode.value === 'video' })
+    await playFromList(queue.value, n, queueName.value, { fromLast: true })
   }
 
   async function prev(): Promise<void> {
@@ -180,7 +191,7 @@ export const usePlayerStore = defineStore('player', () => {
     const idx = queue.value.indexOf(currentId.value ?? '')
     const p = prevIndex(settings.mode, idx, queue.value.length)
     if (p === null) return
-    await playFromList(queue.value, p, queueName.value, { fromLast: true, video: videoMode.value === 'video' })
+    await playFromList(queue.value, p, queueName.value, { fromLast: true })
   }
 
   function seek(sec: number): void {
@@ -317,8 +328,7 @@ export const usePlayerStore = defineStore('player', () => {
 
   // ── 仅音频模式（P0-30：vid=no，引擎始终是 mpv）──
   function setAudioOnly(on: boolean): void {
-    audioOnly.value = on
-    void api.playerSetVideoEnabled(!on).catch(() => false)
+    audioOnly.value = on // vid 由 videoMode 侦听统一下发，避免与「有无画面表面」的判断打架
   }
 
   // ── 睡眠定时 ──

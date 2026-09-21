@@ -91,7 +91,7 @@ const smartCounts = computed<Record<SmartKey, number>>(() => {
     else counts.audio++
     if (t.lyricsPath) counts.withSubs++
     if (favoriteIds.has(t.id)) counts.favorites++
-    if (t.fileMtime > 0 && now - t.fileMtime < 30 * 86400_000) counts.recentAdded++
+    if (t.fileMtime > 0 && now - t.fileMtime * 1000 < 30 * 86400_000) counts.recentAdded++
   }
   return counts
 })

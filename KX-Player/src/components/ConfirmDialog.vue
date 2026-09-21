@@ -60,7 +60,7 @@ defineExpose({ open })
             <button
               ref="confirmBtn"
               class="btn-primary"
-              :style="opts.danger ? 'background:#e63a2e' : ''"
+              :style="opts.danger ? 'background:var(--danger)' : ''"
               @click="close(true)"
             >{{ opts.confirmText || '确定' }}</button>
           </div>

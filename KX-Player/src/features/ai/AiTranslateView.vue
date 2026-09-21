@@ -7,6 +7,7 @@ import { useLibraryStore } from '@/stores/library'
 import { api } from '@/bridge/ipc'
 import { scanSubtitleFiles, translateFile, translateSegments, type SubtitleFile } from '@/services/aiTranslate'
 import { normDir } from '@/utils/format'
+import { errText } from '@/contracts/result'
 
 const ui = useUiStore()
 const settings = useSettingsStore()
@@ -53,7 +54,7 @@ async function fetchModels(): Promise<void> {
     }
   } catch (e) {
     // 之前只有 try/finally：invoke 失败会被静默吞掉，按钮看起来「无效」
-    modelError.value = String(e)
+    modelError.value = errText(e)
   } finally {
     fetchingModels.value = false
   }
@@ -128,7 +129,7 @@ async function startTranslate(): Promise<void> {
       f.out = r.outPath
     } catch (e) {
       f.state = 'failed'
-      f.error = e instanceof Error ? e.message : String(e)
+      f.error = errText(e)
     }
     doneCount.value++
   }
@@ -482,7 +483,6 @@ onBeforeUnmount(() => { cancelFlag = true })
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--bg-input);
-  outline: none;
   font-size: 12px;
 }
 .ai-field input:focus { border-color: rgb(var(--accent-rgb)); }
@@ -499,7 +499,7 @@ onBeforeUnmount(() => { cancelFlag = true })
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.ai-test-result.ok { color: #40c878; }
+.ai-test-result.ok { color: var(--success); }
 
 .ai-target-row {
   display: flex;
@@ -562,9 +562,9 @@ onBeforeUnmount(() => { cancelFlag = true })
   font-size: 12px;
 }
 .ai-file:nth-child(odd) { background: var(--bg-hover); }
-.ai-file.done .ai-file-state { color: #40c878; }
+.ai-file.done .ai-file-state { color: var(--success); }
 .ai-file.failed { background: rgba(230, 58, 46, 0.08); }
-.ai-file.failed .ai-file-state { color: #e6685f; }
+.ai-file.failed .ai-file-state { color: var(--danger); }
 .ai-file.running .ai-file-state { color: rgb(var(--accent-rgb)); }
 .ai-file-state { width: 44px; flex-shrink: 0; color: var(--text-muted); }
 .ai-file-name {
@@ -577,7 +577,7 @@ onBeforeUnmount(() => { cancelFlag = true })
 .ai-file-out {
   flex-shrink: 0;
   font-size: 11px;
-  color: #40c878;
+  color: var(--success);
   max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -588,7 +588,7 @@ onBeforeUnmount(() => { cancelFlag = true })
   height: 16px;
   border-radius: 50%;
   background: rgba(230, 58, 46, 0.2);
-  color: #e6685f;
+  color: var(--danger);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -602,7 +602,7 @@ onBeforeUnmount(() => { cancelFlag = true })
   font-size: 12px;
   color: var(--text-muted);
 }
-.danger-ghost:hover { color: #e6685f; border-color: rgba(230, 58, 46, 0.5); }
+.danger-ghost:hover { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
 
 .ai-model-row {
   display: flex;
@@ -637,7 +637,7 @@ onBeforeUnmount(() => { cancelFlag = true })
 }
 .ai-model-toggle:hover { background: var(--bg-hover); color: var(--text); }
 .ai-model-btn { flex-shrink: 0; padding: 6px 10px; font-size: 11px; }
-.ai-field-error { font-size: 10.5px; color: #e6685f; }
+.ai-field-error { font-size: 10.5px; color: var(--danger); }
 
 /* ── 模型下拉列表：完整展示、可滚动、可过滤 ── */
 .ai-field { position: relative; }
@@ -722,7 +722,7 @@ onBeforeUnmount(() => { cancelFlag = true })
   font-size: 12px;
   color: rgb(var(--accent-rgb));
 }
-.ai-file.dir-done .ai-file-state { color: #40c878; }
-.ai-file.dir-conflict .ai-file-state { color: #ffc857; }
-.ai-file.dir-failed .ai-file-state { color: #e6685f; }
+.ai-file.dir-done .ai-file-state { color: var(--success); }
+.ai-file.dir-conflict .ai-file-state { color: var(--warning); }
+.ai-file.dir-failed .ai-file-state { color: var(--danger); }
 </style>

@@ -112,18 +112,25 @@ const previewStyle = computed<Record<string, string>>(() => {
   else if (fit === 'cover') style.objectFit = 'cover'
   else if (fit === 'center') { style.objectFit = 'none'; style.objectPosition = 'center' }
   else if (fit === 'tile') {
-    style.objectFit = 'none'
-    style.objectRepeat = 'repeat'
-    style.width = 'auto'
-    style.height = 'auto'
-    style.minWidth = '100%'
-    style.minHeight = '100%'
+    // 平铺：<img> 不支持 CSS repeat，隐藏 img，由 previewContainerStyle 用 background-image 实现
+    style.display = 'none'
   }
   // 居中/平铺不施加缩放平移（与 repeat/none 冲突）
   if (fit !== 'tile' && fit !== 'center') {
     style.transform = `translate(${(posX.value - 50) * 0.8}%, ${(posY.value - 50) * 0.8}%) scale(${zoomPct.value / 100})`
   }
   return style
+})
+
+/** 平铺模式：在预览容器上用 background-image 实现 */
+const previewContainerStyle = computed<Record<string, string>>(() => {
+  if (settings.bgSize !== 'tile' || !bgUrl.value) return {} as Record<string, string>
+  return {
+    backgroundImage: `url(${bgUrl.value})`,
+    backgroundRepeat: 'repeat',
+    backgroundSize: 'auto',
+    opacity: String(Math.max(0, Math.min(1, 1 - settings.ovl))),
+  }
 })
 
 function setFit(v: 'stretch' | 'cover' | 'center' | 'tile' | 'contain'): void {
@@ -152,6 +159,7 @@ onBeforeUnmount(() => {
             ref="preview"
             class="bge-preview"
             :class="{ dragging }"
+            :style="previewContainerStyle"
             @wheel="onWheel"
             @mousedown="onDragStart"
           >

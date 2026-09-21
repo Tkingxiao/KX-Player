@@ -12,6 +12,7 @@ import VirtualGrid from '@/components/VirtualGrid.vue'
 import VirtualList from '@/components/VirtualList.vue'
 import MediaCover from '@/components/MediaCover.vue'
 import SelectMenu from '@/components/SelectMenu.vue'
+import { cardRowHeight } from '@/utils/layout'
 import TrackTable from '@/features/library/TrackTable.vue'
 import { SMART_LABELS, DURATION_BUCKETS, matchSmart, cmpBy } from '@/utils/collections'
 import { trackName, trackArtist, fmtTime } from '@/utils/format'
@@ -165,7 +166,7 @@ function rowKey(i: number): string {
         ref="gridScroller"
         :count="filteredTracks.length"
         :card-width="settings.gridSize"
-        :card-height="settings.gridSize + 58"
+        :card-height="cardRowHeight(settings.gridSize)"
       >
         <template #default="{ index }">
           <div class="media-card" @dblclick="playCard(filteredTracks[index])" @contextmenu="showTrackMenu($event, filteredTracks[index], filteredTracks.map((t) => t.id), title)">
@@ -255,7 +256,7 @@ function rowKey(i: number): string {
   height: 30px;
   border-radius: 50%;
   background: rgb(var(--accent-rgb));
-  color: #fff;
+  color: var(--on-accent);
   display: flex;
   align-items: center;
   justify-content: center;

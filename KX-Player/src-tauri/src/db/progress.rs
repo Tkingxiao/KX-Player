@@ -1,40 +1,16 @@
 //! 播放进度与书签（与 Electron progressDb.ts 语义逐条一致；≥95% 完听由前端判定）。
 
-use super::with_db;
+use super::{initialize_schema, with_db};
 use crate::model::{Bookmark, PlayProgress};
 use rusqlite::Result;
 use std::path::Path;
-
-fn init(conn: &rusqlite::Connection) -> Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS play_progress (
-          track_id     TEXT PRIMARY KEY,
-          position_ms  INTEGER NOT NULL DEFAULT 0,
-          completed    INTEGER NOT NULL DEFAULT 0,
-          play_count   INTEGER NOT NULL DEFAULT 1,
-          played_at    INTEGER NOT NULL DEFAULT 0,
-          last_speed   REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_progress_played_at ON play_progress(played_at DESC);
-        CREATE TABLE IF NOT EXISTS bookmarks (
-          id         TEXT PRIMARY KEY,
-          track_id   TEXT NOT NULL,
-          at_ms      INTEGER NOT NULL,
-          label      TEXT NOT NULL DEFAULT '',
-          created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_bookmarks_track ON bookmarks(track_id, at_ms);
-        "#,
-    )
-}
 
 pub fn get_all_progress(db_path: &Path) -> Vec<PlayProgress> {
     if !db_path.exists() {
         return vec![];
     }
     let r = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         let mut stmt = conn.prepare("SELECT track_id, position_ms, completed, play_count, played_at, last_speed FROM play_progress")?;
         let rows = stmt.query_map([], |r| {
             Ok(PlayProgress {
@@ -54,7 +30,7 @@ pub fn get_all_progress(db_path: &Path) -> Vec<PlayProgress> {
 /// completed=None 表示保留原值（播放中回写位置）
 pub fn set_progress(db_path: &Path, track_id: &str, position_ms: i64, completed: Option<bool>, last_speed: Option<f64>) {
     let _ = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         conn.execute(
             "INSERT INTO play_progress (track_id, position_ms, completed, play_count, played_at, last_speed)
              VALUES (?1, ?2, ?3, 1, ?4, ?5)
@@ -78,7 +54,7 @@ pub fn set_progress(db_path: &Path, track_id: &str, position_ms: i64, completed:
 
 pub fn mark_completed(db_path: &Path, track_id: &str, completed: bool) {
     let _ = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         conn.execute(
             "INSERT INTO play_progress (track_id, position_ms, completed, play_count, played_at)
              VALUES (?1, 0, ?2, 1, ?3)
@@ -91,7 +67,7 @@ pub fn mark_completed(db_path: &Path, track_id: &str, completed: bool) {
 
 pub fn clear_progress(db_path: &Path, track_id: &str) {
     let _ = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         conn.execute("DELETE FROM play_progress WHERE track_id = ?1", [track_id])?;
         Ok(())
     });
@@ -103,7 +79,7 @@ pub fn prune_progress_and_bookmarks(db_path: &Path) {
         return;
     }
     let _ = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         conn.execute("DELETE FROM play_progress WHERE track_id NOT IN (SELECT id FROM tracks)", [])?;
         conn.execute("DELETE FROM bookmarks WHERE track_id NOT IN (SELECT id FROM tracks)", [])?;
         Ok(())
@@ -115,7 +91,7 @@ pub fn list_bookmarks(db_path: &Path, track_id: &str) -> Vec<Bookmark> {
         return vec![];
     }
     let r = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         let mut stmt = conn.prepare(
             "SELECT id, track_id, at_ms, label, created_at FROM bookmarks WHERE track_id = ?1 ORDER BY at_ms ASC",
         )?;
@@ -134,10 +110,10 @@ pub fn list_bookmarks(db_path: &Path, track_id: &str) -> Vec<Bookmark> {
 }
 
 pub fn add_bookmark(db_path: &Path, track_id: &str, at_ms: i64, label: &str) -> Option<Bookmark> {
-    let id = format!("bm_{}_{}", now_ms().to_string(), rand_suffix());
+    let id = format!("bm_{}_{}", now_ms(), rand_suffix());
     let created = now_ms();
     let r = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         conn.execute(
             "INSERT INTO bookmarks (id, track_id, at_ms, label, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![id, track_id, at_ms.max(0), label, created],
@@ -150,7 +126,7 @@ pub fn add_bookmark(db_path: &Path, track_id: &str, at_ms: i64, label: &str) -> 
 
 pub fn rename_bookmark(db_path: &Path, id: &str, label: &str) {
     let _ = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         conn.execute("UPDATE bookmarks SET label = ?1 WHERE id = ?2", rusqlite::params![label, id])?;
         Ok(())
     });
@@ -158,7 +134,7 @@ pub fn rename_bookmark(db_path: &Path, id: &str, label: &str) {
 
 pub fn remove_bookmark(db_path: &Path, id: &str) {
     let _ = with_db(db_path, |conn| {
-        init(conn)?;
+        initialize_schema(conn)?;
         conn.execute("DELETE FROM bookmarks WHERE id = ?1", [id])?;
         Ok(())
     });

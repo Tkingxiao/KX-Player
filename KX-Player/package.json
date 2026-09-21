@@ -11,13 +11,17 @@
     "build": "vite build",
     "build:fe": "vite build",
     "tauri": "tauri",
-    "check": "vue-tsc --noEmit && vitest run",
-    "check:types": "vue-tsc --noEmit"
+    "check": "vue-tsc --noEmit && node scripts/gen-ipc-doc.mjs --check && vitest run && cd src-tauri && cargo clippy --all-targets -- -D warnings",
+    "check:types": "vue-tsc --noEmit",
+    "check:ffmpeg": "node scripts/check-ffmpeg.mjs",
+    "check:ipc": "node scripts/gen-ipc-doc.mjs --check",
+    "check:clippy": "cd src-tauri && cargo clippy --all-targets -- -D warnings",
+    "test": "vitest run && cd src-tauri && cargo test",
+    "gen:ipc": "node scripts/gen-ipc-doc.mjs"
   },
   "dependencies": {
-    "@fontsource/inter": "^5.2.8",
-    "@fontsource/noto-sans-sc": "^5.2.9",
     "@tauri-apps/api": "^2.11.1",
+    "@vueuse/core": "^15.0.0",
     "chinese-conv": "^4.0.0",
     "pinia": "^4.0.3",
     "pinyin-pro": "^3.28.1",

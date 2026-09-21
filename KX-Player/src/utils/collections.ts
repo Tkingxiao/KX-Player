@@ -18,7 +18,7 @@ export const SMART_LABELS: Record<SmartCollection, string> = {
   favorites: '收藏',
   video: '视频',
   audio: '仅音频',
-  withSubs: '有歌词',
+  withSubs: '有字幕',
 }
 
 export type DurationBucket = 'lt10m' | 'to30m' | 'to60m' | 'to2h' | 'gt2h'

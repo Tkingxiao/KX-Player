@@ -410,7 +410,6 @@ onMounted(() => {
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--bg-input);
-  outline: none;
   font-size: 12px;
 }
 .bm-row {
@@ -445,7 +444,6 @@ onMounted(() => {
   border: 1px solid rgb(var(--accent-rgb));
   border-radius: 4px;
   background: var(--bg-input);
-  outline: none;
 }
 .bm-row .icon-btn { opacity: 0; width: 22px; height: 22px; font-size: 10px; }
 .bm-row:hover .icon-btn { opacity: 1; }

@@ -2,6 +2,7 @@
 //! 自动打标只产生建议，绝不直接写库（宪法禁止项 24）。
 
 use crate::db::with_db;
+use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::paths::library_db_path;
 use rusqlite::params;
 use serde::Serialize;
@@ -99,7 +100,7 @@ pub fn build_category_tree(mut flat: Vec<CategoryDto>) -> Vec<CategoryDto> {
         }
     }
     fn sort_rec(nodes: &mut Vec<CategoryDto>) {
-        nodes.sort_by(|a, b| (a.sort_index, a.id).cmp(&(b.sort_index, b.id)));
+        nodes.sort_by_key(|a| (a.sort_index, a.id));
         for n in nodes {
             sort_rec(&mut n.children);
         }
@@ -108,9 +109,9 @@ pub fn build_category_tree(mut flat: Vec<CategoryDto>) -> Vec<CategoryDto> {
     roots
 }
 
-pub fn create_category(parent_id: Option<i64>, name: &str) -> Result<i64, String> {
+pub fn create_category(parent_id: Option<i64>, name: &str) -> IpcResult<i64> {
     if name.trim().is_empty() {
-        return Err("名称不能为空".into());
+        return Err(IpcError::invalid_argument("名称不能为空"));
     }
     with_db(Path::new(&library_db_path()), |conn| {
         crate::db::initialize_schema(conn)?;
@@ -120,32 +121,32 @@ pub fn create_category(parent_id: Option<i64>, name: &str) -> Result<i64, String
         )?;
         Ok(conn.last_insert_rowid())
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
-pub fn rename_category(id: i64, name: &str) -> Result<(), String> {
+pub fn rename_category(id: i64, name: &str) -> IpcResult<()> {
     if name.trim().is_empty() {
-        return Err("名称不能为空".into());
+        return Err(IpcError::invalid_argument("名称不能为空"));
     }
     with_db(Path::new(&library_db_path()), |conn| {
         conn.execute("UPDATE categories SET name = ?1 WHERE id = ?2", params![name.trim(), id])?;
         Ok(())
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
-pub fn delete_category(id: i64) -> Result<(), String> {
+pub fn delete_category(id: i64) -> IpcResult<()> {
     with_db(Path::new(&library_db_path()), |conn| {
         // 级联删除子分类与关联（ON DELETE CASCADE）
         conn.execute("DELETE FROM categories WHERE id = ?1", [id])?;
         Ok(())
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
-pub fn move_category(id: i64, parent_id: Option<i64>, sort_index: i64) -> Result<(), String> {
+pub fn move_category(id: i64, parent_id: Option<i64>, sort_index: i64) -> IpcResult<()> {
     if parent_id == Some(id) {
-        return Err("不能移动到自己".into());
+        return Err(IpcError::invalid_argument("不能移动到自己"));
     }
     with_db(Path::new(&library_db_path()), |conn| {
         conn.execute(
@@ -154,10 +155,10 @@ pub fn move_category(id: i64, parent_id: Option<i64>, sort_index: i64) -> Result
         )?;
         Ok(())
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
-pub fn assign_category(category_id: i64, track_ids: &[String]) -> Result<i64, String> {
+pub fn assign_category(category_id: i64, track_ids: &[String]) -> IpcResult<i64> {
     with_db(Path::new(&library_db_path()), |conn| {
         crate::db::initialize_schema(conn)?;
         let mut changed: i64 = 0;
@@ -170,10 +171,10 @@ pub fn assign_category(category_id: i64, track_ids: &[String]) -> Result<i64, St
         }
         Ok(changed)
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
-pub fn unassign_category(category_id: i64, track_ids: &[String]) -> Result<i64, String> {
+pub fn unassign_category(category_id: i64, track_ids: &[String]) -> IpcResult<i64> {
     with_db(Path::new(&library_db_path()), |conn| {
         let mut changed: i64 = 0;
         for tid in track_ids {
@@ -182,7 +183,7 @@ pub fn unassign_category(category_id: i64, track_ids: &[String]) -> Result<i64, 
         }
         Ok(changed)
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
 pub fn category_track_ids(category_id: i64, include_children: bool) -> Vec<String> {
@@ -242,9 +243,9 @@ pub fn list_tags() -> Vec<TagDto> {
     .unwrap_or_default()
 }
 
-pub fn upsert_tag(name: &str, color: Option<&str>, kind: &str) -> Result<i64, String> {
+pub fn upsert_tag(name: &str, color: Option<&str>, kind: &str) -> IpcResult<i64> {
     if name.trim().is_empty() {
-        return Err("名称不能为空".into());
+        return Err(IpcError::invalid_argument("名称不能为空"));
     }
     with_db(Path::new(&library_db_path()), |conn| {
         crate::db::initialize_schema(conn)?;
@@ -253,15 +254,15 @@ pub fn upsert_tag(name: &str, color: Option<&str>, kind: &str) -> Result<i64, St
              ON CONFLICT(name) DO UPDATE SET color = COALESCE(excluded.color, tags.color)",
             params![name.trim(), color, kind],
         )?;
-        Ok(conn.query_row("SELECT id FROM tags WHERE name = ?1", [name.trim()], |r| r.get(0))?)
+        conn.query_row("SELECT id FROM tags WHERE name = ?1", [name.trim()], |r| r.get(0))
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
-pub fn rename_tag(id: i64, name: &str) -> Result<(), String> {
+pub fn rename_tag(id: i64, name: &str) -> IpcResult<()> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err("名称不能为空".into());
+        return Err(IpcError::invalid_argument("名称不能为空"));
     }
     with_db(Path::new(&library_db_path()), |conn| {
         let changed = conn.execute("UPDATE tags SET name = ?1 WHERE id = ?2", params![trimmed, id])?;
@@ -272,25 +273,25 @@ pub fn rename_tag(id: i64, name: &str) -> Result<(), String> {
     })
     .map_err(|e| {
         if e.to_string().contains("UNIQUE constraint failed") {
-            "已存在同名标签".to_string()
+            IpcError::invalid_argument("已存在同名标签")
         } else if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
-            "标签不存在".to_string()
+            IpcError::new(AppErrorCode::NotFound, "标签不存在")
         } else {
-            e.to_string()
+            IpcError::db(e)
         }
     })
 }
 
-pub fn delete_tag(id: i64) -> Result<(), String> {
+pub fn delete_tag(id: i64) -> IpcResult<()> {
     with_db(Path::new(&library_db_path()), |conn| {
         conn.execute("DELETE FROM tags WHERE id = ?1", [id])?;
         Ok(())
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
 /// 打标（add=追加；replace=先清空这些条目的手动标签）
-pub fn tag_tracks(tag_ids: &[i64], track_ids: &[String], mode: &str) -> Result<i64, String> {
+pub fn tag_tracks(tag_ids: &[i64], track_ids: &[String], mode: &str) -> IpcResult<i64> {
     with_db(Path::new(&library_db_path()), |conn| {
         crate::db::initialize_schema(conn)?;
         let mut changed: i64 = 0;
@@ -312,10 +313,10 @@ pub fn tag_tracks(tag_ids: &[i64], track_ids: &[String], mode: &str) -> Result<i
         )?;
         Ok(changed)
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
-pub fn untag_tracks(tag_id: i64, track_ids: &[String]) -> Result<i64, String> {
+pub fn untag_tracks(tag_id: i64, track_ids: &[String]) -> IpcResult<i64> {
     with_db(Path::new(&library_db_path()), |conn| {
         let mut changed: i64 = 0;
         for tid in track_ids {
@@ -324,7 +325,7 @@ pub fn untag_tracks(tag_id: i64, track_ids: &[String]) -> Result<i64, String> {
         conn.execute("UPDATE tags SET use_count = (SELECT COUNT(*) FROM track_tags WHERE tag_id = tags.id)", [])?;
         Ok(changed)
     })
-    .map_err(|e| e.to_string())
+    .map_err(IpcError::db)
 }
 
 pub fn tags_of_tracks(track_ids: &[String]) -> std::collections::HashMap<String, Vec<TagDto>> {
@@ -391,7 +392,7 @@ fn match_keywords(text: &str) -> Vec<TagSuggestionDto> {
     for (kw, tag) in KEYWORDS {
         // 词边界匹配英文关键词，避免 rain 命中 brain
         let hit = if kw.is_ascii() {
-            let padded = format!(" {} ", &lower);
+            let padded = format!(" {} ", lower);
             let kw_padded = format!(" {} ", kw);
             padded.contains(&kw_padded)
                 || lower.starts_with(&format!("{kw} "))
@@ -408,7 +409,7 @@ fn match_keywords(text: &str) -> Vec<TagSuggestionDto> {
             }
         }
     }
-    out.sort_by(|a, b| b.score.cmp(&a.score));
+    out.sort_by_key(|a| std::cmp::Reverse(a.score));
     out
 }
 
@@ -439,4 +440,28 @@ pub fn suggest_tags(track_ids: &[String]) -> Vec<(String, Vec<TagSuggestionDto>)
         out.push((tid.clone(), suggestions));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::AppErrorCode;
+
+    /// 校验错误必须在**源头**拿到码：命令层只搬运，分不清「名字为空」和「数据库坏了」，
+    /// 到了那里再猜码就是编故事。这几条都应在触库之前返回。
+    #[test]
+    fn validation_errors_carry_invalid_argument_at_the_source() {
+        let rejected = [
+            super::create_category(None, "   ").err(),
+            super::rename_category(1, "").err(),
+            super::upsert_tag(" ", None, "topic").err(),
+            super::rename_tag(1, "  ").err(),
+        ];
+        for e in rejected {
+            let e = e.expect("空名称必须被拒");
+            assert_eq!(e.code, AppErrorCode::InvalidArgument, "消息: {:?}", e.message);
+            assert_eq!(e.message, "名称不能为空");
+        }
+        let e = super::move_category(7, Some(7), 0).expect_err("移动到自己必须被拒");
+        assert_eq!(e.code, AppErrorCode::InvalidArgument);
+    }
 }

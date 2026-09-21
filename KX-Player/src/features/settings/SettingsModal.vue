@@ -162,12 +162,9 @@ const bgPreviewStyle = computed<Record<string, string>>(() => {
   else if (fit === 'cover') style.objectFit = 'cover'
   else if (fit === 'center') { style.objectFit = 'none'; style.objectPosition = 'center' }
   else if (fit === 'tile') {
-    style.objectFit = 'none'
-    style.objectRepeat = 'repeat'
-    style.width = 'auto'
-    style.height = 'auto'
-    style.minWidth = '100%'
-    style.minHeight = '100%'
+    // 平铺：<img> 不支持 CSS repeat，此处仅隐藏 img；
+    // 实际平铺由 App.vue 的 #bg-layer background-image 实现
+    style.display = 'none'
   }
   const e = settings.imgEditState
   if (e && fit !== 'tile' && fit !== 'center') {
@@ -291,7 +288,7 @@ const themeRows = [
                 <span class="slider-label">{{ row.label }}</span>
                 <input
                   type="range"
-                  min="0.2"
+                  min="0"
                   max="1"
                   step="0.01"
                   :value="settings[row.key]"
@@ -462,8 +459,8 @@ const themeRows = [
   background: var(--bg-selected);
 }
 .theme-dot { width: 12px; height: 12px; border-radius: 50%; }
-.dark-dot { background: #17171c; border: 1px solid var(--border-strong); }
-.light-dot { background: #f2f2f6; border: 1px solid var(--border-strong); }
+.dark-dot { background: var(--swatch-theme-dark); border: 1px solid var(--border-strong); }
+.light-dot { background: var(--swatch-theme-light); border: 1px solid var(--border-strong); }
 
 .accent-row {
   display: flex;
@@ -490,7 +487,7 @@ const themeRows = [
   height: 8px;
   margin-left: -2px;
   border-radius: 2px;
-  background: #fff;
+  background: var(--on-media);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4), 0 0 0 4px rgba(255,255,255,0.9);
 }
 .sv-wrap { flex: 1; max-width: 200px; }

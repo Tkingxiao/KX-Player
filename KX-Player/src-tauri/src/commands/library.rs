@@ -1,10 +1,12 @@
 //! 命令层：曲库/扫描/封面/进度/书签/文件监听。
 //! 全部 async + spawn_blocking：Tauri 同步命令会在主线程执行，任何 IO 都可能卡住 UI。
 
+use crate::error::IpcResult;
 use crate::model::{Bookmark, PlayProgress, ScanResult};
 use std::path::PathBuf;
 use tauri::{AppHandle, State};
 
+use super::join_task;
 use crate::state::AppWindowsState;
 
 fn db_path() -> PathBuf {
@@ -312,11 +314,9 @@ pub async fn taxonomy_list_categories() -> Vec<crate::taxonomy::CategoryDto> {
 }
 
 #[tauri::command]
-pub async fn taxonomy_create_category(parent_id: Option<i64>, name: String) -> Result<crate::taxonomy::CategoryDto, String> {
+pub async fn taxonomy_create_category(parent_id: Option<i64>, name: String) -> IpcResult<crate::taxonomy::CategoryDto> {
     let trimmed = name.trim().to_string();
-    let id = blocking!(crate::taxonomy::create_category(parent_id, &name))
-        .map_err(|_| "任务失败".to_string())?
-        ?;
+    let id = join_task("新建分类", blocking!(crate::taxonomy::create_category(parent_id, &name)))?;
     Ok(crate::taxonomy::CategoryDto {
         id,
         parent_id,
@@ -330,28 +330,28 @@ pub async fn taxonomy_create_category(parent_id: Option<i64>, name: String) -> R
 }
 
 #[tauri::command]
-pub async fn taxonomy_rename_category(id: i64, name: String) -> Result<(), String> {
-    blocking!(crate::taxonomy::rename_category(id, &name)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_rename_category(id: i64, name: String) -> IpcResult<()> {
+    join_task("分类改名", blocking!(crate::taxonomy::rename_category(id, &name)))
 }
 
 #[tauri::command]
-pub async fn taxonomy_delete_category(id: i64) -> Result<(), String> {
-    blocking!(crate::taxonomy::delete_category(id)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_delete_category(id: i64) -> IpcResult<()> {
+    join_task("删除分类", blocking!(crate::taxonomy::delete_category(id)))
 }
 
 #[tauri::command]
-pub async fn taxonomy_move_category(id: i64, parent_id: Option<i64>, sort_index: i64) -> Result<(), String> {
-    blocking!(crate::taxonomy::move_category(id, parent_id, sort_index)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_move_category(id: i64, parent_id: Option<i64>, sort_index: i64) -> IpcResult<()> {
+    join_task("移动分类", blocking!(crate::taxonomy::move_category(id, parent_id, sort_index)))
 }
 
 #[tauri::command]
-pub async fn taxonomy_assign_category(category_id: i64, track_ids: Vec<String>) -> Result<i64, String> {
-    blocking!(crate::taxonomy::assign_category(category_id, &track_ids)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_assign_category(category_id: i64, track_ids: Vec<String>) -> IpcResult<i64> {
+    join_task("归入分类", blocking!(crate::taxonomy::assign_category(category_id, &track_ids)))
 }
 
 #[tauri::command]
-pub async fn taxonomy_unassign_category(category_id: i64, track_ids: Vec<String>) -> Result<i64, String> {
-    blocking!(crate::taxonomy::unassign_category(category_id, &track_ids)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_unassign_category(category_id: i64, track_ids: Vec<String>) -> IpcResult<i64> {
+    join_task("移出分类", blocking!(crate::taxonomy::unassign_category(category_id, &track_ids)))
 }
 
 #[tauri::command]
@@ -360,14 +360,12 @@ pub async fn taxonomy_list_tags() -> Vec<crate::taxonomy::TagDto> {
 }
 
 #[tauri::command]
-pub async fn taxonomy_upsert_tag(name: String, color: Option<String>, kind: Option<String>) -> Result<crate::taxonomy::TagDto, String> {
+pub async fn taxonomy_upsert_tag(name: String, color: Option<String>, kind: Option<String>) -> IpcResult<crate::taxonomy::TagDto> {
     let trimmed = name.trim().to_string();
     let kind_final = kind.unwrap_or_else(|| "topic".into());
     let color2 = color.clone();
     let kind2 = kind_final.clone();
-    let id = blocking!(crate::taxonomy::upsert_tag(&name, color2.as_deref(), &kind2))
-        .map_err(|_| "任务失败".to_string())?
-        ?;
+    let id = join_task("保存标签", blocking!(crate::taxonomy::upsert_tag(&name, color2.as_deref(), &kind2)))?;
     Ok(crate::taxonomy::TagDto {
         id,
         name: trimmed,
@@ -379,24 +377,26 @@ pub async fn taxonomy_upsert_tag(name: String, color: Option<String>, kind: Opti
 }
 
 #[tauri::command]
-pub async fn taxonomy_rename_tag(id: i64, name: String) -> Result<(), String> {
-    blocking!(crate::taxonomy::rename_tag(id, &name)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_rename_tag(id: i64, name: String) -> IpcResult<()> {
+    join_task("标签改名", blocking!(crate::taxonomy::rename_tag(id, &name)))
 }
 
 #[tauri::command]
-pub async fn taxonomy_delete_tag(id: i64) -> Result<(), String> {
-    blocking!(crate::taxonomy::delete_tag(id)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_delete_tag(id: i64) -> IpcResult<()> {
+    join_task("删除标签", blocking!(crate::taxonomy::delete_tag(id)))
 }
 
 #[tauri::command]
-pub async fn taxonomy_tag_tracks(tag_ids: Vec<i64>, track_ids: Vec<String>, mode: Option<String>) -> Result<i64, String> {
-    blocking!(crate::taxonomy::tag_tracks(&tag_ids, &track_ids, mode.as_deref().unwrap_or("add")))
-        .map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_tag_tracks(tag_ids: Vec<i64>, track_ids: Vec<String>, mode: Option<String>) -> IpcResult<i64> {
+    join_task(
+        "批量打标",
+        blocking!(crate::taxonomy::tag_tracks(&tag_ids, &track_ids, mode.as_deref().unwrap_or("add"))),
+    )
 }
 
 #[tauri::command]
-pub async fn taxonomy_untag_tracks(tag_id: i64, track_ids: Vec<String>) -> Result<i64, String> {
-    blocking!(crate::taxonomy::untag_tracks(tag_id, &track_ids)).map_err(|_| "任务失败".to_string())?
+pub async fn taxonomy_untag_tracks(tag_id: i64, track_ids: Vec<String>) -> IpcResult<i64> {
+    join_task("取消打标", blocking!(crate::taxonomy::untag_tracks(tag_id, &track_ids)))
 }
 
 #[tauri::command]
@@ -405,23 +405,25 @@ pub async fn taxonomy_suggest_tags(track_ids: Vec<String>) -> Vec<(String, Vec<c
 }
 
 #[tauri::command]
-pub async fn taxonomy_apply_suggested_tags(accepted: Vec<(String, String)>) -> Result<i64, String> {
+pub async fn taxonomy_apply_suggested_tags(accepted: Vec<(String, String)>) -> IpcResult<i64> {
     // accepted: (trackId, tagName) — 先建 tag 再打标
-    tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
-        let mut tag_ids: Vec<i64> = Vec::new();
-        let names: Vec<String> = accepted.iter().map(|(_, n)| n.clone()).collect();
-        for name in &names {
-            let id = crate::taxonomy::upsert_tag(name, None, "topic")?;
-            if !tag_ids.contains(&id) {
-                tag_ids.push(id);
+    join_task(
+        "应用建议标签",
+        tauri::async_runtime::spawn_blocking(move || -> IpcResult<i64> {
+            let mut tag_ids: Vec<i64> = Vec::new();
+            let names: Vec<String> = accepted.iter().map(|(_, n)| n.clone()).collect();
+            for name in &names {
+                let id = crate::taxonomy::upsert_tag(name, None, "topic")?;
+                if !tag_ids.contains(&id) {
+                    tag_ids.push(id);
+                }
             }
-        }
-        let mut track_ids: Vec<String> = accepted.iter().map(|(t, _)| t.clone()).collect();
-        track_ids.dedup();
-        crate::taxonomy::tag_tracks(&tag_ids, &track_ids, "add")
-    })
-    .await
-    .map_err(|_| "任务失败".to_string())?
+            let mut track_ids: Vec<String> = accepted.iter().map(|(t, _)| t.clone()).collect();
+            track_ids.dedup();
+            crate::taxonomy::tag_tracks(&tag_ids, &track_ids, "add")
+        })
+        .await,
+    )
 }
 
 #[tauri::command]

@@ -1,137 +1,28 @@
-/** 契约层：渲染层与 Rust 后端之间的 DTO 与 API 类型（端到端类型化）。 */
+/**
+ * 契约层 · `AppApi`：渲染层可见的对象接口形状，由 `src/bridge/ipc.ts` 实现。
+ *
+ * DTO 在 `./dto`，命令名与参数键在 `./commands`，事件名与载荷在 `./events`。
+ * 这里只描述**方法形状**（含前端侧的适配结果，如 `{ ok, error }` 包装），
+ * 与 Rust 命令签名的差异由 `bridge/ipc.ts` 在边界收口。
+ */
+import type {
+  AudioDevice,
+  BgImageData,
+  Bookmark,
+  Category,
+  ConvertItem,
+  DirEntry,
+  ExecResult,
+  FfmpegInfo,
+  MpvPlayerState,
+  PlayProgress,
+  ScanResult,
+  SubtitleTrack,
+  Tag,
+  TagSuggestion,
+} from './dto'
 
-export interface Track {
-  id: string
-  name: string
-  path: string
-  duration: number
-  artist: string
-  album: string
-  format: string
-  isVideo: boolean
-  coverPath: string | null
-  coverData: string | null
-  lyricsPath: string | null
-  fileMtime: number
-  fileSize: number
-  metaTitle: string | null
-  metaArtist: string | null
-  genre: string | null
-  bitrate: number | null
-  sampleRate: number | null
-  loudnessLufs?: number | null
-  albumCoverData?: string | null
-}
-
-export interface FolderNode {
-  name: string
-  path: string
-  children: FolderNode[]
-  tracks: Track[]
-  trackCount: number
-  coverData: string | null
-}
-
-export interface ScanResult {
-  folderPaths: string[]
-  artists: unknown[]
-  folderTree: FolderNode[]
-  allTracks: Track[]
-  fileCount: number
-}
-
-export interface DirEntry {
-  name: string
-  isFile: boolean
-  isDirectory: boolean
-}
-
-export interface AudioDevice {
-  deviceId: string
-  label: string
-}
-
-/** 字幕轨（mpv/libass）；id<=0 表示「关闭字幕」 */
-export interface SubtitleTrack {
-  id: number
-  title: string
-  lang: string
-  selected: boolean
-}
-
-export interface FfmpegInfo {
-  available: boolean
-  path: string | null
-  version: string | null
-}
-
-export interface ConvertItem {
-  id: number
-  path: string
-  outPath: string
-  kind: 'convert' | 'extract'
-  format: string
-}
-
-export interface ConvertProgress {
-  taskId: number
-  itemId: number
-  state: 'running' | 'done' | 'failed' | 'cancelled' | 'queue-finished'
-  error?: string
-}
-
-export interface SubStyle {
-  font?: string
-  fontSize?: number
-  color?: string
-  borderColor?: string
-  borderSize?: number
-  shadowOffset?: number
-  pos?: number
-}
-
-export interface PlayProgress {
-  trackId: string
-  positionMs: number
-  completed: boolean
-  playCount: number
-  playedAt: number
-  lastSpeed: number | null
-}
-
-export interface Bookmark {
-  id: string
-  trackId: string
-  atMs: number
-  label: string
-  createdAt: number
-}
-
-export interface BgImageData {
-  path: string
-  mtime?: number
-}
-
-export interface FavItem {
-  id: string
-  name: string
-  trackIds: string[]
-  isDefault?: boolean
-  cover?: string
-}
-
-/** mpv 播放状态镜像（Rust player:state 事件载荷） */
-export interface MpvPlayerState {
-  playing: boolean
-  position: number
-  duration: number
-  speed: number
-  volume: number
-  muted: boolean
-  trackPath: string | null
-  isVideo: boolean
-  videoActive: boolean
-}
+export * from './dto'
 
 /** AppApi 形状（src/bridge/ipc.ts 经 Tauri invoke/listen 实现） */
 export interface AppApi {
@@ -175,8 +66,10 @@ export interface AppApi {
   loadBgImage: () => Promise<BgImageData | null>
   saveBgImage: (dataUrl: string) => Promise<boolean>
   removeBgImage: () => Promise<boolean>
+  /** 启动自检（P0-64）降级提示：取一次即清空，用于首屏 Toast */
+  startupWarnings: () => Promise<string[]>
   toolsSaveFile: (p: string, b64: string) => Promise<boolean>
-  ffmpegExec: (args: string[]) => Promise<{ code: number; stdout?: string; stderr?: string }>
+  ffmpegExec: (args: string[]) => Promise<ExecResult>
   /** ffmpeg 可用性探测（转换页据此降级显示） */
   ffmpegProbe: () => Promise<FfmpegInfo>
   /** 启动转换队列（任务 + convert:progress 事件），返回 taskId */
@@ -211,23 +104,29 @@ export interface AppApi {
     muted?: boolean
     speed?: number
     videoActive?: boolean
-  }) => Promise<boolean>
-  playerToggle: (paused: boolean) => Promise<boolean>
-  playerSeek: (sec: number) => Promise<boolean>
-  playerSetVolume: (vol: number) => Promise<boolean>
-  playerSetMuted: (muted: boolean) => Promise<boolean>
-  playerSetSpeed: (speed: number) => Promise<boolean>
-  playerStop: () => Promise<boolean>
-  playerSetVideoEnabled: (enabled: boolean) => Promise<boolean>
+  }) => Promise<void>
+  playerToggle: (paused: boolean) => Promise<void>
+  playerSeek: (sec: number) => Promise<void>
+  playerSetVolume: (vol: number) => Promise<void>
+  playerSetMuted: (muted: boolean) => Promise<void>
+  playerSetSpeed: (speed: number) => Promise<void>
+  playerStop: () => Promise<void>
+  playerSetVideoEnabled: (enabled: boolean) => Promise<void>
   playerSetStageRect: (rect: { x: number; y: number; w: number; h: number; visible: boolean }) => Promise<boolean>
   /** 播放状态快照（pip 窗口冷启动时拉取一次） */
   playerGetState: () => Promise<MpvPlayerState>
   /** 打开独立悬浮窗（物理像素）；成功返回 true */
   pipOpen: (x: number, y: number, w: number, h: number) => Promise<boolean>
+  /** PipRoot.onMounted 握手：WebView 已就绪，触发 attach_overlay + pip:shown */
+  pipReady: () => Promise<boolean>
   /** 关闭/隐藏独立悬浮窗，mpv 覆盖窗口挂回主窗口 */
   pipClose: () => Promise<boolean>
+  /** 从悬浮窗还原：关浮窗 + 主窗口到前台 + 广播 pip:restored */
+  pipRestore: () => Promise<boolean>
   /** 悬浮窗已关闭（由 pip 窗口或主窗口触发） */
   onPipClosed: (cb: () => void) => () => void
+  /** 悬浮窗还原到舞台（双击浮窗画面 / Esc 触发） */
+  onPipRestored: (cb: () => void) => () => void
   /** 钉住状态变更（pip 窗口内切换时同步到主窗口） */
   onPipPinned: (cb: (pinned: boolean) => void) => () => void
   /** pip 窗口内设置钉住状态 */
@@ -235,9 +134,9 @@ export interface AppApi {
   playerListDevices: () => Promise<AudioDevice[]>
   playerSetDevice: (deviceId: string) => Promise<boolean>
   playerSubtitleTracks: () => Promise<SubtitleTrack[]>
-  playerSetSubtitleTrack: (id: number) => Promise<boolean>
-  playerSetSubtitleVisible: (visible: boolean) => Promise<boolean>
-  playerSetSubtitleDelay: (sec: number) => Promise<boolean>
+  playerSetSubtitleTrack: (id: number) => Promise<void>
+  playerSetSubtitleVisible: (visible: boolean) => Promise<void>
+  playerSetSubtitleDelay: (sec: number) => Promise<void>
   playerSetSubStyle: (style: {
     font?: string
     fontSize?: number
@@ -246,55 +145,33 @@ export interface AppApi {
     borderSize?: number
     shadowOffset?: number
     pos?: number
-  }) => Promise<boolean>
-  playerApplyLoudnessGain: (trackLufs: number | null, targetLufs: number) => Promise<boolean>
+  }) => Promise<void>
+  playerApplyLoudnessGain: (trackLufs: number | null, targetLufs: number) => Promise<void>
   /** 后台响度分析（任务 + loudness:progress 事件）：[trackId, path] 列表 */
   analyzeLoudness: (tracks: [string, string][]) => Promise<boolean>
   cancelLoudness: () => Promise<boolean>
   toggleFullscreen: () => Promise<boolean>
 
   // ── 分类与标签（P0-11/12/13）──
+  // `Promise<void>` = 成功即 resolve(null)，失败一律 reject（`02 §6.1`）；
+  // 调用方用 try/catch 分流，不能拿返回值当成功标志——Rust 侧没有回传布尔值。
   taxonomyListCategories: () => Promise<Category[]>
-  taxonomyCreateCategory: (parentId: number | null, name: string) => Promise<Category | null>
-  taxonomyRenameCategory: (id: number, name: string) => Promise<boolean>
-  taxonomyDeleteCategory: (id: number) => Promise<boolean>
-  taxonomyMoveCategory: (id: number, parentId: number | null, sortIndex: number) => Promise<boolean>
-  taxonomyAssignCategory: (categoryId: number, trackIds: string[]) => Promise<boolean>
-  taxonomyUnassignCategory: (categoryId: number, trackIds: string[]) => Promise<boolean>
+  taxonomyCreateCategory: (parentId: number | null, name: string) => Promise<Category>
+  taxonomyRenameCategory: (id: number, name: string) => Promise<void>
+  taxonomyDeleteCategory: (id: number) => Promise<void>
+  taxonomyMoveCategory: (id: number, parentId: number | null, sortIndex: number) => Promise<void>
+  /** 受影响的行数：0 表示本来就是这个状态，不是失败 */
+  taxonomyAssignCategory: (categoryId: number, trackIds: string[]) => Promise<number>
+  taxonomyUnassignCategory: (categoryId: number, trackIds: string[]) => Promise<number>
   taxonomyListTags: () => Promise<Tag[]>
-  taxonomyUpsertTag: (name: string, color?: string | null, kind?: string) => Promise<Tag | null>
-  taxonomyRenameTag: (id: number, name: string) => Promise<boolean>
-  taxonomyDeleteTag: (id: number) => Promise<boolean>
-  taxonomyTagTracks: (tagIds: number[], trackIds: string[], mode?: 'add' | 'replace') => Promise<boolean>
-  taxonomyUntagTracks: (tagId: number, trackIds: string[]) => Promise<boolean>
+  taxonomyUpsertTag: (name: string, color?: string | null, kind?: string) => Promise<Tag>
+  taxonomyRenameTag: (id: number, name: string) => Promise<void>
+  taxonomyDeleteTag: (id: number) => Promise<void>
+  taxonomyTagTracks: (tagIds: number[], trackIds: string[], mode?: 'add' | 'replace') => Promise<number>
+  taxonomyUntagTracks: (tagId: number, trackIds: string[]) => Promise<number>
   taxonomySuggestTags: (trackIds: string[]) => Promise<{ trackId: string; suggestions: TagSuggestion[] }[]>
-  taxonomyApplySuggestedTags: (accepted: { trackId: string; tagName: string }[]) => Promise<boolean>
+  taxonomyApplySuggestedTags: (accepted: { trackId: string; tagName: string }[]) => Promise<number>
   taxonomyTrackTags: (trackIds: string[]) => Promise<Record<string, Tag[]>>
   taxonomyAllTrackTags: () => Promise<{ trackId: string; tagId: number }[]>
   taxonomyAllCategoryItems: () => Promise<{ categoryId: number; trackId: string }[]>
-}
-
-export interface Category {
-  id: number
-  parentId: number | null
-  name: string
-  icon: string | null
-  color: string | null
-  sortIndex: number
-  trackCount: number
-  children: Category[]
-}
-
-export interface Tag {
-  id: number
-  name: string
-  color: string | null
-  kind: string
-  useCount: number
-  autoGenerated: boolean
-}
-
-export interface TagSuggestion {
-  name: string
-  score: number
 }

@@ -49,7 +49,20 @@ const bgUrl = computed<string | null>(() => {
 
 /** 背景图样式：适配方式 + 不透明度 + 缩放/平移 + 模糊。
  *  注意 ovl 语义是「不透明度」：不使用黑色遮罩层，而是直接调低图片自身 alpha，
- *  这样下层应用背景色透出来，比盖一层黑更自然（也让浅色主题可用）。 */
+ *  这样下层应用背景色透出来，比盖一层黑更自然（也让浅色主题可用）。
+ *  平铺模式（tile）无法用 <img> 的 object-fit 实现（objectRepeat 不是有效 CSS），
+ *  改为在 #bg-layer 上设 background-image，并隐藏 <img>。 */
+const bgTileStyle = computed<Record<string, string> | null>(() => {
+  if (settings.bgSize !== 'tile' || !bgUrl.value) return null
+  return {
+    backgroundImage: `url(${bgUrl.value})`,
+    backgroundRepeat: 'repeat',
+    backgroundSize: 'auto',
+    opacity: String(Math.max(0, Math.min(1, 1 - settings.ovl))),
+    filter: settings.bgBlur > 0 ? `blur(${settings.bgBlur}px)` : '',
+  }
+})
+
 const bgStyle = computed<Record<string, string>>(() => {
   const fit = settings.bgSize
   const style: Record<string, string> = {
@@ -66,15 +79,8 @@ const bgStyle = computed<Record<string, string>>(() => {
     // 居中：按原始像素比居中显示，不缩放
     style.objectFit = 'none'
     style.objectPosition = 'center'
-  } else if (fit === 'tile') {
-    // 平铺：以原图尺寸重复
-    style.objectFit = 'none'
-    style.objectRepeat = 'repeat'
-    style.width = 'auto'
-    style.height = 'auto'
-    style.minWidth = '100%'
-    style.minHeight = '100%'
   }
+  // tile 模式由 bgTileStyle 接管 #bg-layer 的 background-image，<img> 隐藏
   // 平铺/居中模式不施加缩放平移（避免与 repeat 冲突）
   const e = settings.imgEditState
   if (e && fit !== 'tile' && fit !== 'center') {
@@ -83,14 +89,14 @@ const bgStyle = computed<Record<string, string>>(() => {
   return style
 })
 
-/** 响应式断点：窄窗口自动折叠 inspector，必要时折叠 sidebar */
+/** 响应式断点（规范 03 §2.1）：<1200 自动折叠右检查器；<1024 侧边栏折叠为图标栏 */
 let ro: ResizeObserver | null = null
 function applyResponsive(): void {
   const w = window.innerWidth
-  // <1024 自动关闭右检查器，避免内容区被压没
-  if (w < 1024 && ui.inspectorOpen) ui.inspectorOpen = false
-  // <1200 且侧边栏展开过宽时折叠
-  if (w < 1080 && !settings.sidebarCollapsed) {
+  // <1200 自动关闭右检查器，避免内容区被压没
+  if (w < 1200 && ui.inspectorOpen) ui.inspectorOpen = false
+  // <1024 侧边栏折叠为图标栏
+  if (w < 1024 && !settings.sidebarCollapsed) {
     settings.sidebarCollapsed = true
     settings.scheduleSave()
   }
@@ -133,6 +139,13 @@ onMounted(async () => {
   // 搜索索引库较大且仅搜索时用到 → 首帧后再拉
   afterFirstPaint(() => { void loadSearchLibs() })
 
+  // P0-64 启动自检：setup 阶段 WebView 还没起来，emit 会被丢掉，只能由首屏来取
+  afterFirstPaint(() => {
+    void api.startupWarnings()
+      .then((list) => list.forEach((w) => ui.toast(w, 'error', 8000)))
+      .catch(() => { /* 提示取不到不影响使用 */ })
+  })
+
   // 扫描事件只反映「用户主动发起」的扫描：启动静默同步与文件监听后台扫描不发事件，
   // 因此这里收到事件时才置 active，且结束后清空。
   api.onScanProgress?.(({ completed, total }) => {
@@ -167,8 +180,9 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div id="bg-layer">
-    <img v-if="bgUrl" :src="bgUrl" alt="" draggable="false" loading="lazy" :style="bgStyle" />
+  <!-- 平铺模式用 #bg-layer 的 background-image；其余模式用 <img>（object-fit 精确控制） -->
+  <div id="bg-layer" :style="bgTileStyle ?? undefined">
+    <img v-if="bgUrl && settings.bgSize !== 'tile'" :src="bgUrl" alt="" draggable="false" loading="lazy" :style="bgStyle" />
   </div>
 
   <div id="app-shell">

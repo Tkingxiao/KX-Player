@@ -21,11 +21,9 @@ const MAX_COVER_DIM: u32 = 300;
 
 static FOLDER_COVER_MAP: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
-pub fn md5_hex(s: &str) -> String {
-    use md5::{Digest, Md5};
-    let mut hasher = Md5::new();
-    hasher.update(s.as_bytes());
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+/// 封面缓存键（02 §1.1 blake3 内容寻址）：取前 16 字节、32 位十六进制。
+pub fn cache_key(s: &str) -> String {
+    blake3::hash(s.as_bytes()).to_hex()[..32].to_string()
 }
 
 fn covers_dir() -> PathBuf {
@@ -160,7 +158,7 @@ pub fn find_external_cover(dir: &str, max_depth: i32) -> Option<PathBuf> {
                 continue;
             }
             let score = score_cover_candidate(&p, depth);
-            if best.is_none() || score > best.as_ref().unwrap().0 {
+            if best.as_ref().is_none_or(|b| score > b.0) {
                 *best = Some((score, p));
             }
         }
@@ -187,7 +185,7 @@ pub fn find_any_image(dir: &str) -> Option<PathBuf> {
             continue;
         }
         let score = score_cover_candidate(&p, 0);
-        if score > -100 && (best.is_none() || score > best.as_ref().unwrap().0) {
+        if score > -100 && best.as_ref().is_none_or(|b| score > b.0) {
             best = Some((score, p));
         }
     }
@@ -298,7 +296,7 @@ fn persist_folder_cover_map(map: &HashMap<String, String>) {
 pub fn set_folder_cover_mapping(folder_path: &str) {
     let mut guard = FOLDER_COVER_MAP.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
-    map.insert(folder_path.to_string(), md5_hex(folder_path));
+    map.insert(folder_path.to_string(), cache_key(folder_path));
     persist_folder_cover_map(map);
 }
 
@@ -344,7 +342,7 @@ pub fn resolve_folder_cover(folder_path: &str) -> Option<String> {
     let source = find_external_cover(folder_path, 1)
         .or_else(|| find_any_image(folder_path))
         .or_else(|| find_descendant_cover(folder_path))?;
-    let name = format!("folder_{}", md5_hex(folder_path));
+    let name = format!("folder_{}", cache_key(folder_path));
     let saved = save_cover_file(&name, &source)?;
     set_folder_cover_mapping(folder_path);
     Some(saved)

@@ -12,16 +12,19 @@ pub struct ExecResult {
     pub error: Option<String>,
 }
 
-/// 全局 tokio 运行时（阻塞命令线程借用）
-pub fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+/// 全局 tokio 运行时（阻塞命令线程借用）。多线程建不出来就退到单线程；两者都失败返回 Err，
+/// 由调用方转成可报告的任务错误，而不是在懒初始化里 panic 掉宿主线程。
+pub fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RT: Lazy<Option<tokio::runtime::Runtime>> = Lazy::new(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("tokio runtime")
+            .or_else(|_| tokio::runtime::Builder::new_current_thread().enable_all().build())
+            .ok()
     });
-    &RT
+    RT.as_ref()
+        .ok_or_else(|| "运行时不可用：无法创建 tokio 线程".to_string())
 }
 
 fn spawn_hidden(exe: std::path::PathBuf, args: &[String]) -> tokio::process::Command {
@@ -40,7 +43,10 @@ pub fn exec_ffmpeg(args: &[String]) -> ExecResult {
     let Some(exe) = crate::paths::locate_ffmpeg() else {
         return ExecResult { code: -1, stdout: None, stderr: None, error: Some("ffmpeg.exe 未找到".into()) };
     };
-    runtime().block_on(exec_async(exe, args, 600))
+    match runtime() {
+        Ok(rt) => rt.block_on(exec_async(exe, args, 600)),
+        Err(e) => ExecResult { code: -1, stdout: None, stderr: None, error: Some(e) },
+    }
 }
 
 async fn exec_async(exe: std::path::PathBuf, args: &[String], timeout_secs: u64) -> ExecResult {
@@ -135,7 +141,12 @@ pub fn probe_ffmpeg() -> FfmpegInfo {
     let Some(exe) = crate::paths::locate_ffmpeg() else {
         return FfmpegInfo { available: false, path: None, version: None };
     };
-    let result = runtime().block_on(exec_async(exe.clone(), &["-version".to_string()], 15));
+    let result = match runtime() {
+        Ok(rt) => rt.block_on(exec_async(exe.clone(), &["-version".to_string()], 15)),
+        Err(e) => {
+            return FfmpegInfo { available: false, path: Some(e.to_string()), version: None };
+        }
+    };
     let version = result
         .stdout
         .as_deref()
@@ -165,7 +176,7 @@ pub fn parse_integrated_lufs(stderr: &str) -> Option<f64> {
     for line in stderr.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("I:") {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             if let Ok(v) = token.parse::<f64>() {
                 if v.is_finite() && v > -100.0 {
                     return Some(v);
@@ -197,7 +208,10 @@ pub fn measure_loudness(path: &str) -> LoudnessResult {
         "null".into(),
         null_device(),
     ];
-    let result = runtime().block_on(exec_async(exe, &args, 300));
+    let result = match runtime() {
+        Ok(rt) => rt.block_on(exec_async(exe, &args, 300)),
+        Err(e) => return LoudnessResult { path: path.into(), lufs: None, error: Some(e) },
+    };
     if let Some(err) = result.error {
         return LoudnessResult { path: path.into(), lufs: None, error: Some(err) };
     }
@@ -287,7 +301,10 @@ pub fn run_convert_queue(app: tauri::AppHandle, items: Vec<ConvertItem>) -> u64 
                 "taskId": task_id, "itemId": item.id, "state": "running",
             }));
             let args = build_convert_args(item);
-            let result = runtime().block_on(exec_async(exe.clone(), &args, 3600));
+            let result = match runtime() {
+                Ok(rt) => rt.block_on(exec_async(exe.clone(), &args, 3600)),
+                Err(e) => ExecResult { code: -1, stdout: None, stderr: None, error: Some(e) },
+            };
             if cancel.load(AtomicOrdering::SeqCst) {
                 let _ = app.emit("convert:progress", serde_json::json!({
                     "taskId": task_id, "itemId": item.id, "state": "cancelled",

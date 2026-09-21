@@ -48,6 +48,7 @@ export default defineConfig({
     include: [
       'vue',
       'pinia',
+      '@vueuse/core',
       '@tauri-apps/api/core',
       '@tauri-apps/api/event',
     ],

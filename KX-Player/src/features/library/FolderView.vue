@@ -11,6 +11,7 @@ import SelectMenu from '@/components/SelectMenu.vue'
 import TrackTable from '@/features/library/TrackTable.vue'
 import { normDir, fmtTime } from '@/utils/format'
 import { cachedFolderCover, requestFolderCovers } from '@/utils/covers'
+import { cardRowHeight } from '@/utils/layout'
 import type { ContextMenuItem } from '@/stores/ui'
 import type { FolderNode } from '@/contracts/api'
 
@@ -258,7 +259,7 @@ function onScroll(top: number): void {
         class="fv-scroll edge-fade"
         :count="sortedChildren.length"
         :card-width="settings.gridSize"
-        :card-height="settings.gridSize + 52"
+        :card-height="cardRowHeight(settings.gridSize)"
         @scroll="onScroll"
       >
         <template #default="{ index }">
@@ -431,7 +432,7 @@ function onScroll(top: number): void {
   height: 30px;
   border-radius: 50%;
   background: rgb(var(--accent-rgb));
-  color: #fff;
+  color: var(--on-accent);
   display: flex;
   align-items: center;
   justify-content: center;

@@ -66,12 +66,12 @@ pub fn try_fix_encoding(text: &str) -> String {
     text.to_string()
 }
 
+/// 条目 ID 命名空间（02 §1.1 UUIDv5）。固定常量，**换掉等于给全库换 ID**：
+/// 进度、书签、分类、标签、封面文件与 settings 里的 trackId 全部按旧命名空间寻址。
+const ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0xb9ab_1b7b_af50_4eab_98a9_ce5a_0d76_8fa9);
+
 pub fn hash_path_id(path: &str) -> String {
-    use md5::{Digest, Md5};
-    let mut hasher = Md5::new();
-    hasher.update(path.as_bytes());
-    let out = hasher.finalize();
-    out.iter().map(|b| format!("{b:02x}")).collect::<String>()[..12].to_string()
+    uuid::Uuid::new_v5(&ID_NAMESPACE, path.as_bytes()).simple().to_string()
 }
 
 fn lofty_supports(ext: &str) -> bool {
@@ -178,10 +178,11 @@ pub fn stat_file(path: &str) -> Option<(f64, i64)> {
     Some((mtime, meta.len() as i64))
 }
 
-/// 条目稳定 ID：md5(反斜杠路径) 前 12 位。
-/// 必须与 Electron 版 hashPath 的输入完全一致（Node path.join 在 Windows 产生纯反斜杠路径），
-/// 否则封面缓存（covers/{id}.jpg）、收藏夹/播放列表（settings 里的 trackId）、
-/// 进度与书签（SQLite track_id）全部失联——2026-09-19 已因此丢过一次进度，勿改。
+/// 条目稳定 ID：UUIDv5(规范化反斜杠路径)，32 位十六进制。
+/// 路径规范化必须与 Electron 版 `hashPath` 的**输入**逐字符一致（Node `path.join` 在 Windows
+/// 产生纯反斜杠路径）——ID 只随规范化规则变，不随哈希算法变；换算法（md5[..12] → UUIDv5）
+/// 时由 `db::migrate_track_ids` 在启动期把旧 ID 全量改写，否则封面缓存、进度、书签、
+/// 分类与 settings 里的 trackId 会全部失联（2026-09-19 已因此丢过一次进度）。
 pub fn file_id(path: &str) -> String {
     let win_path = normalize_path(path).replace('/', "\\");
     hash_path_id(&win_path)
@@ -191,4 +192,25 @@ pub fn file_id(path: &str) -> String {
 pub fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
     let reader = image::ImageReader::open(path).ok()?;
     reader.into_dimensions().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_id;
+
+    /// 钉住「命名空间 + 路径规范化」两件事：换掉任一项都会给全库换 ID，
+    /// 进度、书签、收藏与封面缓存集体失联（见 db::migrate_legacy_ids）。
+    #[test]
+    fn file_id_golden_pins_namespace() {
+        assert_eq!(file_id(r"C:\Music\Album\song.mp3"), "3a8fa096e5015b8090a414676dc28ebd");
+    }
+
+    /// ID 只由规范化后的路径决定：分隔符写法与结尾斜杠不该改变它。
+    #[test]
+    fn file_id_ignores_separators_and_trailing_slash() {
+        let back = file_id(r"C:\Music\song.mp3");
+        assert_eq!(back, file_id("C:/Music/song.mp3"));
+        assert_eq!(back, file_id(r"C:\Music\song.mp3\"));
+        assert_ne!(back, file_id(r"C:\Music\song.flac"));
+    }
 }

@@ -557,7 +557,7 @@ onBeforeUnmount(() => {
   display: inline-flex;
   color: var(--text-muted);
 }
-.pb-heart:hover, .pb-heart.on { color: #e6685f; }
+.pb-heart:hover, .pb-heart.on { color: var(--danger); }
 .pb-continue {
   font-size: 10.5px;
   padding: 1px 8px;
@@ -648,7 +648,7 @@ onBeforeUnmount(() => {
   width: 3px;
   height: 10px;
   border-radius: 1px;
-  background: #ffc857;
+  background: var(--warning);
   transform: translateX(-1px);
 }
 
@@ -784,7 +784,6 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--bg-input);
-  outline: none;
   font-size: 12px;
 }
 .sleep-wide { width: 100%; justify-content: center; margin-bottom: 6px; }

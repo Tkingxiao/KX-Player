@@ -8,10 +8,15 @@
 //! （黑屏）。因此本模块：① 窗口由专用线程创建（线程即窗口所有者）；② 该线程跑标准消息循环；
 //! ③ 所有窗口操作都先入队，再 PostMessage 唤醒该线程，在它自己的线程上执行。
 //!
-//! ## 为什么不用「子窗口压在 WebView 下方 + 透明」方案
-//! WebView2 在 Windows 上用 DirectComposition 呈现，其合成内容恒处于同一顶层窗口内所有
-//! 原生子窗口之上（透明像素露出的是窗口背景/桌面，不是下层子窗口），旧方案画面永远不可见。
-//! 顶层窗口由 DWM 按顶层 Z 序合成，天然盖在主窗口之上。
+//! ## 两种层序：覆盖（主窗口）与垫底（悬浮窗）
+//! 主窗口场景用「覆盖」：宿主窗口是顶层窗口，直接压在 WebView 之上（WebView2 用
+//! DirectComposition 呈现，同一顶层窗口内任何原生子窗口都在其合成内容之下，压不穿）。
+//!
+//! 悬浮窗（pip）场景反过来，用「垫底」：pip 窗口本身是 transparent 的顶层窗口，把宿主
+//! 窗口放在它**下面**，视频就从 pip 的透明像素里透出来 —— 于是 DOM 控件（标题、按钮、
+//! 进度条）天然浮在画面之上，鼠标消息也正常落到 pip 窗口，不需要再靠轮询光标猜 hover。
+//! 垫底时宿主窗口不能以 pip 为 owner（owned 窗口恒在其 owner 之上），所以 owner 恒为
+//! 主窗口，靠显式的 z 序断言维持「宿主在下、pip 在上」这一对关系（见 raise_above_host）。
 //!
 //! ## 交互
 //! wndproc 对 WM_NCHITTEST 返回 HTTRANSPARENT：鼠标事件落到下方同线程的主窗口
@@ -28,11 +33,11 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, GetStockObject, BLACK_BRUSH, HBRUSH};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    GWLP_HWNDPARENT, HTTRANSPARENT, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
-    WM_DESTROY, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_NOTOPMOST,
+    HWND_TOPMOST, PostMessageW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, GWLP_HWNDPARENT, HTTRANSPARENT, MA_NOACTIVATE, MSG, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, WM_DESTROY, WM_ERASEBKGND, WM_MOUSEACTIVATE,
+    WM_NCHITTEST, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const HOST_CLASS: &str = "kx_mpv_host";
@@ -226,6 +231,11 @@ fn apply_rect(main_hwnd: isize, host: isize, rect: &StageRect) {
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
             set_os_visible(host, true);
+            // 垫底模式下每帧重断言一次层序：期间可能有别的应用把 topmost 窗口提到最前，
+            // 漏掉这一步会让浮窗被自己的视频层盖住（表现为小窗黑屏/只有声音）。
+            if let Some(pip) = TARGET.lock().ok().and_then(|t| *t) {
+                raise_pip(pip);
+            }
         } else {
             ShowWindow(host as HWND, SW_HIDE);
         }
@@ -233,27 +243,52 @@ fn apply_rect(main_hwnd: isize, host: isize, rect: &StageRect) {
 }
 
 /// 切换挂靠目标（在舞台线程执行）：
-/// - 目标 = pip 悬浮窗：覆盖窗口成为其 owned 窗口（z 序在 pip 之上、随 pip 隐藏/最小化）。
-/// - 目标 = None：挂回主窗口（随主窗口最小化/关闭，与原先行为一致）。
-/// 修改 owner 后必须 SetWindowPos 刷新，否则窗口层级/可见性可能不生效。
+/// - 目标 = pip 悬浮窗：宿主窗口「垫」在浮窗之下，视频透过浮窗的透明像素显示，
+///   浮窗内的 DOM 控件因此能浮在画面上。
+/// - 目标 = None：挂回主窗口，恢复「覆盖」层序（压在 WebView 之上）。
+///
+/// owner 关系只在同一个 z 序带内生效，而顶层窗口先按「topmost 带 / 普通带」分层：
+/// 悬浮窗是 always_on_top（topmost 带），宿主窗口若留在普通带就会被浮窗压在下面
+/// （表现为小窗只有声音/黑屏）。所以挂靠浮窗时要把宿主窗口一并提进 topmost 带，
+/// 挂回主窗口时再撤销，避免视频浮在其它应用之上。
+///
+/// 注意 owner 恒为主窗口：owned 窗口恒在其 owner **之上**，若以 pip 为 owner 就无法垫底。
 fn apply_attach(host: isize, target: Option<isize>) {
     unsafe {
-        let base = match target {
-            Some(h) => h,
-            None => MAIN_HWND.get().copied().unwrap_or(0),
-        };
+        let main = MAIN_HWND.get().copied().unwrap_or(0);
         let _ = TARGET.lock().map(|mut t| *t = target);
-        if base != 0 {
-            SetWindowLongPtrW(host as HWND, GWLP_HWNDPARENT, base);
+        if main != 0 {
+            SetWindowLongPtrW(host as HWND, GWLP_HWNDPARENT, main);
         }
         SetWindowPos(
             host as HWND,
-            std::ptr::null_mut(),
+            if target.is_some() { HWND_TOPMOST } else { HWND_NOTOPMOST },
             0,
             0,
             0,
             0,
-            SWP_NOACTIVATE | SWP_NOZORDER | 0x0001 /* SWP_NOSIZE */ | 0x0002 /* SWP_NOMOVE */,
+            SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE,
+        );
+        if let Some(pip) = target {
+            raise_pip(pip);
+        }
+    }
+}
+
+/// 把 pip 窗口提到宿主窗口之上（垫底关系的另一半）。
+/// 跨线程 SetWindowPos：目标线程（Tauri 主线程）始终在泵消息，且本函数只在
+/// 挂靠/几何同步这些低频路径上调用，不会与主线程形成互相等待。
+fn raise_pip(pip: isize) {
+    unsafe {
+        // 宿主刚被提到 topmost 带顶端，紧随其后把浮窗也提一次，浮窗即落在宿主之上
+        SetWindowPos(
+            pip as HWND,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE,
         );
     }
 }

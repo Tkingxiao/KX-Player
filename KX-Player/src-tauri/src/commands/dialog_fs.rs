@@ -147,7 +147,7 @@ pub fn list_dir(path: String) -> Vec<DirEntryInfo> {
 }
 
 #[tauri::command]
-pub fn rename_dir(old_path: String, new_path: String) -> Result<(), String> {
+pub fn rename_dir(old_path: String, new_path: String) -> crate::error::IpcResult<()> {
     crate::ai::rename_dir(&old_path, &new_path)
 }
 
@@ -178,7 +178,6 @@ pub fn clipboard_write_text(text: String) -> bool {
 
 #[cfg(windows)]
 fn set_clipboard_win(text: &str) -> bool {
-    use std::ffi::CString;
     unsafe {
         if windows_sys::Win32::System::DataExchange::OpenClipboard(std::ptr::null_mut()) == 0 {
             return false;
@@ -206,7 +205,6 @@ fn set_clipboard_win(text: &str) -> bool {
             }
         }
         windows_sys::Win32::System::DataExchange::CloseClipboard();
-        let _ = CString::new("clipboard");
         ok
     }
 }
@@ -215,14 +213,13 @@ fn set_clipboard_win(text: &str) -> bool {
 #[tauri::command]
 pub fn show_item_in_folder(path: String) -> bool {
     let arg = format!("/select,{path}");
-    let _ = crate::fftools::runtime().block_on(async {
+    let Ok(rt) = crate::fftools::runtime() else {
+        return false;
+    };
+    rt.block_on(async {
         #[cfg(windows)]
         {
             let _ = tokio::process::Command::new("explorer.exe").args(["/select,", &arg]).spawn();
-        }
-        #[allow(unused_must_use)]
-        {
-            ()
         }
     });
     true

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /** 自绘标题栏：Logo + 居中即时搜索 + 主题/导入/窗口控制。 */
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { useDebounceFn } from '@vueuse/core'
 import { api } from '@/bridge/ipc'
 import { useUiStore } from '@/stores/ui'
 import { useLibraryStore } from '@/stores/library'
@@ -8,27 +9,27 @@ import { useLibraryStore } from '@/stores/library'
 const ui = useUiStore()
 const library = useLibraryStore()
 const maximized = ref(false)
-let searchTimer: ReturnType<typeof setTimeout> | null = null
+
+const commitSearch = useDebounceFn((v: string) => {
+  if (v.trim()) {
+    if (!ui.searchActive) ui.searchActive = true
+    ui.view = 'search'
+  } else if (ui.searchActive) {
+    ui.searchActive = false
+    ui.view = 'smart'
+  }
+}, 200)
 
 const searchValue = computed({
   get: () => ui.searchQuery,
   set: (v: string) => {
     ui.searchQuery = v
-    if (searchTimer) clearTimeout(searchTimer)
-    searchTimer = setTimeout(() => {
-      searchTimer = null
-      if (v.trim()) {
-        if (!ui.searchActive) ui.searchActive = true
-        ui.view = 'search'
-      } else if (ui.searchActive) {
-        ui.searchActive = false
-        ui.view = 'smart'
-      }
-    }, 200)
+    commitSearch(v)
   },
 })
 
 function clearSearch(): void {
+  commitSearch.cancel()
   ui.searchQuery = ''
   ui.searchActive = false
   if (ui.view === 'search') ui.view = 'smart'
@@ -55,7 +56,7 @@ onBeforeUnmount(() => {
 <template>
   <header id="titlebar">
     <div class="tb-left">
-      <img class="tb-logo" src="/favicon.ico" alt="" />
+      <img class="tb-logo" src="/icon.svg" alt="" />
       <span class="tb-name">KX Player</span>
     </div>
 
@@ -158,7 +159,6 @@ onBeforeUnmount(() => {
   flex: 1;
   border: none;
   background: none;
-  outline: none;
   font-size: 12px;
   color: var(--text);
 }
@@ -203,7 +203,7 @@ onBeforeUnmount(() => {
   to { transform: rotate(360deg); }
 }
 .tb-close:hover {
-  background: #e81123;
-  color: #fff;
+  background: var(--win-close);
+  color: var(--on-media);
 }
 </style>

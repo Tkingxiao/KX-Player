@@ -1,5 +1,6 @@
 //! AI 翻译服务：OpenAI 兼容 /chat/completions（网络只发生在 Rust 侧；API Key 不落盘）。
 
+use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::model::{AiChatPayload, AiModelsResult, AiPingResult};
 use reqwest::blocking::Client;
 use std::time::Duration;
@@ -39,7 +40,10 @@ fn chat_url(base_url: &str) -> String {
 pub fn chat_completion(opts: &AiChatPayload, timeout_ms: u64) -> Result<String, String> {
     let url = chat_url(&opts.base_url);
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json".parse().unwrap());
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
     if !opts.api_key.is_empty() {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", opts.api_key)) {
             headers.insert("Authorization", v);
@@ -79,7 +83,8 @@ pub fn ping(opts: &AiChatPayload) -> AiPingResult {
         temperature: Some(0.0),
     };
     match chat_completion(&minimal, 15_000) {
-        Ok(reply) => AiPingResult { ok: true, message: format!("连接成功：{}", &reply[..reply.len().min(60)]) },
+        // 按字符截：`&reply[..60]` 落在多字节中间会 panic，而这条在命令线程上。
+        Ok(reply) => AiPingResult { ok: true, message: format!("连接成功：{}", reply.chars().take(60).collect::<String>()) },
         Err(e) => AiPingResult { ok: false, message: e },
     }
 }
@@ -118,22 +123,22 @@ pub fn list_models(base_url: &str, api_key: &str) -> AiModelsResult {
 }
 
 /// 目录重命名（同父目录内；目标已存在则拒绝）
-pub fn rename_dir(old_path: &str, new_path: &str) -> Result<(), String> {
+pub fn rename_dir(old_path: &str, new_path: &str) -> IpcResult<()> {
     if old_path.is_empty() || new_path.is_empty() {
-        return Err("参数错误".into());
+        return Err(IpcError::invalid_argument("参数错误"));
     }
     let old = std::path::Path::new(old_path);
     let new = std::path::Path::new(new_path);
     if !old.is_dir() {
-        return Err("原目录不存在".into());
+        return Err(IpcError::new(AppErrorCode::NotFound, "原目录不存在"));
     }
     if new.exists() {
-        return Err("目标目录已存在".into());
+        return Err(IpcError::invalid_argument("目标目录已存在"));
     }
     let old_parent = old.parent().unwrap_or(old);
     let new_parent = new.parent().unwrap_or(new);
     if old_parent != new_parent {
-        return Err("只允许同父目录内重命名".into());
+        return Err(IpcError::invalid_argument("只允许同父目录内重命名"));
     }
-    std::fs::rename(old, new).map_err(|e| e.to_string())
+    std::fs::rename(old, new).map_err(IpcError::io)
 }

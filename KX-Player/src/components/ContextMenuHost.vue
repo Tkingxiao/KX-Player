@@ -170,10 +170,10 @@ onBeforeUnmount(() => {
   background: var(--bg-selected);
 }
 .ctx-item.danger {
-  color: #e6685f;
+  color: var(--danger);
 }
 .ctx-item.danger:hover {
-  background: rgba(230, 58, 46, 0.12);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 .ctx-item.disabled {
   opacity: 0.4;

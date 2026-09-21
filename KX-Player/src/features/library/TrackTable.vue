@@ -9,6 +9,7 @@ import { useUiStore } from '@/stores/ui'
 import { usePlaylistsStore } from '@/stores/playlists'
 import { useTrackActions } from '@/composables/useTrackActions'
 import { fmtTime, fmtQuality, trackName, trackArtist } from '@/utils/format'
+import { ROW_H } from '@/utils/layout'
 
 const props = withDefaults(defineProps<{
   tracks: Track[]
@@ -22,7 +23,6 @@ const ui = useUiStore()
 const playlists = usePlaylistsStore()
 const { playTrackInContext, showTrackMenu } = useTrackActions()
 
-const ROW_H = 46
 const ids = computed(() => props.tracks.map((t) => t.id))
 
 // ── 排序 ──
@@ -278,7 +278,7 @@ function rowKey(i: number): string {
   transition: opacity var(--dur-fast) var(--ease);
 }
 .tt-row:hover .tt-heart { opacity: 1; }
-.tt-heart.on { opacity: 1; color: #e6685f; }
+.tt-heart.on { opacity: 1; color: var(--danger); }
 .tt-sortable { cursor: pointer; }
 .tt-sortable:hover { color: var(--text); }
 .tt-arrow { font-size: 8px; margin-left: 3px; }

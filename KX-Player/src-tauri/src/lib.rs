@@ -4,6 +4,7 @@ mod ai;
 mod bgimage;
 mod commands;
 mod db;
+mod error;
 mod ffprobe;
 mod fftools;
 mod model;
@@ -23,7 +24,7 @@ use tauri::{Emitter, Manager, WindowEvent};
 /// PlayerCore 从 player 模块导出
 pub use player::PlayerCore;
 
-pub fn run() {
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -37,6 +38,11 @@ pub fn run() {
             // 数据目录与封面目录（沿用 Electron 版 userData 路径）
             let _ = paths::ensure_data_dir();
             let _ = paths::ensure_covers_dir();
+            db::check_integrity();
+            let migrated = db::migrate_legacy_ids(&paths::library_db_path(), &paths::settings_path());
+            if migrated > 0 {
+                paths::append_log(&format!("条目 ID 迁移：{migrated} 条旧 ID 已改写为 UUIDv5，备份见 *.pre-uuid5"));
+            }
             scanner::covers::load_folder_cover_map();
             bgimage::migrate_oversized();
 
@@ -62,13 +68,13 @@ pub fn run() {
                     WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
                         let player: tauri::State<PlayerCore> = app.state();
-                        player.attach_overlay(None);
+                        player.detach_overlay();
                         let _ = window.hide();
                         let _ = app.emit("pip:closed", ());
                     }
                     WindowEvent::Destroyed => {
                         let player: tauri::State<PlayerCore> = app.state();
-                        player.attach_overlay(None);
+                        player.detach_overlay();
                         let _ = app.emit("pip:closed", ());
                     }
                     // 悬浮窗移动/缩放：覆盖窗口跟随（矩形相对 pip 客户区，重放即换算到新屏幕位置）
@@ -164,6 +170,7 @@ pub fn run() {
             commands::system::load_bg_image,
             commands::system::save_bg_image,
             commands::system::remove_bg_image,
+            commands::system::startup_warnings,
             commands::system::minimize_window,
             commands::system::maximize_window,
             commands::system::close_window,
@@ -196,7 +203,9 @@ pub fn run() {
             commands::player::player_list_devices,
             commands::player::player_set_device,
             commands::player::pip_open,
+            commands::player::pip_ready,
             commands::player::pip_close,
+            commands::player::pip_restore,
             commands::player::pip_set_pinned,
             commands::player::app_force_quit,
             commands::library::taxonomy_list_categories,
@@ -220,7 +229,10 @@ pub fn run() {
             commands::library::taxonomy_all_category_items,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running KX-Player");
+        .map_err(|e| {
+            crate::paths::append_log(&format!("fatal: run exited: {e}"));
+            Box::new(e) as Box<dyn std::error::Error>
+        })
 }
 
 fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -242,18 +254,18 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "quit" => {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = app.emit("window:beforeClose", ());
-                let win2 = win.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    fftools::kill_all();
-                    let _ = win2.close();
-                });
-                app.exit(0);
-            } else {
-                app.exit(0);
-            }
+            // 与 app_force_quit 同语义：先置 force_close（否则主窗口 CloseRequested
+            // 会被 prevent 成“隐藏到托盘”），再广播 beforeClose 给前端落盘设置，
+            // 300ms 后退出；原实现先调 app.exit(0) 再 sleep，保存与退出互相竞态。
+            let state: tauri::State<AppWindowsState> = app.state();
+            state.force_close.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = app.emit("window:beforeClose", ());
+            let app2 = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                crate::fftools::kill_all();
+                app2.exit(0);
+            });
         }
         _ => {}
     })

@@ -174,11 +174,14 @@ export const useLibraryStore = defineStore('library', () => {
   // 进度回写（player store 调用）
   function updateProgressLocal(trackId: string, positionMs: number, completed?: boolean): void {
     const prev = progress.value.get(trackId)
+    // playCount：只在 EOF 时（completed !== undefined）才递增，且每次 EOF 计一次
+    // 若 completed=false（听了 >5% 但 <95%），也算一次播放记录
+    const isEof = completed !== undefined
     const next: PlayProgress = {
       trackId,
       positionMs,
       completed: completed ?? prev?.completed ?? false,
-      playCount: (prev?.playCount ?? 0) + (prev ? 0 : 1),
+      playCount: (prev?.playCount ?? 0) + (isEof ? 1 : 0),
       playedAt: Date.now(),
       lastSpeed: prev?.lastSpeed ?? null,
     }

@@ -18,8 +18,9 @@ export function useTrackActions() {
   const taxonomy = useTaxonomyStore()
 
   function playTrackInContext(track: Track, list: string[], name: string): void {
-    // P0-2：按介质自动选形态——视频进舞台，音频走普通播放
-    void player.playTrack(track, list, name, { fromLast: false, video: true })
+    // 是否出画面由「当前有没有显示画面的表面」决定（见 player store 的 videoMode），
+    // 这里只负责起播；调用方负责把舞台/悬浮窗打开。
+    void player.playTrack(track, list, name, { fromLast: false })
   }
 
   function playTrackFromLast(track: Track, list: string[], name: string): void {

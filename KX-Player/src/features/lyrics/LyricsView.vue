@@ -226,7 +226,7 @@ const isFavorite = computed(() => (player.currentId ? playlists.isFavorite(playe
 }
 .lv-badges { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 .chip-btn { cursor: pointer; }
-.chip-btn.on { color: #e6685f; border-color: rgba(230, 58, 46, 0.4); }
+.chip-btn.on { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
 .lv-progress {
   font-size: 12px;
   color: var(--text-muted);

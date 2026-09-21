@@ -3,12 +3,12 @@
   --titlebar-h: 36px;
   --sidebar-w: 232px;
   --sidebar-w-collapsed: 56px;
-  --toolbar-h: 44px;
-  --inspector-w: 320px;
+  --toolbar-h: 44px;          /* 视频舞台顶栏；StageView 的 CSS 唯一来源 */
+  --inspector-w: 320px;       /* 检查器默认宽度；运行期可拖拽，实际值在 settings.inspectorWidth */
   --playerbar-h: 76px;
-  --grid-min: 176px;
-  --card-row-h: 232px;
-  --row-h: 46px;
+  --grid-min: 176px;          /* 卡片封面边长默认值；运行期可调，实际值在 settings.gridSize */
+  --card-row-h: 232px;        /* = grid-min + 56；56 在 utils/layout.ts 的 CARD_CHROME_H（JS 侧需要数值） */
+  --row-h: 46px;              /* 列表行高；TrackTable 从 utils/layout.ts 的 ROW_H 取同值 */
   --gap: 12px;
 
   --radius-sm: 6px;

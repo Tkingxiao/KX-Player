@@ -42,7 +42,7 @@ const rows = computed(() => {
 })
 
 let resizeObserver: ResizeObserver | null = null
-let resizeTimer: ReturnType<typeof setTimeout> | null = null
+let rafId2 = 0
 
 function recalcCols(): void {
   const el = viewport.value
@@ -50,6 +50,15 @@ function recalcCols(): void {
   viewportH.value = el.clientHeight
   const c = Math.max(1, Math.floor((el.clientWidth + props.gap) / (props.cardWidth + props.gap)))
   if (c !== cols.value) cols.value = c
+}
+
+/** rAF 节流重算：侧边栏/检查器开合、窗口缩放时列数即时跟随（避免旧宽度下错误列数残留） */
+function scheduleRecalc(): void {
+  if (rafId2) return
+  rafId2 = requestAnimationFrame(() => {
+    rafId2 = 0
+    recalcCols()
+  })
 }
 
 function onScroll(): void {
@@ -66,18 +75,17 @@ onMounted(() => {
   const el = viewport.value
   if (!el) return
   recalcCols()
-  resizeObserver = new ResizeObserver(() => {
-    // 窗口 resize 期间暂停渲染，结束后重算列数
-    if (resizeTimer) clearTimeout(resizeTimer)
-    resizeTimer = setTimeout(recalcCols, 200)
-  })
+  resizeObserver = new ResizeObserver(scheduleRecalc)
   resizeObserver.observe(el)
 })
+
+// 卡片基准尺寸变化（如设置里切换封面大小）：列数必须重算，否则 1fr 单元格宽度异常
+watch([() => props.cardWidth, () => props.gap], scheduleRecalc)
 
 onBeforeUnmount(() => {
   resizeObserver?.disconnect()
   resizeObserver = null
-  if (resizeTimer) clearTimeout(resizeTimer)
+  if (rafId2) cancelAnimationFrame(rafId2)
   if (rafId) cancelAnimationFrame(rafId)
 })
 
@@ -104,7 +112,8 @@ defineExpose({ scrollToTop, cols })
           :style="{
             height: cardHeight + 'px',
             marginBottom: gap + 'px',
-            gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
+            columnGap: gap + 'px',
+            gridTemplateColumns: `repeat(${cols}, minmax(${cardWidth}px, 1fr))`,
           }"
         >
           <template v-for="i in row" :key="i">
@@ -129,11 +138,13 @@ defineExpose({ scrollToTop, cols })
   position: absolute;
   top: 0;
   left: 0;
+  /* 必须显式撑满：绝对定位默认 shrink-to-fit，1fr 轨道会按错误宽度解析 → 卡片宽度异常 */
+  width: 100%;
   will-change: transform;
 }
 .vgrid-row {
   display: grid;
-  gap: inherit;
+  /* 水平间距由行内 columnGap 提供（gap: inherit 会解析为 normal=0，是旧版卡片粘连/宽度异常的根因） */
   /* 行内所有单元格等高、等宽：卡片内容（有无封面）不得改变格子尺寸 */
   align-items: stretch;
 }

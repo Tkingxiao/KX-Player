@@ -17,9 +17,6 @@ const player = usePlayerStore()
 const stageEl = ref<HTMLElement | null>(null)
 const surfaceEl = ref<HTMLElement | null>(null)
 
-/** 顶部控制条高度（px）：mpv 矩形从这里下方开始 */
-const TOPBAR_H = 44
-
 const isStage = computed(() => ui.view === 'stage')
 
 const shouldShow = computed(
@@ -54,8 +51,18 @@ let ro: ResizeObserver | null = null
 
 watch(
   [() => ui.view, () => player.currentId, () => player.videoMode, () => player.audioOnly, () => ui.pipEnabled],
-  () => {
-    void nextTick(syncStage)
+  ([newView, _id, _vm, _ao, pip], [_pv, _pi, _pvm, _pao, prevPip]) => {
+    // pip 刚关闭（true → false）：等 Rust kx-stage 线程完成 Attach(None) 命令后
+    // 再同步矩形（否则矩形坐标还按旧的 pip 客户区计算）
+    if (prevPip && !pip) {
+      // 若当前就在 stage 视图，延迟后主动重推一次矩形（用户是从 pip 还原回 stage）
+      setTimeout(() => void nextTick(syncStage), 300)
+    } else if (newView === 'stage' && !pip) {
+      // 用户导航回 stage：立即同步
+      void nextTick(syncStage)
+    } else {
+      void nextTick(syncStage)
+    }
   },
 )
 
@@ -106,6 +113,34 @@ function openSettings(): void {
   ui.settingsOpen = true
 }
 
+// ── 控制条自动隐藏（规范 P0-3：鼠标静止 2.5s 淡出顶栏，移动即浮现）──
+const chromeHidden = ref(false)
+let idleTimer: ReturnType<typeof setTimeout> | null = null
+
+function armIdleHide(): void {
+  if (idleTimer) clearTimeout(idleTimer)
+  chromeHidden.value = false
+  idleTimer = setTimeout(() => {
+    // 仅在舞台正常播放且未开浮窗时淡出；暂停时保留控制入口
+    if (shouldShow.value && player.current?.isVideo && statePlaying()) chromeHidden.value = true
+  }, 2500)
+}
+
+function statePlaying(): boolean {
+  return !player.audioOnly && player.videoMode === 'video'
+}
+
+// 离开舞台/开关浮窗时复位
+watch([isStage, () => ui.pipEnabled], ([s, pip]) => {
+  if (!s || pip) {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = null
+    chromeHidden.value = false
+  } else {
+    armIdleHide()
+  }
+})
+
 function onKey(e: KeyboardEvent): void {
   if (ui.view !== 'stage' && !pipEnabled.value) return
   const tag = (e.target as HTMLElement)?.tagName
@@ -121,11 +156,20 @@ function onKey(e: KeyboardEvent): void {
   }
 }
 
+// 单击/双击防冲突：双击时浏览器先发一次 click，需要防抖区分
+let clickTimer: ReturnType<typeof setTimeout> | null = null
+
 function onScreenClick(): void {
-  player.togglePlay()
+  if (clickTimer) return // 已在等双击判定，忽略此次单击（双击第二下会取消）
+  clickTimer = setTimeout(() => {
+    clickTimer = null
+    player.togglePlay()
+  }, 220)
 }
 
 function onScreenDblClick(): void {
+  // 取消待执行的单击动作
+  if (clickTimer) { clearTimeout(clickTimer); clickTimer = null }
   void toggleFullscreen()
 }
 
@@ -135,10 +179,13 @@ onMounted(() => {
   if (stageEl.value) ro.observe(stageEl.value)
   if (surfaceEl.value) ro.observe(surfaceEl.value)
   syncStage()
+  armIdleHide()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey)
+  if (idleTimer) clearTimeout(idleTimer)
+  if (clickTimer) clearTimeout(clickTimer)
   ro?.disconnect()
   // 卸载时若不在 PiP，务必隐藏 mpv 覆盖窗口，避免画面残留
   if (!ui.pipEnabled) {
@@ -148,9 +195,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section ref="stageEl" class="stage" :class="{ pip: pipEnabled }">
-    <!-- 顶部控制条：位于 WebView 内，mpv 矩形从它下方开始，故按钮可点击 -->
-    <div v-if="isStage && !pipEnabled" class="stage-topbar">
+  <section ref="stageEl" class="stage" :class="{ pip: pipEnabled }" @mousemove="armIdleHide">
+    <!-- 顶部控制条：位于 WebView 内，mpv 矩形从它下方开始，故按钮可点击；
+         悬浮窗开启时也要保留（否则主窗口停在舞台时既点不到返回也进不了设置） -->
+    <div v-if="isStage" class="stage-topbar" :class="{ 'chrome-hidden': chromeHidden && !pipEnabled }">
       <button class="stage-btn stage-back" title="返回" aria-label="返回" @click="goBackFromStage">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="15,18 9,12 15,6" />
@@ -160,6 +208,18 @@ onBeforeUnmount(() => {
         <div class="stage-title" :title="player.currentTitle">{{ player.currentTitle }}</div>
         <div class="stage-sub">{{ player.currentArtist }}</div>
       </div>
+      <button
+        v-if="player.current?.isVideo"
+        class="stage-btn"
+        :class="{ active: ui.pipEnabled }"
+        :title="ui.pipEnabled ? '关闭悬浮窗' : '小窗（切出悬浮窗）'"
+        aria-label="画中画"
+        @click="ui.togglePip()"
+      >
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="8" y="10" width="12" height="10" rx="2" /><path d="M4 14V6a2 2 0 0 1 2-2h8" />
+        </svg>
+      </button>
       <button
         class="stage-btn"
         :class="{ active: ui.settingsOpen }"
@@ -178,7 +238,7 @@ onBeforeUnmount(() => {
     <div
       ref="surfaceEl"
       class="stage-surface"
-      :class="{ 'with-topbar': isStage && !pipEnabled }"
+      :class="{ 'with-topbar': isStage }"
       @click="onScreenClick"
       @dblclick="onScreenDblClick"
     />
@@ -193,8 +253,8 @@ onBeforeUnmount(() => {
   z-index: 5;
   cursor: default;
 }
+/* 悬浮窗接管画面时：主窗口舞台仅剩占位，背景透明；顶栏保持可交互 */
 .stage.pip {
-  pointer-events: none;
   background: transparent;
 }
 .stage-topbar {
@@ -202,14 +262,20 @@ onBeforeUnmount(() => {
   top: 0;
   left: 0;
   right: 0;
-  height: 44px;
+  height: var(--toolbar-h);
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 0 12px;
   z-index: 2;
   background: linear-gradient(180deg, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0));
-  color: #fff;
+  color: var(--on-media);
+  transition: opacity 300ms var(--ease);
+}
+/* 鼠标静止 2.5s 淡出（规范 P0-3）；淡出后不拦截点击 */
+.stage-topbar.chrome-hidden {
+  opacity: 0;
+  pointer-events: none;
 }
 .stage-btn {
   display: inline-flex;
@@ -224,7 +290,7 @@ onBeforeUnmount(() => {
 }
 .stage-btn:hover {
   background: rgba(255, 255, 255, 0.14);
-  color: #fff;
+  color: var(--on-media);
 }
 .stage-btn.active {
   color: rgb(var(--accent-rgb));
@@ -254,6 +320,6 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 .stage-surface.with-topbar {
-  top: 44px;
+  top: var(--toolbar-h);
 }
 </style>

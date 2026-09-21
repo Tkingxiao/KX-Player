@@ -162,12 +162,11 @@ const totalDuration = computed(() => tracks.value.reduce((s, t) => s + (t.durati
   border: 1px solid rgb(var(--accent-rgb));
   border-radius: var(--radius-sm);
   padding: 2px 8px;
-  outline: none;
   width: 320px;
 }
 .lv-sub { font-size: 12px; color: var(--text-muted); }
 .lv-actions { display: flex; gap: 10px; margin-top: 8px; }
-.danger-ghost:hover { color: #e6685f; border-color: rgba(230, 58, 46, 0.5); }
+.danger-ghost:hover { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
 .lv-table {
   flex: 1;
   min-height: 0;

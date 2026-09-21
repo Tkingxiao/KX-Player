@@ -130,6 +130,9 @@ pub struct AiChatPayload {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// `ai_ping` 只带三个凭证字段过来，messages 由 [`crate::ai::ping`] 自己补。
+    /// 没有 `default` 时 serde 会因缺字段直接拒绝整个请求，测试连接必然失败。
+    #[serde(default)]
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f64>,
 }
@@ -176,8 +179,14 @@ pub struct PlayerState {
     pub volume: f64,
     pub muted: bool,
     pub track_path: Option<String>,
-    pub is_video: bool,
     pub video_active: bool,
+    /// 画面显示尺寸（mpv video-params dwidth/dheight，含像素长宽比）。
+    /// 0 = 尚未拿到（无视频轨或还在加载）。悬浮窗据此把窗口锁成同一比例，
+    /// 避免 mpv 在窗口内留 letterbox 黑边。
+    #[serde(default)]
+    pub video_w: f64,
+    #[serde(default)]
+    pub video_h: f64,
 }
 
 /// 字幕样式（mpv sub-* 属性遥控）
@@ -191,4 +200,19 @@ pub struct SubStyle {
     pub border_size: Option<f64>,
     pub shadow_offset: Option<f64>,
     pub pos: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AiChatPayload;
+
+    /// 线格式回归守卫：`ai_ping` 只发三个凭证字段（见 `bridge/ipc.ts`），
+    /// `messages` 一旦回到必填，serde 会拒掉整个请求，测试连接静默失败。
+    #[test]
+    fn ai_chat_payload_accepts_a_ping_shaped_request() {
+        let p: AiChatPayload =
+            serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m"}"#).unwrap();
+        assert!(p.messages.is_empty());
+        assert!(p.temperature.is_none());
+    }
 }

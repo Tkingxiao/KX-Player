@@ -3,6 +3,7 @@
 
 pub mod embed;
 
+use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::model::PlayerState;
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Format, Mpv};
@@ -57,7 +58,7 @@ impl PlayerCore {
     }
 
     /// 首次播放时初始化 mpv 与嵌入窗口（幂等）
-    pub fn ensure_started(&self, window: &WebviewWindow) -> Result<(), String> {
+    pub fn ensure_started(&self, window: &WebviewWindow) -> IpcResult<()> {
         if self.mpv.get().is_some() {
             return Ok(());
         }
@@ -67,10 +68,11 @@ impl PlayerCore {
         }
         let main_hwnd: isize = window
             .hwnd()
-            .map_err(|e| format!("获取窗口句柄失败: {e}"))?
+            .map_err(|e| IpcError::with_detail(AppErrorCode::MpvEmbedFailed, "获取窗口句柄失败", e))?
             .0 as isize;
         // 舞台线程：创建覆盖窗口并跑消息循环（窗口操作只在该线程执行，避免跨线程 SendMessage 死锁）
-        let host = embed::start_stage_thread(main_hwnd).ok_or("创建 mpv 宿主窗口失败")?;
+        let host = embed::start_stage_thread(main_hwnd)
+            .ok_or_else(|| IpcError::new(AppErrorCode::MpvEmbedFailed, "创建 mpv 宿主窗口失败"))?;
         let mpv = Mpv::with_initializer(|init| {
             init.set_option("wid", host as i64)?;
             init.set_option("vo", "gpu-next".to_string())?;
@@ -84,7 +86,7 @@ impl PlayerCore {
             init.set_option("audio-display", "no".to_string())?;
             Ok(())
         })
-        .map_err(|e| format!("mpv 初始化失败: {e}"))?;
+        .map_err(|e| IpcError::with_detail(AppErrorCode::MpvInitFailed, "mpv 初始化失败", e))?;
         let mpv = Arc::new(mpv);
 
         let _ = self.main_hwnd.set(main_hwnd);
@@ -101,13 +103,13 @@ impl PlayerCore {
         std::thread::Builder::new()
             .name("mpv-events".into())
             .spawn(move || event_loop(mpv, app, shared, last_emit))
-            .map_err(|e| format!("mpv 事件线程启动失败: {e}"))?;
+            .map_err(|e| IpcError::with_detail(AppErrorCode::MpvInitFailed, "mpv 事件线程启动失败", e))?;
         crate::paths::append_log("[mpv] initialized with embedded window");
         Ok(())
     }
 
-    pub fn play_file(&self, path: &str, resume_ms: f64, vol: f64, muted: bool, speed: f64, video_active: bool) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn play_file(&self, path: &str, resume_ms: f64, vol: f64, muted: bool, speed: f64, video_active: bool) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         {
             let mut s = self.shared.lock();
             s.playing = true;
@@ -124,38 +126,41 @@ impl PlayerCore {
         } else {
             let _ = mpv.set_property("start", 0.0_f64);
         }
+        // keep-open=yes 让 mpv 播完后停在「已暂停」，而 pause 属性会跨 loadfile 保留：
+        // 不显式清掉，之后每次起播都冻在首帧（进度不动、画面静止，前端一直显示加载中）。
+        mpv.set_property("pause", false).map_err(mpv_err)?;
         mpv.command("loadfile", &[path]).map_err(mpv_err)?;
         self.emit_state(true);
         Ok(())
     }
 
-    pub fn set_paused(&self, paused: bool) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_paused(&self, paused: bool) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("pause", paused).map_err(mpv_err)
     }
 
-    pub fn seek(&self, sec: f64) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn seek(&self, sec: f64) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.command("seek", &[&format!("{sec:.3}"), "absolute"]).map_err(mpv_err)
     }
 
-    pub fn set_volume(&self, v: f64) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_volume(&self, v: f64) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("volume", v * 100.0).map_err(mpv_err)
     }
 
-    pub fn set_muted(&self, m: bool) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_muted(&self, m: bool) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("mute", m).map_err(mpv_err)
     }
 
-    pub fn set_speed(&self, s: f64) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_speed(&self, s: f64) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("speed", s).map_err(mpv_err)
     }
 
-    pub fn stop(&self) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn stop(&self) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.command("stop", &[]).map_err(mpv_err)?;
         {
             let mut s = self.shared.lock();
@@ -163,6 +168,8 @@ impl PlayerCore {
             s.position = 0.0;
             s.track_path = None;
             s.video_active = false;
+            s.video_w = 0.0;
+            s.video_h = 0.0;
         }
         self.set_stage_visible(false);
         self.emit_state(true);
@@ -202,8 +209,8 @@ impl PlayerCore {
     }
 
     /// 选择字幕轨（id<=0 表示关闭字幕）
-    pub fn set_subtitle_track(&self, id: i64) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_subtitle_track(&self, id: i64) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         let v = if id > 0 { id.to_string() } else { "no".to_string() };
         mpv.set_property("sid", v).map_err(mpv_err)?;
         // 记住选择（mpv 会持久化 sub-visibility）
@@ -212,20 +219,20 @@ impl PlayerCore {
     }
 
     /// 字幕开关（不改变当前轨）
-    pub fn set_subtitle_visible(&self, visible: bool) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_subtitle_visible(&self, visible: bool) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("sub-visibility", visible).map_err(mpv_err)
     }
 
     /// 字幕时间偏移（秒，正=延后显示）
-    pub fn set_subtitle_delay(&self, sec: f64) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_subtitle_delay(&self, sec: f64) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("sub-delay", sec).map_err(mpv_err)
     }
 
     /// 字幕样式（mpv sub-* 属性遥控）
-    pub fn set_sub_style(&self, style: crate::model::SubStyle) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_sub_style(&self, style: crate::model::SubStyle) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         if let Some(v) = style.font {
             mpv.set_property("sub-font", v).map_err(mpv_err)?;
         }
@@ -251,17 +258,17 @@ impl PlayerCore {
     }
 
     /// 响度均衡：volume-gain 叠加在用户音量之上；无分析值时必须清零上一首的增益。
-    pub fn apply_loudness_gain(&self, track_lufs: Option<f64>, target_lufs: f64) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn apply_loudness_gain(&self, track_lufs: Option<f64>, target_lufs: f64) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("volume-gain", loudness_gain_db(track_lufs, target_lufs))
             .map_err(mpv_err)?;
         Ok(())
     }
 
     /// 「仅音频」= vid=no（引擎始终是 mpv，播放位置不丢）
-    pub fn set_video_enabled(&self, enabled: bool) -> Result<(), String> {
+    pub fn set_video_enabled(&self, enabled: bool) -> IpcResult<()> {
 
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("vid", if enabled { "auto".to_string() } else { "no".to_string() })
             .map_err(mpv_err)?;
         {
@@ -271,7 +278,16 @@ impl PlayerCore {
         Ok(())
     }
 
-    pub fn set_stage_rect(&self, x: i32, y: i32, w: i32, h: i32, visible: bool) {
+    /// 前端下发舞台几何。同一时刻只有一个窗口有资格决定画面在哪：
+    /// - 挂在浮窗上时，忽略主窗口的命令。主窗口的失焦、视图切换都会发 `visible:false`，
+    ///   它和浮窗的几何命令在同一个 FIFO 队列里竞速，后到者赢 ——
+    ///   表现为「不在视频界面打开小窗时，小窗画面消失」。
+    /// - 浮窗已关闭/还原时，忽略浮窗的命令。浮窗只是被 hide，它的 WebView 还活着并会继续
+    ///   上报几何，而那份矩形是**浮窗客户区**坐标，拿去换算主窗口就把画面甩到左上角。
+    pub fn set_stage_rect(&self, x: i32, y: i32, w: i32, h: i32, visible: bool, from_pip: bool) {
+        if from_pip != self.pip_active.load(Ordering::SeqCst) {
+            return;
+        }
         let rect = embed::StageRect { x, y, w, h, visible };
         *self.last_rect.lock() = Some(rect);
         embed::set_stage_rect(rect);
@@ -314,12 +330,30 @@ impl PlayerCore {
     }
 
     /// 切换覆盖窗口挂靠目标：Some(hwnd)=独立悬浮窗（pip），None=挂回主窗口。
-    /// 同时清空最后矩形——挂靠切换后目标客户区坐标系已变，旧的矩形不再有效，
-    /// 由前端（PipRoot 或舞台）在挂靠完成后重新下发几何。
+    /// 清空 last_rect：坐标系已切换，旧矩形在新坐标系下完全无意义；
+    /// 前端（PipRoot 或 StageView）在挂靠完成后会重新下发正确几何。
     pub fn attach_overlay(&self, target: Option<isize>) {
         self.pip_active.store(target.is_some(), Ordering::SeqCst);
-        *self.last_rect.lock() = None;
+        *self.last_rect.lock() = None;   // 必须清空，防止 reposition() 用错坐标系
         embed::attach(target);
+    }
+
+    /// 提前声明「画面即将由悬浮窗接管」。pip_open 在 show() 之前调用：
+    /// 显示浮窗会让主窗口失焦，那次 Focused(false) 若早于 attach_overlay 到达，
+    /// 就会把刚挂好底的视频层一起藏掉（小窗只剩声音）。
+    pub fn mark_pip_active(&self, active: bool) {
+        self.pip_active.store(active, Ordering::SeqCst);
+    }
+
+    /// 分离覆盖窗口（pip 关闭 / 还原时专用）：
+    /// 先强制隐藏覆盖窗口（避免在 Attach(None) 被 kx-stage 处理前短暂露出错误位置），
+    /// 再挂回主窗口并清空 last_rect。
+    pub fn detach_overlay(&self) {
+        self.pip_active.store(false, Ordering::SeqCst);
+        // 先发 Visible(false) 入队，让 kx-stage 先隐藏再切 owner
+        embed::set_os_visible_cmd(false);
+        *self.last_rect.lock() = None;
+        embed::attach(None);
     }
 
     pub fn is_pip_active(&self) -> bool {
@@ -366,8 +400,8 @@ impl PlayerCore {
         ensure_default_device(devices)
     }
 
-    pub fn set_device(&self, id: &str) -> Result<(), String> {
-        let mpv = self.mpv.get().ok_or("mpv 未初始化")?;
+    pub fn set_device(&self, id: &str) -> IpcResult<()> {
+        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
         mpv.set_property("audio-device", id.to_string()).map_err(mpv_err)
     }
 
@@ -378,61 +412,6 @@ impl PlayerCore {
 
 fn loudness_gain_db(track_lufs: Option<f64>, target_lufs: f64) -> f64 {
     track_lufs.map(|lufs| (target_lufs - lufs).clamp(-12.0, 12.0)).unwrap_or(0.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ensure_default_device, loudness_gain_db};
-    use crate::model::AudioDevice;
-
-    fn dev(id: &str, label: &str) -> AudioDevice {
-        AudioDevice { device_id: id.into(), label: label.into() }
-    }
-
-    #[test]
-    fn loudness_gain_is_zero_without_measurement() {
-        assert_eq!(loudness_gain_db(None, -23.0), 0.0);
-    }
-
-    #[test]
-    fn loudness_gain_uses_target_difference_and_clamps() {
-        assert_eq!(loudness_gain_db(Some(-28.0), -23.0), 5.0);
-        assert_eq!(loudness_gain_db(Some(-50.0), -23.0), 12.0);
-        assert_eq!(loudness_gain_db(Some(-5.0), -23.0), -12.0);
-    }
-
-    #[test]
-    fn device_list_keeps_real_devices_and_prepends_default() {
-        let out = ensure_default_device(vec![dev("wasapi/{abc}", "扬声器 (Realtek)")]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].device_id, "auto");
-        assert_eq!(out[0].label, "系统默认输出");
-        assert_eq!(out[1].device_id, "wasapi/{abc}");
-        assert_eq!(out[1].label, "扬声器 (Realtek)");
-    }
-
-    #[test]
-    fn device_list_does_not_duplicate_mpv_auto_entry() {
-        let out = ensure_default_device(vec![dev("auto", "Autoselect device"), dev("null", "Null")]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].device_id, "auto");
-        assert_eq!(out[0].label, "Autoselect device");
-        assert_eq!(out[1].device_id, "null");
-    }
-
-    #[test]
-    fn device_list_falls_back_to_chinese_label_for_empty_auto_description() {
-        let out = ensure_default_device(vec![dev("auto", "   ")]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].label, "系统默认输出");
-    }
-
-    #[test]
-    fn empty_device_list_still_yields_default() {
-        let out = ensure_default_device(Vec::new());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].device_id, "auto");
-    }
 }
 
 fn default_device() -> crate::model::AudioDevice {
@@ -455,8 +434,10 @@ fn ensure_default_device(mut devices: Vec<crate::model::AudioDevice>) -> Vec<cra
     devices
 }
 
-fn mpv_err(e: libmpv2::Error) -> String {
-    format!("mpv: {e}")
+/// mpv 的 `set_property`/`command` 失败既不是初始化失败也不是嵌入失败，码取 `Internal`；
+/// 原始 `libmpv2::Error` 文本进 `detail`，排查时仍能看到。
+fn mpv_err(e: libmpv2::Error) -> IpcError {
+    IpcError::with_detail(AppErrorCode::Internal, "播放器指令失败", e)
 }
 
 fn now_ms() -> u64 {
@@ -474,6 +455,9 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, _l
     let _ = mpv.observe_property("speed", Format::Double, 4);
     let _ = mpv.observe_property("volume", Format::Double, 5);
     let _ = mpv.observe_property("mute", Format::Flag, 6);
+    // 画面显示尺寸（含 PAR）：悬浮窗据此把窗口锁成同一比例，避免左右黑边
+    let _ = mpv.observe_property("video-params/dw", Format::Double, 7);
+    let _ = mpv.observe_property("video-params/dh", Format::Double, 8);
     let _ = mpv.enable_event(libmpv2::events::mpv_event_id::StartFile);
     let _ = mpv.enable_event(libmpv2::events::mpv_event_id::EndFile);
     let _ = mpv.enable_event(libmpv2::events::mpv_event_id::FileLoaded);
@@ -516,6 +500,17 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, _l
                                 force = true;
                             }
                         }
+                        PropertyData::Double(v) if name == "video-params/dw" => {
+                            if (s.video_w - v).abs() > 0.5 {
+                                s.video_w = v;
+                                force = true;
+                            }
+                        }
+                        PropertyData::Double(v) if name == "video-params/dh"
+                            && (s.video_h - v).abs() > 0.5 => {
+                                s.video_h = v;
+                                force = true;
+                            }
                         _ => {}
                     }
                 }
@@ -526,6 +521,9 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, _l
                     let mut s = shared.lock();
                     s.playing = true;
                     s.position = 0.0;
+                    // 换曲即失配：不清掉的话悬浮窗会按上一首的比例开窗，新画面又要黑边补差
+                    s.video_w = 0.0;
+                    s.video_h = 0.0;
                 }
                 let _ = app.emit("player:loading", ());
                 emit_state_shared(&app, &shared, true, &mut None, Duration::from_millis(0));
@@ -585,4 +583,59 @@ fn emit_state_shared(
         let snap = shared.lock().clone();
         let _ = app.emit("player:state", snap);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_default_device, loudness_gain_db};
+    use crate::model::AudioDevice;
+
+    fn dev(id: &str, label: &str) -> AudioDevice {
+        AudioDevice { device_id: id.into(), label: label.into() }
+    }
+
+    #[test]
+    fn loudness_gain_is_zero_without_measurement() {
+        assert_eq!(loudness_gain_db(None, -23.0), 0.0);
+    }
+
+    #[test]
+    fn loudness_gain_uses_target_difference_and_clamps() {
+        assert_eq!(loudness_gain_db(Some(-28.0), -23.0), 5.0);
+        assert_eq!(loudness_gain_db(Some(-50.0), -23.0), 12.0);
+        assert_eq!(loudness_gain_db(Some(-5.0), -23.0), -12.0);
+    }
+
+    #[test]
+    fn device_list_keeps_real_devices_and_prepends_default() {
+        let out = ensure_default_device(vec![dev("wasapi/{abc}", "扬声器 (Realtek)")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].device_id, "auto");
+        assert_eq!(out[0].label, "系统默认输出");
+        assert_eq!(out[1].device_id, "wasapi/{abc}");
+        assert_eq!(out[1].label, "扬声器 (Realtek)");
+    }
+
+    #[test]
+    fn device_list_does_not_duplicate_mpv_auto_entry() {
+        let out = ensure_default_device(vec![dev("auto", "Autoselect device"), dev("null", "Null")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].device_id, "auto");
+        assert_eq!(out[0].label, "Autoselect device");
+        assert_eq!(out[1].device_id, "null");
+    }
+
+    #[test]
+    fn device_list_falls_back_to_chinese_label_for_empty_auto_description() {
+        let out = ensure_default_device(vec![dev("auto", "   ")]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "系统默认输出");
+    }
+
+    #[test]
+    fn empty_device_list_still_yields_default() {
+        let out = ensure_default_device(Vec::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].device_id, "auto");
+    }
 }

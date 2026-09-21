@@ -216,8 +216,8 @@ watch(() => ui.autoTagReview, (v) => { if (v) void load() })
 .atr-btn:hover { color: var(--text); background: var(--bg-hover); }
 .atr-primary {
   background: rgb(var(--accent-rgb) / 0.9);
-  color: #fff;
+  color: var(--on-accent);
 }
-.atr-primary:hover { background: rgb(var(--accent-rgb)); color: #fff; }
+.atr-primary:hover { background: rgb(var(--accent-rgb)); color: var(--on-accent); }
 .atr-primary:disabled { opacity: 0.45; }
 </style>

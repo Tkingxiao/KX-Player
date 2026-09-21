@@ -127,6 +127,9 @@ fn meta_to_file_meta(m: ScanMeta) -> FileMeta {
 /// - `parse` 的 panic 被捕获后降级为兜底元数据，扫描不会因此中断；
 /// - 结果认领用 `finished[idx]` 的 CAS 完成：worker 正常完成与 watchdog 超时兜底
 ///   只有一方能计数；已判超时的文件不会被 worker 迟到的真实结果覆盖（与旧版语义一致）。
+///
+/// 参数表就是「共享状态 + 本次认领范围」的完整清单，打包成结构体只是把同一批字段换个地方写。
+#[allow(clippy::too_many_arguments)]
 fn parse_one_guarded(
     idx: usize,
     chunk_end: usize,
@@ -186,13 +189,7 @@ fn parse_pool(
 
     // worker 数：min(cpu, 8)，下限 2（宪法：扫描解码并发 min(cpu, 8)）。
     // 上限 8 避免解码/IO 争抢与内存峰值；下限 2 让单核机器也能让 IO 与 CPU 重叠。
-    let threads = std::cmp::min(
-        8,
-        std::cmp::max(
-            2,
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
-        ),
-    );
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
     // 领取粒度：把任务切成约 4 个 chunk/worker —— chunk 越小负载越均衡（个别慢文件不至于
     // 形成长尾），但每个 chunk 至少 1 个文件。worker 数再按 chunk 数封顶，
     // 于是小库（total < threads*4）不会 spawn 一堆空转线程，也不会出现空 chunk。
@@ -536,8 +533,7 @@ fn build_folder_tree(files: &[String], metas: &HashMap<String, FileMeta>, roots:
         // 祖先链：确保从叶子目录到根的所有中间目录节点存在
         // （children 挂接统一由后方的排序链接循环完成，父目录路径必然先于子目录处理）
         let mut cur = dir.clone();
-        loop {
-            let Some(parent_end) = cur.rfind('/') else { break };
+        while let Some(parent_end) = cur.rfind('/') {
             let parent = cur[..parent_end].to_string();
             if parent.is_empty() {
                 break;
@@ -582,8 +578,8 @@ fn build_folder_tree(files: &[String], metas: &HashMap<String, FileMeta>, roots:
                 node.children.push(assemble(kid, nodes, children_map));
             }
         }
-        node.children.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        node.tracks.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        node.children.sort_by_key(|a| a.name.to_lowercase());
+        node.tracks.sort_by_key(|a| a.name.to_lowercase());
         node
     }
 
@@ -594,8 +590,8 @@ fn build_folder_tree(files: &[String], metas: &HashMap<String, FileMeta>, roots:
 
     // 排序 + 计数
     fn finalize(node: &mut FolderNode) -> i64 {
-        node.children.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        node.tracks.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        node.children.sort_by_key(|a| a.name.to_lowercase());
+        node.tracks.sort_by_key(|a| a.name.to_lowercase());
         let mut count = node.tracks.len() as i64;
         for child in &mut node.children {
             count += finalize(child);
@@ -606,7 +602,7 @@ fn build_folder_tree(files: &[String], metas: &HashMap<String, FileMeta>, roots:
     for r in &mut roots_sorted {
         finalize(r);
     }
-    roots_sorted.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    roots_sorted.sort_by_key(|a| a.name.to_lowercase());
     // 仅保留有内容的根
     roots_sorted.retain(|r| r.track_count > 0 || !r.children.is_empty());
     roots_sorted
@@ -677,7 +673,7 @@ fn fill_album_covers(artists: &mut [ScannedArtist], only_changed: Option<&HashSe
     }
 }
 
-/// 封面落盘：专辑封面复制给专辑内所有音轨；文件夹封面写入 folder_{md5}.jpg + 映射
+/// 封面落盘：专辑封面复制给专辑内所有音轨；文件夹封面写入 folder_{hash}.jpg + 映射
 fn save_covers(artists: &[ScannedArtist], tree: &[FolderNode], changed_only: Option<&HashSet<String>>) -> (usize, usize) {
     let mut track_saved = 0usize;
     let mut track_total = 0usize;
@@ -731,7 +727,7 @@ fn save_covers(artists: &[ScannedArtist], tree: &[FolderNode], changed_only: Opt
             }
             if let Some(src) = src {
                 *folder_total += 1;
-                let hash = covers::md5_hex(&np);
+                let hash = covers::cache_key(&np);
                 let saved = covers::save_cover_file(&format!("folder_{hash}"), &src);
                 if saved.is_some() || covers::folder_cover_path(&np).is_some() {
                     covers::set_folder_cover_mapping(&np);

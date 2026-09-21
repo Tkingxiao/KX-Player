@@ -36,10 +36,7 @@ fn run_probe(argv: Vec<String>) -> Option<Vec<u8>> {
         .build()
         .ok()?;
     let out = rt.block_on(async {
-        match tokio::process::Command::new(argv[0].clone()).args(&argv[1..]).output().await {
-            Ok(o) => Some(o),
-            Err(_) => None,
-        }
+        tokio::process::Command::new(argv[0].clone()).args(&argv[1..]).output().await.ok()
     })?;
     if out.status.success() {
         Some(out.stdout)
