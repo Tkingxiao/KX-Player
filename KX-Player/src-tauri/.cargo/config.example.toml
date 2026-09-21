@@ -1,0 +1,12 @@
+# 复制本文件为同目录的 config.toml，并把 native 路径改成自己机器上 mpv-dev 的位置。
+# config.toml 含机器专属绝对路径，不入库。
+#
+# 为什么需要它：libmpv2-sys 只发 `cargo:rustc-link-lib=mpv`，不提供搜索路径，
+# 链接期会 `cannot find mpv.lib`。mpv.lib 由 mpv-dev 包里的 libmpv.dll.a 复制而来
+# （MinGW 导入库，MSVC link.exe 可直接用）。
+# 运行期的 libmpv-2.dll 不用管，build.rs 会从同一个目录自动铺设。
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-L", "native=<仓库根>\\.toolchain\\mpv-dev",
+]

@@ -56,6 +56,12 @@ record-time.js
 # Rust / Tauri build artifacts
 KX-Player/src-tauri/target/
 **/target/
+# libmpv-2.dll 由 build.rs 从 .toolchain/mpv-dev 铺过来，不入库（115 MB > GitHub 100 MB 单文件上限）
+KX-Player/src-tauri/lib/
+# tauri_build::build() 每次构建重新生成；capabilities/default.json 才是手写的事实源
+KX-Player/src-tauri/gen/
+# 机器专属：链接 mpv 的 native 搜索路径含绝对路径，模板见同目录 config.example.toml
+KX-Player/src-tauri/.cargo/config.toml
 
 # AI/agent tool state (临时钩子状态，勿入库)
 .mimosa/
@@ -90,12 +96,15 @@ coverage/
 *.stackdump
 *.dmp
 
-# 待索引清理后再启用的规则（直接加会与已跟踪文件冲突）：
-#   KX-Player/src-tauri/gen/schemas/   → Tauri 每次 build 自动重建，现有 4 个文件已入库
-#   HANDOVER*.md                       → HANDOVER-electron-era.md 已入库，需先决定是否保留
-# 启用时需配合：git rm -r --cached <路径>
+# 本地/临时文档
 /docs-vibecoding
-HANDOVER-electron-era.md
-HANDOVER.md
-CLAUDE.md
 /tmp
+
+# 逐批整改账本与交接笔记：含本机路径与逐批决策往来，只在本机保留
+ALIGNMENT-AUDIT-*.md
+HANDOVER*.md
+
+# 本地启动脚本：写死了本机绝对路径兜底，不入库（等价入口是 npm run dev）
+start.bat
+# 根目录的 npm 空锁文件残留，真正生效的是 KX-Player/package-lock.json
+/package-lock.json

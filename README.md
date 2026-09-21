@@ -19,7 +19,8 @@
 - Windows 10/11（依赖 WebView2；窗口嵌入用 Win32 API）
 - Rust 1.98.1（`rust-toolchain.toml` 已锁定，`rustup` 自动安装）。`npm run check` 需要 clippy，它**不随 toolchain 自动装**：`rustup component add --toolchain 1.98.1-x86_64-pc-windows-msvc clippy`
 - Node.js ≥ 18、npm ≥ 9
-- `libmpv-2.dll`（随包资源，置于 `KX-Player/src-tauri/lib/`）
+- mpv-dev：解压到仓库根的 `.toolchain/mpv-dev/`（要含 `libmpv-2.dll` 与 `mpv.lib`）。运行期那份 dll 由 `build.rs` 从这儿自动铺到 `src-tauri/lib/` 和 exe 同目录，不入库
+- `src-tauri/.cargo/config.toml`：复制同目录的 `config.example.toml` 过去，把 `native` 改成自己机器上 `.toolchain/mpv-dev` 的绝对路径。缺它链接期报 `cannot find mpv.lib`；它含机器专属路径，同样不入库
 - ffmpeg / ffprobe（可选，仅格式转换、音频提取、响度分析需要；不在 PATH 时相关功能降级，播放不受影响）
 
 ## 开发
@@ -30,7 +31,7 @@ npm install
 npm run dev          # Vite dev server + Rust 后端，前端热更新、Rust 改动自动重编译
 ```
 
-或双击仓库根目录的 `start.bat`（等价于 `npm run dev`）。
+本地想双击启动可自行放一个等价 `npm run dev` 的脚本；仓库不代管，因为它总要写死本机路径。
 
 dev server 固定 `127.0.0.1:5173`——不要改回 `localhost`，WebView2 的 IPv6 解析会导致启动时「拒绝连接」。
 
@@ -93,12 +94,9 @@ KX-Player/                      仓库根
 │       │   ├── bgimage.rs      背景图压缩
 │       │   ├── paths.rs        数据目录、日志轮转
 │       │   └── model.rs        DTO
-│       ├── lib/libmpv-2.dll    随包资源
+│       ├── lib/                构建时由 build.rs 从 .toolchain 铺 libmpv-2.dll，不入库
 │       └── tauri.conf.json
-├── docs-vibecoding/            规格提示词（00~05）
-├── .ulpi/design/DESIGN.md      设计语言
-├── HANDOVER.md                 交付现状自述
-└── ALIGNMENT-AUDIT-2026-09-20.md  实现与提示词的对齐审计
+└── .ulpi/design/DESIGN.md      设计语言
 ```
 
 ## 功能
@@ -126,7 +124,7 @@ KX-Player/                      仓库根
 | 现象 | 处理 |
 |---|---|
 | 启动白屏 / 「127.0.0.1 拒绝连接」 | 见上文「不要用 cargo build --release」；确认 dev server 已在 `127.0.0.1:5173` 监听 |
-| 视频黑屏但有声 | 确认 `libmpv-2.dll` 与 exe 同目录或 `resources` 路径正确 |
+| 视频黑屏但有声 | 确认 exe 同目录有 `libmpv-2.dll`。它由 `build.rs` 从 `.toolchain/mpv-dev` 铺设，构建日志里出现「缺少 libmpv-2.dll」warning 就是没铺成 |
 | 极少数情况启动白屏 | 清除 `%LOCALAPPDATA%\com.kxplayer.music*` 缓存后重试 |
 | 转换/响度分析报「ffmpeg.exe 未找到」 | 安装 ffmpeg 并加入 PATH（或设 `KX_FFMPEG` 指向 exe），或按上文接入随包 sidecar；`npm run check:ffmpeg` 能一次报清「找到了哪个、缺哪些编解码器」 |
 | 新增 Rust 命令前端调不到 | Tauri 按 camelCase 归一化参数名：`base_url` → 前端键名必须是 `baseUrl`（不是 `baseURL`）；同时确认已在 `lib.rs` 的 `invoke_handler` 注册 |
