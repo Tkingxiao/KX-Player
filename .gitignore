@@ -1,110 +1,108 @@
-# Dependencies
+# ============================================================
+# 这个文件是「什么不进仓库」的唯一事实源。
+# 分组的判据只有一条：这东西能不能从仓库里的东西重新长出来。
+#   能长出来 → 忽略（依赖、构建产物、缓存、工具状态）
+#   长不出来又只属于某台机器 → 忽略 + 提供入库的 example 模板
+#   长不出来且属于项目本身 → 入库
+# 规则一律不带开头斜杠的写法可在任意层级生效，所以不再重复写 `**/xxx/`。
+# ============================================================
+
+# ---------- 1. 依赖 ----------
 node_modules/
 
-# Build outputs
+# ---------- 2. 构建产物（前端 + Tauri）----------
 dist/
+# Electron 时代两代输出目录，仓库里已无对应源码，仅防本地残留被误提交
 dist-electron/
 dist_electron/
+# cargo 输出；根与嵌套工程都适用
+**/target/
+# libmpv-2.dll 由 build.rs 从 .toolchain/mpv-dev 铺设，不入库（115 MB > GitHub 单文件 100 MB 上限）
+KX-Player/src-tauri/lib/
+# tauri_build::build() 每次构建重新生成；capabilities/default.json 才是手写的事实源
+KX-Player/src-tauri/gen/
+# vite 预打包缓存 / 增量编译信息 / 测试与 lint 缓存
+.vite/
+*.tsbuildinfo
+coverage/
+.eslintcache
 
-# Electron build artifacts
+# ---------- 3. 安装包与打包副产物 ----------
 *.exe
+*.blockmap
+# 只挡打包器生成的 yml。会连带吞掉所有 .yml（含未来的 CI workflow），
+# 因此显式放行 .github 下的工作流；negation 必须写在 *.yml 之后才生效。
+*.yml
+!/.github/**/*.yml
+!/.github/**/*.yaml
+# macOS / Linux 产物：本仓当前只出 Windows 包，留着是因为它们只会出现在别人机器的输出目录里
 *.dmg
 *.AppImage
 *.deb
 *.rpm
-*.blockmap
-# 注意：*.yml 会吞掉所有 .yaml/.yml 配置文件（含未来的 CI workflow），
-# 因此显式放行 .github 下的工作流。negation 必须写在 *.yml 之后才生效。
-*.yml
-!.github/**/*.yml
-!.github/**/*.yaml
 
-# IDE
+# ---------- 4. 机器专属：换台机器就要重写，一律走入库的 example 模板 ----------
+# 链接 mpv 的 native 搜索路径含本机绝对路径 → 模板 src-tauri/.cargo/config.example.toml
+KX-Player/src-tauri/.cargo/config.toml
+# mpv-dev 工具链（含 115 MB 的 dll）：可重新下载，获取方式见 README「依赖」
+.toolchain/
+
+# ---------- 5. 工具与 agent 状态（各自往工作区里写日志/缓存/报告，与源码无关）----------
+.mimosa/
+.zcode/
 .reasonix/
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Claude Code
 .claude/
-
-# Logs
-*.log
-npm-debug.log*
-
-# Environment
-.env
-.env.local
-
-#vscode 2022 build cache
+.qoder/
+# VS Code 2022 的构建缓存
 .vs
+# 各类 agent 自取的上下文文件
 CLAUDE.md
 AGENTS.md
 
-# Error
+# ---------- 6. 本地脚本：内含写死的本机路径，不入库；等价入口见 README ----------
+start.bat
+# 本地审查脚本，同上（不入库、不读取其内容）
+revire.bat
+
+# ---------- 7. 本地笔记与临时文档 ----------
+# 规格提示词草稿，是开发输入而非交付物
+/docs-vibecoding/
+/tmp/
+# 逐批整改账本与交接笔记：含本机路径与逐批决策往来，只在本机保留
+ALIGNMENT-AUDIT-*.md
+HANDOVER*.md
+# 早期零散记录习惯留下的名字
 error.md
 plan.md
 better.md
 record-time.js
 
-# Rust / Tauri build artifacts
-KX-Player/src-tauri/target/
-**/target/
-# libmpv-2.dll 由 build.rs 从 .toolchain/mpv-dev 铺过来，不入库（115 MB > GitHub 100 MB 单文件上限）
-KX-Player/src-tauri/lib/
-# tauri_build::build() 每次构建重新生成；capabilities/default.json 才是手写的事实源
-KX-Player/src-tauri/gen/
-# 机器专属：链接 mpv 的 native 搜索路径含绝对路径，模板见同目录 config.example.toml
-KX-Player/src-tauri/.cargo/config.toml
-
-# AI/agent tool state (临时钩子状态，勿入库)
-.mimosa/
-**/.mimosa/
-.zcode/
-**/.zcode/
-.toolchain/
-**/.toolchain/
-
-# 本地测试媒体（开发期临时生成）
+# ---------- 8. 本地测试素材与运行期产物 ----------
 test-media/
-**/test-media/
-
-# 测试运行目录（临时 APPDATA / 日志 / dump）
 .test-run/
-**/.test-run/
-
-# 运行期产物
+*.log
+npm-debug.log*
+# 运行期日志（落在 exe 同级或用户目录）
 kx-player-log.txt
-
-# 构建 / 测试缓存（当前无被跟踪文件命中，可安全忽略）
-*.tsbuildinfo
-.vite/
-coverage/
-.eslintcache
-
-# 编辑器备份 / 崩溃残留
+# 崩溃转储与编辑器备份
+*.dmp
+*.stackdump
 *~
 *.bak
 *.tmp
 *.old
-*.stackdump
-*.dmp
 
-# 本地/临时文档
-/docs-vibecoding
-/tmp
-
-# 逐批整改账本与交接笔记：含本机路径与逐批决策往来，只在本机保留
-ALIGNMENT-AUDIT-*.md
-HANDOVER*.md
-
-# 本地启动脚本：写死了本机绝对路径兜底，不入库（等价入口是 npm run dev）
-start.bat
-# 根目录的 npm 空锁文件残留，真正生效的是 KX-Player/package-lock.json
+# ---------- 9. 环境 ----------
+.env
+.env.local
+# 根目录误生成的空锁文件残留；真正生效的是 KX-Player/package-lock.json
 /package-lock.json
+
+# ---------- 10. 编辑器与操作系统 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini

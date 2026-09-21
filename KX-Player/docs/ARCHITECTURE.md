@@ -156,9 +156,9 @@ KX-Player/
 `scanner/mod.rs` 是**单个 964 行**的文件，扫描全流程（发现 → 并行元数据 → 分组 → 封面落盘 → 入库）
 都在里面。`db/library.rs` 750 行，`player/mod.rs` 577 行，`taxonomy.rs` 426 行。
 
-⚠️ 仓库根下还有 `electron/`、`dist-electron/` 等 **Electron 版遗留**目录和
-`test-media/`。它们不参与 Tauri 构建（`vite.config.ts:43` 只把 `./index.html` 当入口扫），
-但会让全文检索出现同名旧实现 —— 读代码时注意别把 Electron 版当现状。
+ℹ️ Electron 版遗留实现（`electron/` 8 个文件、`build/uninstall.nsh`、4 个一次性基准脚本）已移出仓库，
+只存在于 git 历史；本机上可能还残留 `dist-electron/`、`dist_electron/`、`test-media/` 等旧输出目录，
+它们不参与 Tauri 构建，也已在根 `.gitignore` 里挡住。若去历史里翻旧实现，注意别把 Electron 版当现状。
 
 ---
 
