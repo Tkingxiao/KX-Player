@@ -134,8 +134,10 @@ onMounted(async () => {
         if (bg && bg.path) {
           settings.bgPath = bg.path
           settings.bgMtime = bg.mtime ?? Date.now()
+          settings.bgLuma = bg.luma ?? null
         } else {
           settings.bgPath = ''
+          settings.bgLuma = null
         }
       } catch { /* ignore */ }
     })()

@@ -70,6 +70,7 @@ export const api: AppApi = {
   openFolder: () => invoke('open_folder'),
   openImageFile: () => invoke('open_image_file'),
   openAudioFiles: () => invoke('open_audio_files'),
+  openTextFiles: () => invoke('open_text_files'),
   scanFoldersWithProgress: (p) => invoke('scan_folders', { paths: p }).then(decorateScan),
   scanFoldersIncremental: (p) => invoke('scan_folders_incremental', { paths: p }).then(decorateScan),
   startupSync: (p) => invoke('startup_sync', { paths: p }).then(decorateScan),
@@ -159,6 +160,23 @@ export const api: AppApi = {
       baseUrl: payload.baseURL,
       apiKey: payload.apiKey,
     }),
+  // ── AI 批量任务（B3）──
+  // 与 aiChat 的区别：这里只「启动」任务，逐块翻译在 Rust 里跑，进度走 ai:progress 事件。
+  // 前端不再拿 await 串起整条链路，所以关页面不影响任务、也才有地方能取消它。
+  aiTranslateStart: ({ baseURL, paths, ...opts }) =>
+    invoke('ai_translate_start', { spec: { baseUrl: baseURL, paths, ...opts } }),
+  aiTextsStart: ({ baseURL, texts, ...opts }) =>
+    invoke('ai_texts_start', { spec: { baseUrl: baseURL, texts, ...opts } }),
+  aiTaskCancel: (taskId: number) => invoke('ai_task_cancel', { taskId }).catch(() => false),
+  // AI-16 半自动模式：导出走保存框（取消 = reject CANCELLED，调用方别当故障报），
+  // 导入的译文文本由前端读好再传（编码探测在 read_text_file 那份，不重复实现一遍）
+  aiExportPrompts: (paths) => invoke('ai_export_prompts', { paths }),
+  aiImportTranslations: (paths, text, apply) => invoke('ai_import_translations', { paths, text, apply }),
+  subtitleScanDir: (dir, kind, maxDepth, limit) =>
+    invoke('subtitle_scan_dir', { dir, kind, maxDepth, limit }),
+  // 改名主干只走这一条命令：预览与落地是两个命令，前端手里拿到的永远只是预览。
+  // 不入 settings、不进历史队列（04 §7.8 的「同一条流水线」是 S2 的事）
+  renamePreview: (paths) => invoke('rename_preview', { paths }),
   renameDir: async (oldPath, newPath) => {
     try {
       await invoke('rename_dir', { oldPath, newPath })

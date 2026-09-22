@@ -21,7 +21,11 @@
 - Node.js ≥ 18、npm ≥ 9
 - mpv-dev：解压到仓库根的 `.toolchain/mpv-dev/`（要含 `libmpv-2.dll` 与 `mpv.lib`）。运行期那份 dll 由 `build.rs` 从这儿自动铺到 `src-tauri/lib/` 和 exe 同目录，不入库
 - `src-tauri/.cargo/config.toml`：复制同目录的 `config.example.toml` 过去，把 `native` 改成自己机器上 `.toolchain/mpv-dev` 的绝对路径。缺它链接期报 `cannot find mpv.lib`；它含机器专属路径，同样不入库
-- ffmpeg / ffprobe（可选，仅格式转换、音频提取、响度分析需要；不在 PATH 时相关功能降级，播放不受影响）
+- ffmpeg（**可选，且不随安装包分发** —— 这是 2026-09-22 的决定，不是待办：安装包与仓库都不带它，`tauri.conf.json` 也不写 `bundle.externalBin`）。只有格式转换 / 音频提取 / 响度分析 / 抽帧需要它，谁用谁本机装一份：
+  - 要**单文件静态构建**（gyan.dev 的 `ffmpeg-release-essentials.zip` 那一类）。共享构建的 `ffmpeg.exe` 只有 ~0.5 MB、运行时拖着 ~210 MB 的 `av-*.dll`，不能用
+    - 落点（`paths::locate_ffmpeg()` 按序找）：`KX_FFMPEG` 环境变量 → exe 同目录 `ffmpeg.exe`（若你手动放了一份）→ 同目录 `ffmpeg/ffmpeg.exe` → `C:\ffmpeg\bin` → PATH。日常最省事的是加进 PATH
+  - 装完跑一次 `npm run check:ffmpeg`：它按 `02 §1.2` 的能力清单核 `-codecs`/`-formats`，会打印「找到了哪个 exe、版本、是否 GPL、缺哪些编解码器」，任一项缺失即 `exit 1`
+  - 没装也能正常用：应用启动与播放完全不受影响，转换页会显示一条警告并置灰「开始转换」（`ffmpeg_probe` 探测到 `available:false`）
 
 ## 开发
 
@@ -38,12 +42,14 @@ dev server 固定 `127.0.0.1:5173`——不要改回 `localhost`，WebView2 的 
 ## 校验与构建
 
 ```bash
-npm run check:types  # vue-tsc 类型检查
-npm run check:ipc    # 命令/事件四方对账（Rust ⇄ generate_handler ⇄ contracts ⇄ ipc.ts）
-npm run gen:ipc      # 重新生成 docs/IPC.md（改了命令或事件就要跑）
-npm run check        # 一条跑全：类型检查 + check:ipc + vitest + cargo clippy -D warnings
-npm run test         # vitest 单测 + cargo test（Rust 侧 36 用例）
-npm run check:ffmpeg # 校验本机/sidecar ffmpeg 是否具备转换页所需编解码能力（缺失即 exit 1）
+npm run check:types    # vue-tsc 类型检查
+npm run check:ipc      # 命令/事件四方对账（Rust ⇄ generate_handler ⇄ contracts ⇄ ipc.ts）
+npm run check:columns  # 列名对账：contracts/columns.ts ↔ DDL ↔ Rust SQL ↔ contracts/dto.ts
+npm run check:colors   # 色值对账：DESIGN.md 的 Color 段 ↔ theme.css ↔ 组件里的字面色值
+npm run gen:ipc        # 重新生成 docs/IPC.md（改了命令或事件就要跑）
+npm run check          # 一条跑全：上面三段对账 + vitest + cargo clippy -D warnings
+npm run test           # vitest 单测 + cargo test（Rust 侧用例）
+npm run check:ffmpeg   # 校验本机 ffmpeg 是否具备转换页所需编解码能力（环境自检，缺失即 exit 1）
 npm run build        # 前端生产构建 → KX-Player/dist
 
 cd src-tauri && cargo check && cargo test
@@ -113,7 +119,7 @@ KX-Player/                      仓库根
 
 ## 已知限制
 
-- **ffmpeg 非随包**：查找顺序 `KX_FFMPEG` → exe 同目录 → `C:\ffmpeg\bin` 等常见位置 → PATH；转换页有缺失提示与降级。sidecar 的落点与启用方式见 `KX-Player/src-tauri/binaries/README.md`（`npm run check:ffmpeg` 按 `02 §1.2` 的能力清单校验手头的 ffmpeg 构建；`externalBin` 尚未写入配置：缺文件会让 `cargo check`/`tauri dev` 一起失败）。带 libx264 的 ffmpeg 为 GPL v2+，分发需一并处理源码获取方式。
+- **ffmpeg 不随包（决定，非欠账）**：理由与口径见上文「环境要求」的 ffmpeg 条与 `docs-vibecoding/02 §1.2`。应用侧已具备能力检测（`ffmpeg_probe`）与降级（转换页警告条 + 置灰执行按钮），缺它只影响转换类功能。因为不分发二进制，带 `libx264` 的 GPL v2+ 源码获取义务也不落在本项目上。
 - **筛选与搜索在前端执行**：组合筛选/搜索目前是全库载入后 JS 过滤，未下沉为 SQL；大库（万条级以上）的启动与搜索响应会退化。
 - 字幕目前由前端解析并自绘浮层，未统一交由 libass 渲染。
 
@@ -126,7 +132,7 @@ KX-Player/                      仓库根
 | 启动白屏 / 「127.0.0.1 拒绝连接」 | 见上文「不要用 cargo build --release」；确认 dev server 已在 `127.0.0.1:5173` 监听 |
 | 视频黑屏但有声 | 确认 exe 同目录有 `libmpv-2.dll`。它由 `build.rs` 从 `.toolchain/mpv-dev` 铺设，构建日志里出现「缺少 libmpv-2.dll」warning 就是没铺成 |
 | 极少数情况启动白屏 | 清除 `%LOCALAPPDATA%\com.kxplayer.music*` 缓存后重试 |
-| 转换/响度分析报「ffmpeg.exe 未找到」 | 安装 ffmpeg 并加入 PATH（或设 `KX_FFMPEG` 指向 exe），或按上文接入随包 sidecar；`npm run check:ffmpeg` 能一次报清「找到了哪个、缺哪些编解码器」 |
+| 转换/响度分析报「ffmpeg.exe 未找到」 | 安装 ffmpeg 并加入 PATH（或设 `KX_FFMPEG` 指向 exe）—— 它**不随安装包分发**，见上文「环境要求」；`npm run check:ffmpeg` 能一次报清「找到了哪个、缺哪些编解码器」 |
 | 新增 Rust 命令前端调不到 | Tauri 按 camelCase 归一化参数名：`base_url` → 前端键名必须是 `baseUrl`（不是 `baseURL`）；同时确认已在 `lib.rs` 的 `invoke_handler` 注册 |
 | 升级后进度/收藏对不上 | 条目 ID 已由 `md5(路径)前 12 位` 改为 UUIDv5，启动时由 `db::migrate_legacy_ids` 全量改写（含封面文件名与 settings）。改写前会把 `library.db` 与 `settings.json` 各复制为 `*.pre-uuid5`，异常时用同目录备份整对回滚 |
 

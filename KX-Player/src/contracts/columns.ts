@@ -217,6 +217,7 @@ export const DTO_NO_TABLE = {
 
   // —— 不进库：文件系统与运行期探测 ——
   DirEntry: '文件系统条目（commands/dialog_fs.rs），不进库。',
+  SubtitleScanItem: 'subtitle_scan_dir 的递归扫描结果（ai_scan::ScannedItem），读目录即得，不落库。',
   FfmpegInfo: '运行期探测 ffmpeg 的结果（paths::locate_ffmpeg），不落库。',
   ExecResult: 'ffmpeg 子进程的 stdout/stderr 返回体，不落库。',
 
@@ -227,7 +228,7 @@ export const DTO_NO_TABLE = {
   SubStyle: '字幕样式是设置项（settings.json 的 sub* 键），不落库。',
 
   // —— 不进库：settings.json / 前端队列 ——
-  BgImageData: '背景图的路径与 mtime，存 settings.json（stores/settings.ts），不落库。',
+  BgImageData: '背景图的路径、mtime 与感知亮度（luma，Rust 侧采样），存 settings.json（stores/settings.ts），不落库。',
   FavItem: '收藏列表存 settings.json 的 favs（stores/playlists.ts）；02 §5.1 的 playlists 表尚未建。',
   ConvertItem: '转换队列项由前端逐项传给 convert_run，不落库。',
   ConvertProgress: 'convert:progress 事件载荷，不落库。',
@@ -239,6 +240,19 @@ export const DTO_NO_TABLE = {
   AiChatResult: 'AI 命令返回体（线形状），不落库。',
   AiPingResult: 'AI 连通性测试回显（线形状），不落库。',
   AiModelsResult: 'AI 模型清单返回体（线形状），不落库。',
+  AiJobOptions: 'AI 批量任务的接入参数（前端侧形状，桥接层映射成 spec.baseUrl），不落库。',
+  AiTranslateSpec: '字幕翻译任务入参（ai_job::AiTranslateSpec），任务跑完就散，不落库。',
+  AiTextsSpec: '纯文本批量翻译任务入参（ai_job::AiTextsSpec），不落库。',
+  AiProgress: 'ai:progress 事件载荷，不落库。',
+  AiExportResult: 'ai_export_prompts 的返回体（写了哪个批次文件、几段、几句导不了），不落库。',
+  AiImportResult: 'ai_import_translations 的校验结果（块数/命中/缺项/重复/越界），不落库。',
+  AiImportFile: '导入校验里每个文件的一份账（齐了才写盘），不落库。',
+  AiImportSample: '差异预览的一条样例（原文 → 译文），不落库。',
+
+  // —— 不进库：改名主干预览（S2 才建 rename_batches / rename_items，本批只读）——
+  RenamePreview: 'rename_preview 的返回体：一层目录的档位分布 + 条目 + 截断/不可读标记，纯计算结果，不落库。',
+  RenameCounts: 'RenamePreview 里的分布计数（rename::preview::Counts），由当前磁盘状态算出，不落库。',
+  RenamePreviewItem: '一条改名预览（rename::preview::Item）：当前名 → 规范化后 + 档位/原因/冲突，落库要等 S2 的 rename_items。',
 } as const
 
 // ── 例外清单 ────────────────────────────────────────────────────

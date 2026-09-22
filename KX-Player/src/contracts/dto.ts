@@ -187,11 +187,157 @@ export interface ConvertProgress {
   error?: string
 }
 
+// ── AI 任务（B3：字幕翻译下沉为 Rust 任务 + ai:progress 事件）──
+
+/** Rust: `ai_strategy::ModelKind` —— 翻译策略档位。`local` 走小批量、单并发、长超时、解析失败二分回收 */
+export type AiModelKind = 'remote' | 'local'
+
+/** 两个 AI 任务共用的接入参数；前端侧沿用 `baseURL` 命名，桥接层映射成 wire 的 `baseUrl` */
+export interface AiJobOptions {
+  baseURL: string
+  apiKey: string
+  model: string
+  /** 缺省 `remote` = 第 11 批的参数 */
+  modelKind?: AiModelKind
+  /** 本地模型一次合并几条（2–10），仅 `modelKind = 'local'` 时起作用 */
+  mergeLines?: number
+  chunkSize?: number
+  concurrency?: number
+}
+
+/** Rust: `ai_job::AiTranslateSpec`。paths 由 subtitleScanDir 扫出，任务只认路径 */
+export interface AiTranslateSpec {
+  baseUrl: string
+  apiKey: string
+  model: string
+  paths: string[]
+  modelKind?: AiModelKind
+  mergeLines?: number
+  chunkSize?: number
+  concurrency?: number
+}
+
+/** Rust: `ai_job::AiTextsSpec`。纯文本批任务（AI 页的「文件夹名翻译」），不碰磁盘 */
+export interface AiTextsSpec {
+  baseUrl: string
+  apiKey: string
+  model: string
+  texts: string[]
+  modelKind?: AiModelKind
+  mergeLines?: number
+  chunkSize?: number
+  concurrency?: number
+}
+
+/** Rust: `ai_job::AiProgress` —— `ai:progress` 事件的载荷，两个任务共用一条流 */
+export interface AiProgress {
+  taskId: number
+  /**
+   * `chunk-done` 是**限速心跳**（同一文件内 ≥500 ms 才一条，收尾那条必发），会跳号；
+   * 队列进度只看 file-* / cancelled，它们一条条必到。
+   */
+  state: 'file-start' | 'chunk-done' | 'file-done' | 'file-failed' | 'cancelled' | 'queue-finished'
+  /** 字幕任务的文件路径；文本任务恒为空串 */
+  path: string
+  /** 字幕任务：当前文件下标；文本任务恒为 0 */
+  fileIndex: number
+  /** 字幕任务：文件总数；文本任务：文本条数 */
+  fileCount: number
+  chunkDone: number
+  chunkTotal: number
+  /** 本次翻译的段落数 */
+  segmentCount: number
+  /** `file-done`：写出的 .zh 文件路径 */
+  outPath?: string
+  /** `file-failed` = 这个文件为什么没翻成；`queue-finished` = 整条队列**为什么提前结束**（端点失联） */
+  error?: string
+  /** 仅文本任务的 `queue-finished`：与请求等长，缺项已回退原文 */
+  translated?: string[]
+}
+
+/** Rust: `ai_scan::ScannedItem` —— `subtitle_scan_dir` 的条目 */
+export interface SubtitleScanItem {
+  path: string
+  name: string
+  /** 字幕文件才有（小写、无点） */
+  ext?: string
+}
+
+/** `subtitle_scan_dir` 的 kind：字幕文件 / 子目录 */
+export type ScanKind = 'subtitle' | 'dir'
+
+// ── AI-16 半自动模式（导出 / 导入批次，无 Provider 也能走通）──
+
+/** Rust: `ai_export::ExportResult` —— `ai_export_prompts` 的返回体 */
+export interface AiExportResult {
+  /** 用户在保存框里定下的实际写出路径 */
+  path: string
+  /** 本批总条数（= 选中文件的段落数） */
+  units: number
+  /** 真正进了 prompts.txt 的条数 */
+  exported: number
+  /** 原文自带 `### 数字 ###` 形状的行、切不开所以没导出的条数 */
+  unexportable: number
+  files: number
+  /** 提示词原文：前端给「复制」按钮用，不进批次文件 */
+  systemPrompt: string
+  /** 读不了 / 格式不认识的文件的说明，形状是「路径：原因」 */
+  errors: string[]
+}
+
+/** Rust: `ai_export::FileStat` —— 导入校验里每个文件的一份账 */
+export interface AiImportFile {
+  path: string
+  name: string
+  /** 这个文件有几段 */
+  total: number
+  /** 配上译文的段数 */
+  matched: number
+  /** 每段都配上了 —— 只有齐的文件会被写盘 */
+  complete: boolean
+  /** 齐了才有的目标路径（.zh.*）；预览阶段就是「将要写到哪」 */
+  outPath?: string
+}
+
+/** Rust: `ai_export::Sample` —— 差异预览的一条样例 */
+export interface AiImportSample {
+  seq: number
+  file: string
+  from: string
+  to: string
+}
+
+/** Rust: `ai_export::ImportResult` —— `ai_import_translations` 的返回体（预览与落地同一个形状） */
+export interface AiImportResult {
+  units: number
+  /** 导入文本里切出了几块 */
+  blocks: number
+  matched: number
+  missing: number
+  /** 同一序号出现多次：取第一个，其余计这里 */
+  duplicates: number
+  /** 序号不属于本批（多半是导出之后队列又重扫过、列表变了） */
+  outOfRange: number
+  /** 块头在、块内没内容 */
+  empty: number
+  unexportable: number
+  /** 齐了、可以写盘的文件数 */
+  ready: number
+  /** apply = true 时真正写出的路径；预览恒为空数组 */
+  written: string[]
+  files: AiImportFile[]
+  samples: AiImportSample[]
+  /** 读不了的文件 + 写盘失败 */
+  errors: string[]
+}
+
 // ── 外观 ────────────────────────────────────────────────────
 
 export interface BgImageData {
   path: string
   mtime?: number
+  /** 背景图的 rec.601 平均感知亮度（0–255）。Rust 侧解码采样，None 时不出现。 */
+  luma?: number
 }
 
 // ── AI ──────────────────────────────────────────────────────
@@ -229,4 +375,77 @@ export interface AiModelsResult {
   ok: boolean
   models: string[]
   error?: string
+}
+
+// ── 改名主干（AI-6/7/10，`04 §7`）───────────────────────────────
+// Rust 侧在 `rename` 模块里，名字不带 Rename 前缀（`preview::Preview` / `preview::Item`）：
+// 模块名已经说过一次，结构体再说是重复。serde 全是 snake_case 的枚举值。
+
+/** `04 §7.2` 的档位：动到什么程度。第一个命中的规则定档 */
+export type RenameVerdict =
+  | 'skip'
+  | 'normalize_only'
+  | 'needs_repair'
+  | 'needs_translation'
+  | 'compliant'
+
+/** `04 §7.2` 十四级里命中的那一条（一条可以命中多个原因，定档取第一个要动手的） */
+export type RenameReason =
+  | 'locked'
+  | 'rejected'
+  | 'illegal_char'
+  | 'whitespace'
+  | 'wave'
+  | 'half_full'
+  | 'overly_long'
+  | 'prefix_mixed'
+  | 'duplicate_title'
+  | 'mt_smell'
+  | 'kana'
+  | 'traditional'
+  | 'roman'
+
+/** `04 §7.8` 的冲突表：命中任何一条都不能自动改 */
+export type RenameConflict = 'same_target' | 'target_exists' | 'path_too_long'
+
+export type RenameKind = 'folder' | 'file'
+
+/** 档位分布。**计数含没变化的条目**，否则「COMPLIANT 占几成」算不出来（`04 §7.2` 的期望分布判据） */
+export interface RenameCounts {
+  scanned: number
+  skip: number
+  normalizeOnly: number
+  needsRepair: number
+  needsTranslation: number
+  compliant: number
+  /** 规范化前后字面真变了字形的条数 */
+  changed: number
+  conflicts: number
+}
+
+/** 一条预览结果。`target` 是**进模型之前**的形态，不是最终名（NEEDS_* 档还要模型接着翻） */
+export interface RenamePreviewItem {
+  /** 原绝对路径：将来应用/回滚以它为键 */
+  path: string
+  /** 当前名字，带扩展名 */
+  name: string
+  target: string
+  kind: RenameKind
+  /** 对**原名**的第一命中档位 */
+  verdict: RenameVerdict
+  /** 规范化之后重判得出的结论：规则能修掉的不该花 token（`04 §7.11`） */
+  needsAi: boolean
+  reasons: RenameReason[]
+  changed: boolean
+  conflict?: RenameConflict
+}
+
+export interface RenamePreview {
+  counts: RenameCounts
+  /** 有变化、有冲突，或档位不是 COMPLIANT 的条目；三者都不占的不列出 */
+  items: RenamePreviewItem[]
+  /** 超过 300 条被截断，`counts` 仍是全量 */
+  truncated: boolean
+  /** 列不出来的目录（不存在 / 没权限）：不能静默当空目录 */
+  unreadable: string[]
 }

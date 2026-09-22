@@ -5,7 +5,7 @@
  * Rust 侧 `emit("…")`、这里的键、前端 `onEvent<T>('…')` 的字面量，
  * 任一侧多出名字即失败——事件拼错不会有任何报错，只会静默失灵。
  */
-import type { ConvertProgress, MpvPlayerState } from './dto'
+import type { AiProgress, ConvertProgress, MpvPlayerState } from './dto'
 
 /** `loudness:progress` 载荷（Rust 侧 `serde_json::json!` 字面量，非结构体） */
 export interface LoudnessProgress {
@@ -39,6 +39,8 @@ export interface EventSpecs {
   // ── 后台任务 ──
   'convert:progress': ConvertProgress
   'loudness:progress': LoudnessProgress
+  /** 字幕翻译任务（B3）：启动后只有这一条事件流，前端不再逐块 await */
+  'ai:progress': AiProgress
 }
 
 export type EventName = keyof EventSpecs

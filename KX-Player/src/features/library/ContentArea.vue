@@ -53,14 +53,14 @@ const chipLabels = computed(() => {
 <template>
   <main id="content">
     <Transition name="fade">
-      <div v-if="library.scanningVisible && library.scanning.active" class="scan-banner">
+      <div v-if="library.scanningVisible && library.scanning.active" class="scan-banner on-bg">
         <span class="scan-spinner" />
         <span>{{ library.scanning.stage }}</span>
         <span v-if="library.scanning.total" class="tnum">{{ library.scanning.completed }}/{{ library.scanning.total }}</span>
       </div>
     </Transition>
 
-    <div v-if="showChips" class="filter-chips">
+    <div v-if="showChips" class="filter-chips on-bg">
       <span v-for="c in chipLabels" :key="c.key" class="chip">
         {{ c.label }}
         <span

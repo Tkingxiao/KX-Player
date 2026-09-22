@@ -195,7 +195,7 @@ function onScroll(top: number): void {
 <template>
   <div class="folder-view">
     <!-- 工具行 -->
-    <div class="fv-toolbar">
+    <div class="fv-toolbar on-bg">
       <button v-if="!isRoot" class="icon-btn" title="返回上一级" @click="goBack">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15,18 9,12 15,6" /></svg>
       </button>
@@ -286,7 +286,7 @@ function onScroll(top: number): void {
     </div>
 
     <!-- 子文件夹列表 -->
-    <div v-else-if="sortedChildren.length" class="fv-list-wrap">
+    <div v-else-if="sortedChildren.length" class="fv-list-wrap on-bg">
       <VirtualList
         ref="listScroller"
         class="fv-scroll edge-fade"
@@ -310,19 +310,19 @@ function onScroll(top: number): void {
 
     <!-- 当前目录直接音轨 -->
     <div v-if="directTracks.length" class="fv-tracks" :class="{ 'has-children': sortedChildren.length }">
-      <div class="fv-tracks-head section-title">本目录曲目 · {{ directTracks.length }}</div>
+      <div class="fv-tracks-head section-title on-bg">本目录曲目 · {{ directTracks.length }}</div>
       <div ref="trackTableWrap" class="fv-tracks-table">
         <TrackTable :tracks="directTracks" :list-name="currentNode?.name || '文件夹'" />
       </div>
     </div>
 
     <!-- 空态 -->
-    <div v-if="!sortedChildren.length && !directTracks.length" class="empty-state">
+    <div v-if="!sortedChildren.length && !directTracks.length" class="empty-state on-bg">
       <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
       <p>此文件夹内没有音频</p>
     </div>
 
-    <div v-if="!isRoot && allFolderTracks.length" class="fv-total tnum">
+    <div v-if="!isRoot && allFolderTracks.length" class="fv-total tnum on-bg">
       共 {{ allFolderTracks.length }} 首 · {{ fmtTime(allFolderTracks.reduce((s, t) => s + (t.duration || 0), 0)) }}
     </div>
   </div>

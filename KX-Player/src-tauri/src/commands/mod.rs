@@ -5,6 +5,7 @@ use crate::error::{IpcError, IpcResult};
 pub mod dialog_fs;
 pub mod library;
 pub mod player;
+pub mod rename;
 pub mod system;
 pub mod taxonomy;
 

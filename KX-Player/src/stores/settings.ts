@@ -23,6 +23,8 @@ export const useSettingsStore = defineStore('settings', () => {
   const bgBlur = ref(0)
   const bgPath = ref('')
   const bgMtime = ref(0)
+  /** 背景图的 rec.601 平均亮度（0–255），由 Rust 侧采样返回。派生值，故不入 snapshot、不落盘。 */
+  const bgLuma = ref<number | null>(null)
   /** 背景图适配方式：拉伸 / 填充 / 居中 / 平铺 / 适应 */
   const bgSize = ref<'stretch' | 'cover' | 'center' | 'tile' | 'contain'>('cover')
   const imgEditState = ref<BgEditState | null>(null)
@@ -56,6 +58,10 @@ export const useSettingsStore = defineStore('settings', () => {
   // ── AI 翻译（API Key 仅存内存，不落盘）──
   const aiBaseURL = ref('')
   const aiModel = ref('')
+  /** 翻译策略档位：本地模型走小批量 / 单并发 / 长超时（见 Rust `ai_strategy.rs`） */
+  const aiModelKind = ref<'remote' | 'local'>('remote')
+  /** 本地模型一次合并几条（2–10） */
+  const aiMergeLines = ref(4)
 
   // ── 布局尺寸（P0-1 拖拽分隔条）──
   const sidebarWidth = ref(232)
@@ -77,6 +83,7 @@ export const useSettingsStore = defineStore('settings', () => {
       trackSort: trackSort.value, trackSortDir: trackSortDir.value,
       loudnessEnabled: loudnessEnabled.value, loudnessTarget: loudnessTarget.value,
       aiBaseURL: aiBaseURL.value, aiModel: aiModel.value,
+      aiModelKind: aiModelKind.value, aiMergeLines: aiMergeLines.value,
       sidebarWidth: sidebarWidth.value, inspectorWidth: inspectorWidth.value,
       _v: 2,
     }
@@ -151,6 +158,9 @@ export const useSettingsStore = defineStore('settings', () => {
     gridSize.value = (rawGrid === 132 || rawGrid === 220 ? rawGrid : 176) as 132 | 176 | 220
     aiBaseURL.value = String(s.aiBaseURL ?? '')
     aiModel.value = String(s.aiModel ?? '')
+    aiModelKind.value = String(s.aiModelKind) === 'local' ? 'local' : 'remote'
+    const rawMerge = Number(s.aiMergeLines ?? 4)
+    aiMergeLines.value = isFinite(rawMerge) ? Math.max(2, Math.min(10, Math.round(rawMerge))) : 4
     const sw = Number(s.sidebarWidth ?? 232)
     sidebarWidth.value = isFinite(sw) ? Math.max(180, Math.min(360, sw)) : 232
     const iw = Number(s.inspectorWidth ?? 320)
@@ -168,13 +178,13 @@ export const useSettingsStore = defineStore('settings', () => {
 
   return {
     theme, clr, titlebarOpacity, sidebarOpacity, playerOpacity,
-    ovl, bgBlur, bgPath, bgMtime, bgSize, imgEditState,
+    ovl, bgBlur, bgPath, bgMtime, bgSize, imgEditState, bgLuma,
     vol, muted, mode, speed, devId, keyboardEnabled,
     recents, favs, pls,
     folderView, folderSort, folderSortDir, folderStack, gridSize, sidebarCollapsed,
     trackSort, trackSortDir,
     loudnessEnabled, loudnessTarget,
-    aiBaseURL, aiModel,
+    aiBaseURL, aiModel, aiModelKind, aiMergeLines,
     sidebarWidth, inspectorWidth,
     load, scheduleSave, flushOnExit,
   }

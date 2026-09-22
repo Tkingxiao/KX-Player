@@ -7,6 +7,9 @@
  */
 import type {
   AiChatResult,
+  AiExportResult,
+  AiImportResult,
+  AiJobOptions,
   AiModelsResult,
   AiPingResult,
   AudioDevice,
@@ -19,8 +22,11 @@ import type {
   FfmpegInfo,
   MpvPlayerState,
   PlayProgress,
+  RenamePreview,
+  ScanKind,
   ScanResult,
   SubStyle,
+  SubtitleScanItem,
   SubtitleTrack,
   Tag,
   TagSuggestion,
@@ -33,6 +39,8 @@ export interface AppApi {
   openFolder: () => Promise<string[] | null>
   openImageFile: () => Promise<string | null>
   openAudioFiles: () => Promise<string[]>
+  /** AI-16 导入用的多选文本框；取消 = 空数组 */
+  openTextFiles: () => Promise<string[]>
   scanFoldersWithProgress: (paths: string[]) => Promise<ScanResult | null>
   scanFoldersIncremental: (paths: string[]) => Promise<ScanResult | null>
   /** 启动静默增量同步：无变更时不触发扫描态 UI */
@@ -88,7 +96,26 @@ export interface AppApi {
   }) => Promise<AiChatResult>
   aiPing: (payload: { baseURL: string; apiKey: string; model: string }) => Promise<AiPingResult>
   aiListModels: (payload: { baseURL: string; apiKey: string }) => Promise<AiModelsResult>
+  /** 字幕翻译任务（B3）：返回 taskId，进度与结果走 ai:progress 事件，可 aiTaskCancel */
+  aiTranslateStart: (opts: AiJobOptions & { paths: string[] }) => Promise<number>
+  /** 纯文本批量翻译任务（文件夹名译名）：结果在收尾事件的 translated 里 */
+  aiTextsStart: (opts: AiJobOptions & { texts: string[] }) => Promise<number>
+  aiTaskCancel: (taskId: number) => Promise<boolean>
+  /**
+   * AI-16 导出：把选中字幕写成 `### 序号 ###` 批次文件（保存框由用户定位置）。
+   * 不配 Provider 也能走通的那条兜底路径；保存框被取消会 reject `CANCELLED`。
+   */
+  aiExportPrompts: (paths: string[]) => Promise<AiExportResult>
+  /** AI-16 导入：`apply = false` 只做校验与差异预览，一点不碰磁盘 */
+  aiImportTranslations: (paths: string[], text: string, apply: boolean) => Promise<AiImportResult>
+  /** Rust 侧递归扫描：一次调用替代旧的 api.listDir 逐层递归 */
+  subtitleScanDir: (dir: string, kind: ScanKind, maxDepth?: number, limit?: number) => Promise<SubtitleScanItem[]>
   renameDir: (oldPath: string, newPath: string) => Promise<{ ok: boolean; error?: string }>
+  /**
+   * AI-6/7/10 改名预览（`04 §7.8` 只读的那一半）：一次列出每个根目录的下一层，
+   * 给出档位分布 + 「当前名 → 规范化后」清单 + 冲突表。**不写盘、不改一个文件**。
+   */
+  renamePreview: (paths: string[]) => Promise<RenamePreview>
   clipboardWriteText: (t: string) => Promise<boolean>
   showItemInFolder: (p: string) => Promise<boolean>
   getProgressAll: () => Promise<PlayProgress[]>

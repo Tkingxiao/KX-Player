@@ -11,11 +11,12 @@
     "build": "vite build",
     "build:fe": "vite build",
     "tauri": "tauri",
-    "check": "vue-tsc --noEmit && node scripts/gen-ipc-doc.mjs --check && node scripts/check-columns.mjs && vitest run && cd src-tauri && cargo clippy --all-targets -- -D warnings",
+    "check": "vue-tsc --noEmit && node scripts/gen-ipc-doc.mjs --check && node scripts/check-columns.mjs && node scripts/check-colors.mjs && vitest run && cd src-tauri && cargo clippy --all-targets -- -D warnings",
     "check:types": "vue-tsc --noEmit",
     "check:ffmpeg": "node scripts/check-ffmpeg.mjs",
     "check:ipc": "node scripts/gen-ipc-doc.mjs --check",
     "check:columns": "node scripts/check-columns.mjs",
+    "check:colors": "node scripts/check-colors.mjs",
     "check:clippy": "cd src-tauri && cargo clippy --all-targets -- -D warnings",
     "test": "vitest run && cd src-tauri && cargo test",
     "gen:ipc": "node scripts/gen-ipc-doc.mjs"

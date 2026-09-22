@@ -26,9 +26,14 @@ fn long_path(p: &str) -> String {
     }
 }
 
+/// 按**已取出的后缀**（小写、无点）判断是否属于曲库口径。
+/// 文件监听也用它筛掉旁挂文件（字幕/歌词/封面）—— 那是它和扫描器共用的一张名单。
+pub(crate) fn is_media_ext(ext: &str) -> bool {
+    AUDIO_EXTS.contains(&ext) || VIDEO_EXTS.contains(&ext)
+}
+
 fn is_media_file(name: &str) -> bool {
-    let ext = ext_of(name);
-    AUDIO_EXTS.contains(&ext.as_str()) || VIDEO_EXTS.contains(&ext.as_str())
+    is_media_ext(&ext_of(name))
 }
 
 fn discover_files(folder_paths: &[String]) -> Vec<String> {

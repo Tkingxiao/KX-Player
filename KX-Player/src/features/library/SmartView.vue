@@ -121,7 +121,7 @@ function rowKey(i: number): string {
 
 <template>
   <div class="smart-view">
-    <div class="sv-head">
+    <div class="sv-head on-bg">
       <h1 class="sv-title">{{ title }}</h1>
       <span class="sv-count tnum">{{ filteredTracks.length }} 首</span>
       <div class="sv-head-actions">
@@ -191,7 +191,7 @@ function rowKey(i: number): string {
     </div>
 
     <!-- 空态 -->
-    <div v-else class="empty-state">
+    <div v-else class="empty-state on-bg">
       <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg>
       <p>{{ ui.smartKey === 'unfinished' ? '没有未听完的条目' : '这里还是空的' }}</p>
       <button v-if="!library.allTracks.length" class="btn-primary" @click="library.importFolder()">导入文件夹</button>

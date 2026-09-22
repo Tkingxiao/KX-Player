@@ -1,5 +1,6 @@
 /* 深浅色主题色板（深色为默认）。主题切换由 JS 写 data-theme 属性。 */
-/* 颜色派生自 DESIGN.md：深色暖灰底 + 单一 accent，所有文本层级有明确区分。 */
+/* 色值的唯一事实源是 .ulpi/design/DESIGN.md 的 `## Color (locked)`；本文件逐字实现它，
+   `npm run check:colors` 每批对账两侧，这里的字面值查不到 role 就是门禁失败。 */
 :root,
 :root[data-theme="dark"] {
   --bg: #0d0d12;
@@ -58,10 +59,20 @@
   --modal-overlay: rgba(0, 0, 0, 0.35);
   --stage-bg: #000000;
   --scrollbar-thumb: rgba(0, 0, 0, 0.18);
-  --success: #2a9d5c;
-  --warning: #c98f1e;
-  --danger: #d34b42;
+  --success: #008041;
+  --warning: #9b6300;
+  --danger: #c63f37;
 }
+
+/* ── P0-68 亮度自适应墨色（色值见 DESIGN.md 的 Ink on bright / Ink on dark）──
+   data-bg-bright 由 composables/useThemeEffect.ts 写在 documentElement 上：
+   「背景图与主题底色按不透明度合成」后的 rec.601 亮度 >128 → 1，否则 0。
+   只有一档纯黑/纯白，不做灰阶层级（要求：不要灰色）；层级由字号阶梯与字重承担。
+   只有**没有自身表面**的容器改用这两个变量（见 base.css 的 .on-bg）：卡片、弹窗、
+   三处半透明栏有自己的近不透明底，墨色必须跟表面走，否则黑字压黑卡。 */
+:root { --list-text: var(--text); --list-text-sub: var(--text-sub); }
+:root[data-bg-bright="1"] { --list-text: #000000; --list-text-sub: #000000; }
+:root[data-bg-bright="0"] { --list-text: #ffffff; --list-text-sub: #ffffff; }
 
 /* 不随深浅色变化的常量色：媒体表面恒暗，色板预览必须同时表达两种主题。 */
 :root {
@@ -71,5 +82,5 @@
   --media-surface-lo: #0d0d12;
   --win-close: #e81123;
   --swatch-theme-dark: #17171c;
-  --swatch-theme-light: #f2f2f6;
+  --swatch-theme-light: #f2f2f7;
 }

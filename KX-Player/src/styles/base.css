@@ -124,6 +124,19 @@ textarea {
   user-select: none;
 }
 
+/* 直接压在背景图上、自身没有表面的容器：整块换用自适应墨色（P0-68）。
+ * 后代照旧写 var(--text*) 就会跟随，不必逐条改色。
+ * 反过来，凡是画了 --bg-card / --bg-elevated / --modal-bg 的盒子不要打这个类 ——
+ * 它们的墨色必须跟自己那块（近）不透明的底。 */
+.on-bg {
+  /* color 必须自己写一遍：body 上的 color 已经算成了具体颜色，后代里那些
+   * 没有声明 color 的文字（页标题等）继承的是父级的解析值，改 --text 追不上它。 */
+  color: var(--list-text);
+  --text: var(--list-text);
+  --text-sub: var(--list-text);
+  --text-muted: var(--list-text-sub);
+}
+
 /* ── 通用小控件 ── */
 .icon-btn {
   display: inline-flex;

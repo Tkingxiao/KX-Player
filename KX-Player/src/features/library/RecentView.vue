@@ -38,7 +38,7 @@ async function clearRecents(): Promise<void> {
 
 <template>
   <div class="recent-view">
-    <div class="rv-head">
+    <div class="rv-head on-bg">
       <h1 class="rv-title">最近播放</h1>
       <span class="rv-count tnum">{{ tracks.length }} 首 · {{ fmtTime(totalDuration) }}</span>
       <button class="btn-ghost rv-clear" :disabled="!tracks.length" @click="clearRecents">清空</button>
@@ -46,7 +46,7 @@ async function clearRecents(): Promise<void> {
     <div v-if="tracks.length" class="rv-table">
       <TrackTable :tracks="tracks" list-name="最近播放" />
     </div>
-    <div v-else class="empty-state">
+    <div v-else class="empty-state on-bg">
       <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" /></svg>
       <p>还没有播放记录</p>
     </div>

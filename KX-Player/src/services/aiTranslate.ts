@@ -1,264 +1,152 @@
 /**
- * AI 翻译引擎：扫描字幕/歌词文件 → 提取可翻译段 → 分块送 LLM → 回写 .zh 文件。
- * LRC 保留时间戳结构；SRT/VTT 解析 cue 后按标准格式重组。
+ * AI 翻译的任务客户端（B3）。
+ *
+ * 扫描、切块、逐块翻译、回写全部在 Rust 任务里跑（`src-tauri/src/ai_job.rs`），
+ * 这里只负责「启动 + 收 ai:progress + 能取消」。
+ * 提示词与「编号. 译文」解析的**唯一实现**在 `ai_prompt.rs` / `subtitles.rs`：
+ * 这两层原来只在前端有一份，B3 把逐块循环搬到 Rust 后若留在前端就要每块过一次 IPC ——
+ * 等于没搬；若在 Rust 里再抄一份就成了两份。所以是「搬走 + 只留 Rust 那一份」。
  */
-import { api } from '@/bridge/ipc'
-import { parseLrc, parseVttOrSrt } from '@/utils/parsers/lyrics'
-import type { DirEntry } from '@/contracts/api'
+import { api, onEvent } from '@/bridge/ipc'
+import type { AiJobOptions, AiProgress, SubtitleScanItem } from '@/contracts/api'
 
-export const SUBTITLE_EXTS = new Set(['.lrc', '.srt', '.vtt'])
-
-export interface SubtitleFile {
-  path: string
-  name: string
-  ext: string
+/** 递归收集 .lrc/.srt/.vtt（深度 4、上限 500 —— 缺省值在 Rust 侧，与旧前端一致） */
+export function scanSubtitleFiles(dir: string): Promise<SubtitleScanItem[]> {
+  return api.subtitleScanDir(dir, 'subtitle')
 }
 
-/** 递归收集目录下的 .lrc/.srt/.vtt（深度上限 4，数量上限 500） */
-export async function scanSubtitleFiles(dir: string): Promise<SubtitleFile[]> {
-  const out: SubtitleFile[] = []
-  async function walk(d: string, depth: number): Promise<void> {
-    if (depth > 4 || out.length >= 500) return
-    let entries: DirEntry[] = []
-    try { entries = await api.listDir(d) } catch { return }
-    for (const entry of entries) {
-      const name = typeof entry === 'string' ? entry : entry.name
-      const isDir = typeof entry === 'string' ? undefined : entry.isDirectory
-      if (!name) continue
-      const lower = name.toLowerCase()
-      if (isDir === true) {
-        await walk(d + '/' + name, depth + 1)
-      } else if (isDir === false) {
-        if (SUBTITLE_EXTS.has(lower.slice(lower.lastIndexOf('.')))) {
-          out.push({ path: d + '/' + name, name, ext: lower.slice(lower.lastIndexOf('.') + 1) })
-        }
-      } else {
-        // DirEntry 信息缺失时按扩展名判断（无法区分目录，跳过）
-        if (SUBTITLE_EXTS.has(lower.slice(lower.lastIndexOf('.')))) {
-          out.push({ path: d + '/' + name, name, ext: lower.slice(lower.lastIndexOf('.') + 1) })
-        }
-      }
-      if (out.length >= 500) return
-    }
+/** 递归收集子目录（「文件夹名翻译」的队列，上限 300；根目录自身不算） */
+export function scanSubDirectories(dir: string): Promise<SubtitleScanItem[]> {
+  return api.subtitleScanDir(dir, 'dir')
+}
+
+export interface AiTranslateJob {
+  /** 收到 queue-finished 即 resolve；启动命令被拒则 reject */
+  finished: Promise<void>
+  /** 块级取消：在飞的那一块跑完就停，后续块与后续文件不再开始 */
+  stop: () => void
+}
+
+/** 队列行在翻译期间的最小状态面（视图侧再叠加展示字段） */
+export interface TranslateRow {
+  state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  error?: string
+  out?: string
+}
+
+/**
+ * 把一条 `ai:progress` 落到对应的队列行上。纯函数：文件任务的整条状态迁移都在这里，可单测。
+ * rows 必须与发给 Rust 的 paths 同序（事件的 fileIndex 就是那个下标）。
+ */
+export function applyProgress(rows: TranslateRow[], p: AiProgress): void {
+  const row = rows[p.fileIndex]
+  if (!row) return
+  switch (p.state) {
+    case 'file-start':
+      row.state = 'running'
+      break
+    case 'file-done':
+      row.state = 'done'
+      row.out = p.outPath ?? ''
+      break
+    case 'file-failed':
+      row.state = 'failed'
+      row.error = p.error ?? '翻译失败'
+      break
+    case 'cancelled':
+      row.state = 'skipped'
+      break
+    default:
+      // chunk-done / queue-finished 不改单行状态，进度由调用方自己累计
+      break
   }
-  await walk(dir, 0)
-  return out
 }
 
-/** 文本块：一段待翻译文字及其在文件中的位置 */
-export interface Segment {
-  index: number   // 在 segments 数组中的下标
-  text: string
-}
+/**
+ * 跑一个 AI 批量任务，进度事件按 taskId 认领。
+ *
+ * 先订阅再启动，且把「还不知道 taskId」的事件暂存下来：Rust 线程一 spawn 就发第一个事件，
+ * 它完全可能比 `launch()` 的 Promise 更早回到 JS —— 直接按 taskId 过滤会丢掉队首那条 file-start。
+ */
+function startJob(launch: () => Promise<number>, onProgress: (p: AiProgress) => void): AiTranslateJob {
+  let taskId = 0
+  let settled = false
+  let stopWanted = false
+  let early: AiProgress[] = []
+  let unwatch: (() => void) | null = null
 
-export interface ParsedDoc {
-  kind: 'lrc' | 'srt' | 'vtt'
-  segments: Segment[]
-  /** 用译后的段文本重建完整文件内容 */
-  render: (translated: string[]) => string
-}
-
-export function parseDocument(content: string, ext: string): ParsedDoc {
-  if (ext === 'lrc') return parseLrcDoc(content)
-  return parseCueDoc(content, ext === 'vtt' ? 'vtt' : 'srt')
-}
-
-function parseLrcDoc(content: string): ParsedDoc {
-  const lines = content.split(/\r?\n/)
-  const tsRegex = /\[(\d{1,2}:\d{2}(?:\.\d{1,3})?)\]/g
-  const segments: Segment[] = []
-  const segIdxByLine = new Map<number, number>()
-  lines.forEach((line, i) => {
-    if (!line.trim()) return
-    tsRegex.lastIndex = 0
-    if (!tsRegex.test(line)) return // 无时间戳的元数据行不翻译
-    const text = line.replace(/\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]/g, '').trim()
-    if (!text) return
-    segIdxByLine.set(i, segments.length)
-    segments.push({ index: segments.length, text })
+  let resolveDone!: () => void
+  let rejectDone!: (e: unknown) => void
+  const finished = new Promise<void>((res, rej) => {
+    resolveDone = res
+    rejectDone = rej
   })
-  return {
-    kind: 'lrc',
-    segments,
-    render: (translated) => {
-      return lines
-        .map((line, i) => {
-          const segIdx = segIdxByLine.get(i)
-          if (segIdx === undefined) return line
-          const t = translated[segIdx]
-          if (t === undefined) return line
-          return line.replace(/(\]\s*)([^[]+)$/, (_m, p1) => p1 + t)
-        })
-        .join('\n')
+
+  const close = (): void => {
+    settled = true
+    if (unwatch) unwatch()
+    unwatch = null
+  }
+  const take = (p: AiProgress): void => {
+    onProgress(p)
+    if (p.state === 'queue-finished') {
+      close()
+      resolveDone()
+    }
+  }
+
+  unwatch = onEvent<AiProgress>('ai:progress', (p) => {
+    if (settled) return
+    if (taskId === 0) {
+      early.push(p)
+      return
+    }
+    if (p.taskId === taskId) take(p)
+  })
+
+  launch().then(
+    (id) => {
+      taskId = id
+      const buffered = early
+      early = []
+      if (stopWanted) void api.aiTaskCancel(id)
+      for (const p of buffered) if (!settled && p.taskId === id) take(p)
     },
-  }
-}
-
-function fmtTimestamp(sec: number, kind: 'srt' | 'vtt'): string {
-  const h = Math.floor(sec / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const s = Math.floor(sec % 60)
-  const ms = Math.round((sec - Math.floor(sec)) * 1000)
-  const pad = (n: number, w = 2) => String(n).padStart(w, '0')
-  const sep = kind === 'srt' ? ',' : '.'
-  return `${pad(h)}:${pad(m)}:${pad(s)}${sep}${pad(ms, 3)}`
-}
-
-function parseCueDoc(content: string, kind: 'srt' | 'vtt'): ParsedDoc {
-  // 复用歌词解析拿 cue，再重组为标准 SRT/VTT
-  const cues = parseVttOrSrt(content, kind)
-  // 同时需要 end 时间：重新轻量解析时间轴
-  const lineRegex = /(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})/
-  const shortRegex = /(\d{1,2}):(\d{2})[.,](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2})[.,](\d{1,3})/
-  const toSec = (h: string, m: string, s: string, ms: string) =>
-    parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseInt(s, 10) + parseInt(ms.padEnd(3, '0'), 10) / 1000
-  const times: { start: number; end: number }[] = []
-  for (const line of content.split(/\r?\n/)) {
-    const m = line.match(lineRegex)
-    if (m) {
-      times.push({ start: toSec(m[1], m[2], m[3], m[4]), end: toSec(m[5], m[6], m[7], m[8]) })
-      continue
-    }
-    const sm = line.match(shortRegex)
-    if (sm) {
-      times.push({ start: toSec('0', sm[1], sm[2], sm[3]), end: toSec('0', sm[4], sm[5], sm[6]) })
-    }
-  }
-  const segments: Segment[] = cues.map((c, i) => ({ index: i, text: c.text }))
-  return {
-    kind,
-    segments,
-    render: (translated) => {
-      const parts: string[] = []
-      if (kind === 'vtt') parts.push('WEBVTT')
-      cues.forEach((cue, i) => {
-        const t = times[i] ?? { start: cue.time, end: cue.time + 2 }
-        parts.push(
-          `${i + 1}\n${fmtTimestamp(t.start, kind)} --> ${fmtTimestamp(t.end, kind)}\n${translated[i] ?? cue.text}`,
-        )
-      })
-      return parts.join('\n\n') + '\n'
-    },
-  }
-}
-
-export interface TranslateOptions {
-  baseURL: string
-  apiKey: string
-  model: string
-  chunkSize?: number
-  concurrency?: number
-  onProgress?: (done: number, total: number) => void
-}
-
-const SYSTEM_PROMPT =
-  '你是专业的音声字幕/歌词翻译器。用户会给出若干「编号. 文本」行。' +
-  '把每一行翻译成自然、口语化的简体中文：保持编号不变、逐行输出；' +
-  '保留原文中的★♪【】※等装饰符号与表情；拟声词可音译或保留；只输出译文，不要解释、不要合并行。'
-
-function parseNumberedReply(reply: string, expected: number): string[] | null {
-  const out = new Map<number, string>()
-  for (const line of reply.split(/\r?\n/)) {
-    const m = line.match(/^\s*(\d+)\s*[.、)）：:]\s*(.+)$/)
-    if (m) {
-      const n = parseInt(m[1], 10)
-      if (n >= 1 && n <= expected && !out.has(n)) out.set(n, m[2].trim())
-    }
-  }
-  if (out.size < Math.ceil(expected * 0.8)) return null
-  const result: string[] = []
-  for (let i = 1; i <= expected; i++) result.push(out.get(i) ?? '')
-  return result
-}
-
-async function translateChunk(
-  texts: string[],
-  opts: TranslateOptions,
-  retries = 2,
-): Promise<string[]> {
-  const numbered = texts.map((t, i) => `${i + 1}. ${t}`).join('\n')
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const res = await api.aiChat({
-      baseURL: opts.baseURL,
-      apiKey: opts.apiKey,
-      model: opts.model,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: numbered },
-      ],
-      temperature: 0.3,
-    })
-    if (res.ok) {
-      const parsed = parseNumberedReply(res.content, texts.length)
-      if (parsed) {
-        // 空译文回退原文
-        return parsed.map((t, i) => t || texts[i])
-      }
-    }
-  }
-  return texts // 全部重试失败 → 保留原文
-}
-
-/** 翻译一个文档的段文本（并发受 opts.concurrency 控制，默认 2） */
-export async function translateSegments(
-  segments: string[],
-  opts: TranslateOptions,
-): Promise<string[]> {
-  const chunkSize = opts.chunkSize ?? 15
-  const chunks: { start: number; texts: string[] }[] = []
-  for (let i = 0; i < segments.length; i += chunkSize) {
-    chunks.push({ start: i, texts: segments.slice(i, i + chunkSize) })
-  }
-  const results = new Array<string[]>(chunks.length)
-  let done = 0
-  const concurrency = Math.max(1, opts.concurrency ?? 2)
-  let next = 0
-  async function worker(): Promise<void> {
-    while (next < chunks.length) {
-      const idx = next++
-      const chunk = chunks[idx]
-      results[idx] = await translateChunk(chunk.texts, opts)
-      done++
-      opts.onProgress?.(done, chunks.length)
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, worker))
-  return results.flat()
-}
-
-/** UTF-8 安全的 base64（渲染端无 Node Buffer） */
-function utf8ToBase64(str: string): string {
-  const bytes = new TextEncoder().encode(str)
-  let bin = ''
-  for (const b of bytes) bin += String.fromCharCode(b)
-  return btoa(bin)
-}
-
-/** 翻译单个文件并写回 .zh.<ext>（返回输出路径） */
-export async function translateFile(
-  file: SubtitleFile,
-  opts: TranslateOptions,
-): Promise<{ outPath: string; count: number }> {
-  const content = await api.readTextFile(file.path)
-  if (!content) throw new Error('读取失败')
-  const doc = parseDocument(content, file.ext)
-  if (!doc.segments.length) throw new Error('没有可翻译的文本')
-  const onProgress = opts.onProgress
-  const translated = await translateSegments(
-    doc.segments.map((s) => s.text),
-    {
-      ...opts,
-      onProgress: onProgress
-        ? (done, total) => onProgress(done, total)
-        : undefined,
+    (e) => {
+      close()
+      rejectDone(e)
     },
   )
-  const output = doc.render(translated)
-  const dir = file.path.slice(0, file.path.lastIndexOf('/'))
-  const base = file.name.replace(/\.[^.]+$/, '')
-  const outPath = `${dir}/${base}.zh.${file.ext}`
-  const b64 = utf8ToBase64(output)
-  const ok = await api.toolsSaveFile(outPath, b64)
-  if (!ok) throw new Error('保存失败')
-  return { outPath, count: doc.segments.length }
+
+  return {
+    finished,
+    stop: () => {
+      stopWanted = true
+      if (taskId) void api.aiTaskCancel(taskId)
+    },
+  }
+}
+
+/** 启动字幕翻译队列：每个文件一个任务单元，产物是同目录的 .zh.* */
+export function translateSubtitleFiles(
+  opts: AiJobOptions & { paths: string[] },
+  onProgress: (p: AiProgress) => void,
+): AiTranslateJob {
+  return startJob(() => api.aiTranslateStart(opts), onProgress)
+}
+
+/**
+ * 一批纯文本的翻译（AI 页给文件夹名生成译名）。
+ * 返回 null = 任务被取消，调用方别把原文当译名用。
+ */
+export async function translateTexts(opts: AiJobOptions & { texts: string[] }): Promise<string[] | null> {
+  let translated: string[] | null = null
+  const job = startJob(
+    () => api.aiTextsStart(opts),
+    (p) => {
+      if (p.translated) translated = p.translated
+    },
+  )
+  await job.finished
+  return translated
 }

@@ -49,6 +49,23 @@ pub async fn open_audio_files(app: AppHandle) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// AI-16 导入用的多选文本框：一批可以拆给几台机器跑，导回来合并（对齐靠序号，不靠顺序）。
+/// 与 `open_audio_files` 同口径：取消就是空数组，不用错误信封。
+#[tauri::command]
+pub async fn open_text_files(app: AppHandle) -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择译文文件")
+            .add_filter("文本", &["txt"])
+            .blocking_pick_files()
+            .map(|list| list.iter().map(|p| p.to_string()).collect())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[tauri::command]
 pub async fn select_bg_image(app: AppHandle) -> Option<crate::model::BgImageData> {
     tauri::async_runtime::spawn_blocking(move || {

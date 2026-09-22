@@ -1,6 +1,13 @@
 //! 应用装配：插件/托盘/关窗到托盘/单实例/命令注册。
 
 mod ai;
+mod ai_chunk;
+mod ai_export;
+mod ai_job;
+mod ai_prompt;
+mod ai_scan;
+mod ai_strategy;
+mod ai_wire;
 mod bgimage;
 mod commands;
 mod db;
@@ -10,9 +17,11 @@ mod fftools;
 mod model;
 mod paths;
 mod player;
+mod rename;
 mod scanner;
 mod settingsio;
 mod state;
+mod subtitles;
 mod taxonomy;
 mod watcher;
 
@@ -135,6 +144,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::dialog_fs::open_folder,
             commands::dialog_fs::open_image_file,
             commands::dialog_fs::open_audio_files,
+            commands::dialog_fs::open_text_files,
             commands::dialog_fs::select_bg_image,
             commands::dialog_fs::read_as_data_url,
             commands::dialog_fs::read_text_file,
@@ -184,6 +194,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::system::ai_chat,
             commands::system::ai_ping,
             commands::system::ai_list_models,
+            commands::system::ai_translate_start,
+            commands::system::ai_texts_start,
+            commands::system::ai_task_cancel,
+            commands::system::ai_export_prompts,
+            commands::system::ai_import_translations,
+            commands::system::subtitle_scan_dir,
             commands::player::player_play,
             commands::player::player_toggle,
             commands::player::player_seek,
@@ -208,6 +224,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::player::pip_restore,
             commands::player::pip_set_pinned,
             commands::player::app_force_quit,
+            commands::rename::rename_preview,
             commands::taxonomy::taxonomy_list_categories,
             commands::taxonomy::taxonomy_create_category,
             commands::taxonomy::taxonomy_rename_category,

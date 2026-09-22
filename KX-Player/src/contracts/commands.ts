@@ -14,8 +14,12 @@
 import type {
   AiChatPayload,
   AiChatResult,
+  AiExportResult,
+  AiImportResult,
   AiModelsResult,
   AiPingResult,
+  AiTextsSpec,
+  AiTranslateSpec,
   AudioDevice,
   BgImageData,
   Bookmark,
@@ -26,8 +30,10 @@ import type {
   FfmpegInfo,
   MpvPlayerState,
   PlayProgress,
+  RenamePreview,
   ScanResult,
   SubStyle,
+  SubtitleScanItem,
   SubtitleTrack,
   Tag,
   TagSuggestion,
@@ -41,6 +47,7 @@ export interface CommandSpecs {
   open_audio_files: { args: {}, returns: string[] }
   open_folder: { args: {}, returns: string[] | null }
   open_image_file: { args: {}, returns: string | null }
+  open_text_files: { args: {}, returns: string[] }
   read_as_data_url: { args: { path: string }, returns: string | null }
   read_text_file: { args: { path: string }, returns: string | null }
   rename_dir: { args: { oldPath: string, newPath: string }, returns: void }
@@ -118,8 +125,13 @@ export interface CommandSpecs {
 
   // ── 窗口、设置、ffmpeg、AI（commands/system.rs）──
   ai_chat: { args: { payload: AiChatPayload }, returns: AiChatResult }
+  ai_export_prompts: { args: { paths: string[] }, returns: AiExportResult }
+  ai_import_translations: { args: { paths: string[], text: string, apply: boolean }, returns: AiImportResult }
   ai_list_models: { args: { baseUrl: string, apiKey: string }, returns: AiModelsResult }
   ai_ping: { args: { payload: AiChatPayload }, returns: AiPingResult }
+  ai_task_cancel: { args: { taskId: number }, returns: boolean }
+  ai_texts_start: { args: { spec: AiTextsSpec }, returns: number }
+  ai_translate_start: { args: { spec: AiTranslateSpec }, returns: number }
   close_window: { args: {}, returns: void }
   convert_cancel: { args: { taskId: number }, returns: boolean }
   convert_run: { args: { items: ConvertItem[] }, returns: number }
@@ -135,7 +147,11 @@ export interface CommandSpecs {
   save_bg_image: { args: { dataUrl: string }, returns: boolean }
   save_settings: { args: { settings: Record<string, unknown> }, returns: boolean }
   startup_warnings: { args: {}, returns: string[] }
+  subtitle_scan_dir: { args: { dir: string, kind: string, maxDepth?: number, limit?: number }, returns: SubtitleScanItem[] }
   toggle_fullscreen: { args: {}, returns: boolean }
+
+  // ── 改名主干（commands/rename.rs）──
+  rename_preview: { args: { paths: string[] }, returns: RenamePreview }
 }
 
 export type CommandName = keyof CommandSpecs

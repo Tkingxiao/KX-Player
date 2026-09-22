@@ -6,6 +6,7 @@ import { usePlayerStore } from '@/stores/player'
 import { useLibraryStore } from '@/stores/library'
 import { useUiStore } from '@/stores/ui'
 import { api, assetUrl } from '@/bridge/ipc'
+import { bgInkBright } from '@/composables/useThemeEffect'
 import { hexToHsv, hsvToHex } from '@/utils/color'
 
 const settings = useSettingsStore()
@@ -178,6 +179,7 @@ async function pickBg(): Promise<void> {
   if (picked) {
     settings.bgPath = picked.path
     settings.bgMtime = picked.mtime ?? Date.now()
+    settings.bgLuma = picked.luma ?? null
     settings.imgEditState = null
     settings.scheduleSave()
     settings.flushOnExit()
@@ -189,6 +191,7 @@ async function removeBg(): Promise<void> {
   settings.bgPath = ''
   // 清空 mtime：否则残留的 ?v= 会让派生 URL 看似未变，UI 不刷新
   settings.bgMtime = 0
+  settings.bgLuma = null
   settings.imgEditState = null
   ui.bgEditorOpen = false
   settings.scheduleSave()
@@ -196,34 +199,8 @@ async function removeBg(): Promise<void> {
   settings.flushOnExit()
 }
 
-// ── 明度自适应（背景图改变时重采样）──
-const textLight = ref<0 | 1>(1)
-async function sampleBrightness(): Promise<void> {
-  if (!bgUrl.value) { textLight.value = 1; return }
-  const img = new Image()
-  img.src = bgUrl.value
-  await new Promise<void>((resolve) => {
-    img.onload = () => resolve()
-    img.onerror = () => resolve()
-  })
-  // 图片加载失败（文件缺失/路径失效）时保持默认文字色
-  if (!img.complete || !img.naturalWidth) { textLight.value = 1; return }
-  try {
-    const c = document.createElement('canvas')
-    c.width = 50
-    c.height = 50
-    const ctx = c.getContext('2d')
-    if (!ctx) return
-    ctx.drawImage(img, 0, 0, 50, 50)
-    const data = ctx.getImageData(0, 0, 50, 50).data
-    let sum = 0
-    for (let i = 0; i < data.length; i += 4) {
-      sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
-    }
-    textLight.value = sum / (data.length / 4) > 128 ? 0 : 1
-  } catch { textLight.value = 1 }
-}
-watch(bgUrl, () => void sampleBrightness(), { immediate: true })
+// ── 明度自适应当前态（判据与实际写属性用的是同一个函数，见 useThemeEffect）──
+const inkMode = computed<0 | 1 | null>(() => bgInkBright())
 
 const themeRows = [
   { key: 'titlebarOpacity', label: '标题栏不透明度' },
@@ -385,7 +362,7 @@ const themeRows = [
                   </template>
                 </div>
               </div>
-              <p class="set-hint">背景图明度自适应：文字自动切换深浅（当前{{ textLight === 1 ? '深底白字' : '浅底黑字' }}）</p>
+              <p class="set-hint">背景图亮度自适应：压在背景图上的文字自动取纯黑/纯白（当前{{ inkMode === 1 ? '浅底 · 黑字' : inkMode === 0 ? '深底 · 白字' : '判不出亮度 · 跟随主题' }}）</p>
             </section>
 
             <!-- 快捷键 -->

@@ -306,8 +306,10 @@ onBeforeUnmount(() => {
   transform: translateX(-50%);
   padding: 3px 12px;
   border-radius: 999px;
-  background: rgba(0, 0, 0, 0.55);
-  color: rgba(255, 255, 255, 0.85);
+  /* 提示自己压在暗底上（恒暗媒体面），所以不跟随 P0-68 的自适应墨色：
+     底色得暗到纯白字压得住（压在纯白背景图上合成后约 56/255，对比 6.5:1）。 */
+  background: rgba(0, 0, 0, 0.78);
+  color: var(--on-media);
   font-size: 11px;
   pointer-events: none;
   white-space: nowrap;

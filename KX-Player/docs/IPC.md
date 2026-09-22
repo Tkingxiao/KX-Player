@@ -25,6 +25,7 @@
 | `open_audio_files` | — | `string[]` | src-tauri/src/commands/dialog_fs.rs |
 | `open_folder` | — | `string[] ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `open_image_file` | — | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
+| `open_text_files` | — | `string[]` | src-tauri/src/commands/dialog_fs.rs |
 | `read_as_data_url` | `path: String` | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `read_text_file` | `path: String` | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `rename_dir` | `oldPath: String`, `newPath: String` | `null` | src-tauri/src/commands/dialog_fs.rs |
@@ -87,13 +88,24 @@
 | `player_subtitle_tracks` | — | `SubtitleTrack[]` | src-tauri/src/commands/player.rs |
 | `player_toggle` | `paused: bool` | `null` | src-tauri/src/commands/player.rs |
 
+## rename
+
+| 命令 | 参数（JS 键名 : Rust 类型） | resolve | 位置 |
+|---|---|---|---|
+| `rename_preview` | `paths: Vec<String>` | `Preview` | src-tauri/src/commands/rename.rs |
+
 ## system
 
 | 命令 | 参数（JS 键名 : Rust 类型） | resolve | 位置 |
 |---|---|---|---|
 | `ai_chat` | `payload: AiChatPayload` | `AiChatResult` | src-tauri/src/commands/system.rs |
+| `ai_export_prompts` | `paths: Vec<String>` | `ExportResult` | src-tauri/src/commands/system.rs |
+| `ai_import_translations` | `paths: Vec<String>`, `text: String`, `apply: bool` | `ImportResult` | src-tauri/src/commands/system.rs |
 | `ai_list_models` | `baseUrl: String`, `apiKey: String` | `AiModelsResult` | src-tauri/src/commands/system.rs |
 | `ai_ping` | `payload: AiChatPayload` | `AiPingResult` | src-tauri/src/commands/system.rs |
+| `ai_task_cancel` | `taskId: u64` | `boolean` | src-tauri/src/commands/system.rs |
+| `ai_texts_start` | `spec: crate::ai_job::AiTextsSpec` | `number` | src-tauri/src/commands/system.rs |
+| `ai_translate_start` | `spec: crate::ai_job::AiTranslateSpec` | `number` | src-tauri/src/commands/system.rs |
 | `close_window` | — | `null` | src-tauri/src/commands/system.rs |
 | `convert_cancel` | `taskId: u64` | `boolean` | src-tauri/src/commands/system.rs |
 | `convert_run` | `items: Vec<crate::fftools::ConvertItem>` | `number` | src-tauri/src/commands/system.rs |
@@ -109,6 +121,7 @@
 | `save_bg_image` | `dataUrl: String` | `boolean` | src-tauri/src/commands/system.rs |
 | `save_settings` | `settings: Value` | `boolean` | src-tauri/src/commands/system.rs |
 | `startup_warnings` | — | `string[]` | src-tauri/src/commands/system.rs |
+| `subtitle_scan_dir` | `dir: String`, `kind: String`, `maxDepth: Option<usize>`, `limit: Option<usize>` | `ScannedItem[]` | src-tauri/src/commands/system.rs |
 | `toggle_fullscreen` | — | `boolean` | src-tauri/src/commands/system.rs |
 
 ## taxonomy
@@ -141,6 +154,7 @@
 
 | 事件 | 载荷 | 发射（Rust） | 监听（前端） |
 |---|---|---|---|
+| `ai:progress` | `AiProgress` | src-tauri/src/ai_chunk.rs<br>src-tauri/src/ai_job.rs | src/services/aiTranslate.ts |
 | `convert:progress` | `ConvertProgress` | src-tauri/src/fftools.rs | src/features/convert/ConvertView.vue |
 | `loudness:progress` | `LoudnessProgress` | src-tauri/src/commands/library.rs | src/stores/library.ts |
 | `pip:closed` | `null` | src-tauri/src/commands/player.rs<br>src-tauri/src/lib.rs | src/bridge/ipc.ts<br>src/components/PipRoot.vue |

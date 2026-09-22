@@ -39,8 +39,8 @@ const ui = useUiStore()
   border: 1px solid var(--border);
   box-shadow: var(--shadow-pop);
 }
-.toast-error { border-color: rgba(230, 58, 46, 0.5); }
-.toast-success { border-color: rgba(64, 200, 120, 0.5); }
+.toast-error { border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
+.toast-success { border-color: color-mix(in srgb, var(--success) 50%, transparent); }
 .toast-text {
   flex: 1;
   font-size: 12px;

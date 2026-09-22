@@ -109,6 +109,10 @@ pub struct BgImageData {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtime: Option<f64>,
+    /// 背景图的 rec.601 平均感知亮度（0–255）。解码失败时为 None，前端据此回落到主题底色。
+    /// 在 Rust 侧算而不是前端 canvas：asset 协议跨源会 taint canvas，`getImageData` 必抛。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub luma: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

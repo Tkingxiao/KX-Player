@@ -504,7 +504,7 @@ body,
 /* 无边框：客户区就是画面本身，所以不画投影也不画描边 —— 只有钉住时给一条主题色
    细边，用来表示「这颗浮窗会一直跟着」，它压在画面边缘上，不影响整体观感。 */
 .pip-root.pinned .pip-card {
-  outline: 1.5px solid rgb(var(--accent-rgb, 230 58 46));
+  outline: 1.5px solid rgb(var(--accent-rgb));
   outline-offset: -1.5px;
 }
 
@@ -633,7 +633,7 @@ body,
   transform: scale(0.94);
 }
 .pip-btn.on {
-  color: rgb(var(--accent-rgb, 230 58 46));
+  color: rgb(var(--accent-rgb));
   background: rgba(0, 0, 0, 0.22);
 }
 .pip-play {
@@ -665,7 +665,7 @@ body,
   position: relative;
   height: 2px;
   border-radius: 2px;
-  background: rgb(var(--accent-rgb, 230 58 46));
+  background: rgb(var(--accent-rgb));
   box-shadow: 0 0 6px rgba(0, 0, 0, 0.6);
   transition: height var(--dur-fast, 120ms) var(--ease, ease);
 }

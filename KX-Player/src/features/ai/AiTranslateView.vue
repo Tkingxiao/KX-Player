@@ -5,9 +5,19 @@ import { useUiStore } from '@/stores/ui'
 import { useSettingsStore } from '@/stores/settings'
 import { useLibraryStore } from '@/stores/library'
 import { api } from '@/bridge/ipc'
-import { scanSubtitleFiles, translateFile, translateSegments, type SubtitleFile } from '@/services/aiTranslate'
+import {
+  applyProgress,
+  scanSubDirectories,
+  scanSubtitleFiles,
+  translateSubtitleFiles,
+  translateTexts,
+  type AiTranslateJob,
+} from '@/services/aiTranslate'
 import { normDir } from '@/utils/format'
 import { errText } from '@/contracts/result'
+import AiManualPanel from './AiManualPanel.vue'
+import AiRenamePanel from './AiRenamePanel.vue'
+import type { AiProgress, SubtitleScanItem } from '@/contracts/api'
 
 const ui = useUiStore()
 const settings = useSettingsStore()
@@ -60,7 +70,10 @@ async function fetchModels(): Promise<void> {
   }
 }
 
-const files = ref<(SubtitleFile & { state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'; error?: string; out?: string })[]>([])
+type FileState = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+type FileRow = SubtitleScanItem & { state: FileState; error?: string; out?: string }
+
+const files = ref<FileRow[]>([])
 const scanning = ref(false)
 const running = ref(false)
 const doneCount = ref(0)
@@ -89,6 +102,10 @@ async function rescan(): Promise<void> {
     files.value = found.map((f) => ({ ...f, state: 'pending' as const }))
     totalCount.value = files.value.length
     doneCount.value = 0
+  } catch (e) {
+    // 递归扫描整体失败要吭声：静默清空会被当成「这个文件夹没有字幕文件」
+    files.value = []
+    ui.toast(`扫描字幕文件失败：${errText(e)}`, 'error')
   } finally {
     scanning.value = false
   }
@@ -111,47 +128,97 @@ async function testConnection(): Promise<void> {
   }
 }
 
-let cancelFlag = false
+let job: AiTranslateJob | null = null
+
+/**
+ * 两个任务共用的接入参数。
+ * 批量大小 / 并发 / 超时**不在这里决定** —— 前端只说「本地还是外接、本地合几条」，
+ * 档位参数在 Rust 的 `ai_strategy.rs` 里，两处各定一半必然漂移。
+ */
+function jobOpts() {
+  return {
+    baseURL: settings.aiBaseURL,
+    apiKey: apiKey.value,
+    model: settings.aiModel,
+    modelKind: settings.aiModelKind,
+    mergeLines: settings.aiMergeLines,
+  }
+}
+
+/** 切档位要存下来：它决定 Rust 侧用哪一档参数 */
+function setModelKind(k: 'remote' | 'local'): void {
+  settings.aiModelKind = k
+  settings.scheduleSave()
+}
+
+/** 输入框能填任意数，这里先按选项范围收住（Rust 侧还会再钳一次，两边都得有） */
+function clampMerge(): void {
+  const n = Math.round(Number(settings.aiMergeLines))
+  settings.aiMergeLines = isFinite(n) ? Math.min(10, Math.max(2, n)) : 4
+  settings.scheduleSave()
+}
+
+/** 取消过的行留在队列里，「开始翻译」要能把它们重新排队，否则停止后这个文件夹就再也点不动了 */
+const isRetryable = (f: FileRow): boolean => f.state === 'pending' || f.state === 'failed' || f.state === 'skipped'
 
 async function startTranslate(): Promise<void> {
   if (running.value) return
-  const pending = files.value.filter((f) => f.state === 'pending' || f.state === 'failed')
-  if (!pending.length) return
+  const queue = files.value.filter(isRetryable)
+  if (!queue.length) return
   running.value = true
-  cancelFlag = false
-  totalCount.value = pending.length
+  totalCount.value = queue.length
   doneCount.value = 0
-  for (const f of pending) {
-    if (cancelFlag) { f.state = 'skipped'; continue }
-    f.state = 'running'
-    try {
-      const r = await translateFile(f, {
-        baseURL: settings.aiBaseURL,
-        apiKey: apiKey.value,
-        model: settings.aiModel,
-        onProgress: () => { /* 块级进度可扩展 */ },
-      })
-      f.state = 'done'
-      f.out = r.outPath
-    } catch (e) {
-      f.state = 'failed'
-      f.error = errText(e)
-    }
-    doneCount.value++
+  // 行对象与 paths 同序：Rust 事件的 fileIndex 就是这里的下标
+  const paths = queue.map((f) => f.path)
+  // 队列被提前掐断时的原因（端点失联），收尾事件带来
+  let aborted = ''
+  job = translateSubtitleFiles({ ...jobOpts(), paths }, (p: AiProgress) => {
+    applyProgress(queue, p)
+    if (p.state === 'file-done' || p.state === 'file-failed' || p.state === 'cancelled') doneCount.value++
+    if (p.state === 'queue-finished' && p.error) aborted = p.error
+  })
+  try {
+    await job.finished
+  } catch (e) {
+    ui.toast(errText(e), 'error')
+  } finally {
+    running.value = false
+    job = null
   }
-  running.value = false
   const ok = files.value.filter((f) => f.state === 'done').length
+  if (aborted) {
+    ui.toast(`AI 翻译已中断：${aborted}`, 'error')
+    return
+  }
   ui.toast(`AI 翻译完成：成功 ${ok}/${files.value.length}`, ok ? 'success' : 'error')
 }
 
 function stopTranslate(): void {
-  cancelFlag = true
+  job?.stop()
 }
 
 function clearFinished(): void {
   files.value = files.value.filter((f) => f.state === 'pending' || f.state === 'running')
   totalCount.value = files.value.length
   doneCount.value = 0
+}
+
+/**
+ * 半自动批次的序号是按**整个队列**编出来的（`ai_export.rs`），所以这里不能传「待重试的那几个」：
+ * 队列行少一条，后面所有序号就全体前移，用户手上那份 prompts.txt 就对到别的文件上去了。
+ */
+const manualPaths = computed(() => files.value.map((f) => f.path))
+
+/** 手工导入写盘成功的行标成完成 —— 否则队列一直显示「还差 N 个」，看着像没生效 */
+function onManualApplied(done: { path: string, out: string }[]): void {
+  for (const d of done) {
+    const row = files.value.find((f) => f.path === d.path)
+    if (!row) continue
+    row.state = 'done'
+    row.out = d.out
+    row.error = undefined
+  }
+  doneCount.value = files.value.filter((f) => f.state === 'done').length
 }
 
 const stateLabel = {
@@ -180,34 +247,17 @@ const dirApplying = ref(false)
 const dirDone = ref(0)
 const dirTotal = ref(0)
 
-async function scanDirs(dir: string, depth: number): Promise<{ path: string; name: string }[]> {
-  const out: { path: string; name: string }[] = []
-  async function walk(d: string, dep: number): Promise<void> {
-    if (dep > 3 || out.length >= 300) return
-    let entries: import('@/contracts/api').DirEntry[] = []
-    try { entries = await api.listDir(d) } catch { return }
-    for (const entry of entries) {
-      if (typeof entry === 'string') continue
-      if (!entry.isDirectory || !entry.name) continue
-      const p = d + '/' + entry.name
-      out.push({ path: p, name: entry.name })
-      await walk(p, dep + 1)
-      if (out.length >= 300) return
-    }
-  }
-  await walk(dir, depth)
-  return out
-}
-
 async function scanDirNames(): Promise<void> {
   if (!ui.aiFolder || dirScanning.value) return
   dirScanning.value = true
   try {
-    const dirs = await scanDirs(ui.aiFolder, 1)
+    const dirs = await scanSubDirectories(ui.aiFolder)
     dirItems.value = dirs.map((d) => ({
       path: d.path, name: d.name, suggested: '', newPath: '',
       state: 'pending' as const, enabled: true,
     }))
+  } catch (e) {
+    ui.toast(`扫描文件夹失败：${errText(e)}`, 'error')
   } finally {
     dirScanning.value = false
   }
@@ -221,19 +271,20 @@ async function suggestDirNames(): Promise<void> {
   if (!dirItems.value.length || dirSuggesting.value) return
   dirSuggesting.value = true
   try {
-    const names = dirItems.value.map((d) => d.name)
-    const translated = await translateSegments(names, {
-      baseURL: settings.aiBaseURL,
-      apiKey: apiKey.value,
-      model: settings.aiModel,
-      chunkSize: 10,
-      concurrency: 2,
-    })
+    // 文件夹名很短，一批 10 条比字幕更划算 —— 显式覆盖档位里的批量大小；
+    // 并发不再写死 2：本地模型两路并发只是互相抢内存，交给档位决定。
+    const translated = await translateTexts({ ...jobOpts(), texts: dirItems.value.map((d) => d.name), chunkSize: 10 })
+    if (!translated) {
+      ui.toast('译名生成已取消', 'error')
+      return
+    }
     dirItems.value = dirItems.value.map((d, i) => {
       const suggested = sanitizeName(translated[i] ?? d.name) || d.name
       const parent = d.path.slice(0, d.path.lastIndexOf('/'))
       return { ...d, suggested, newPath: `${parent}/${suggested}` }
     })
+  } catch (e) {
+    ui.toast(errText(e), 'error')
   } finally {
     dirSuggesting.value = false
   }
@@ -277,7 +328,8 @@ onMounted(() => {
     void rescan()
   }
 })
-onBeforeUnmount(() => { cancelFlag = true })
+// 离开页面就停：AI 队列没有跨页面的任务状态，留它在后台跑会变成「看不见但仍在烧 token」
+onBeforeUnmount(() => { job?.stop() })
 </script>
 
 <template>
@@ -360,6 +412,39 @@ onBeforeUnmount(() => { cancelFlag = true })
           <input v-model="apiKey" type="password" autocomplete="off" />
         </label>
       </div>
+      <div class="ai-strategy">
+        <span class="ai-strategy-label">模型类型</span>
+        <div class="ai-seg">
+          <button
+            class="btn-ghost"
+            :class="{ on: settings.aiModelKind === 'remote' }"
+            title="云端 OpenAI 兼容接口：一批多送几条、多路并发、超时较短"
+            @click="setModelKind('remote')"
+          >外接模型</button>
+          <button
+            class="btn-ghost"
+            :class="{ on: settings.aiModelKind === 'local' }"
+            title="本机 Ollama 等：一次只发一路、给足加载权重的时间、编号解析失败自动拆开重试"
+            @click="setModelKind('local')"
+          >本地模型</button>
+        </div>
+        <label v-if="settings.aiModelKind === 'local'" class="ai-merge">
+          <span>一次合并</span>
+          <input
+            v-model.number="settings.aiMergeLines"
+            type="number"
+            min="2"
+            max="10"
+            step="1"
+            @change="clampMerge()"
+          />
+          <span>条发送</span>
+        </label>
+        <!-- 只描述策略、不复述数字：具体参数的事实源在 Rust `ai_strategy.rs`，这里抄一遍就会漂 -->
+        <span class="ai-strategy-hint">
+          {{ settings.aiModelKind === 'local' ? '本地档：单路请求、长超时、失败自动拆半重试' : '外接档：多路并发、每批多送几条、超时较短' }}
+        </span>
+      </div>
       <div class="ai-test-row">
         <button class="btn-ghost" :disabled="testing || !settings.aiModel" @click="testConnection">
           {{ testing ? '测试中…' : '测试连接' }}
@@ -422,6 +507,11 @@ onBeforeUnmount(() => { cancelFlag = true })
       </div>
     </section>
 
+    <!-- 改名主干（AI-6/7/10）的 dry-run：只算不改，应用与回滚下一批才有 -->
+    <section class="ai-card">
+      <AiRenamePanel :target-dir="targetDir" />
+    </section>
+
     <!-- 文件队列 -->
     <section class="ai-card ai-files-card">
       <div class="ai-files-head">
@@ -431,7 +521,7 @@ onBeforeUnmount(() => { cancelFlag = true })
           <button class="btn-ghost" :disabled="!files.length" @click="clearFinished">清除已完成</button>
           <button v-if="running" class="btn-ghost danger-ghost" @click="stopTranslate">停止</button>
           <button class="btn-primary" :disabled="running || !files.length || !settings.aiModel" @click="startTranslate">
-            {{ running ? '翻译中…' : `开始翻译（${files.filter((f) => f.state === 'pending' || f.state === 'failed').length}）` }}
+            {{ running ? '翻译中…' : `开始翻译（${files.filter(isRetryable).length}）` }}
           </button>
         </div>
       </div>
@@ -446,6 +536,8 @@ onBeforeUnmount(() => { cancelFlag = true })
           {{ targetDir ? '该文件夹下没有找到 .lrc / .srt / .vtt 文件' : '请先选择目标文件夹' }}
         </div>
       </div>
+      <!-- 没有 Provider 也要能用：导出批次 → 外部工具跑 → 导回校验（AI-16，`05` 第 16 条） -->
+      <AiManualPanel :paths="manualPaths" @applied="onManualApplied" />
     </section>
   </div>
 </template>
@@ -498,6 +590,34 @@ onBeforeUnmount(() => { cancelFlag = true })
   gap: 12px;
   margin-top: 12px;
 }
+/* 档位选择：与测试连接行分开，它是「这批怎么发」的参数，不是连接参数 */
+.ai-strategy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.ai-seg { display: flex; gap: 6px; }
+.ai-seg .btn-ghost { padding: 5px 12px; font-size: 11.5px; }
+.ai-seg .btn-ghost.on {
+  border-color: rgb(var(--accent-rgb));
+  color: rgb(var(--accent-rgb));
+  background: var(--bg-selected);
+}
+.ai-merge { display: flex; align-items: center; gap: 6px; }
+.ai-merge input {
+  width: 52px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  font-size: 12px;
+  color: var(--text);
+}
+.ai-strategy-hint { font-size: 11px; color: var(--text-sub); }
 .ai-test-result {
   font-size: 11.5px;
   color: var(--text-muted);
@@ -569,7 +689,7 @@ onBeforeUnmount(() => { cancelFlag = true })
 }
 .ai-file:nth-child(odd) { background: var(--bg-hover); }
 .ai-file.done .ai-file-state { color: var(--success); }
-.ai-file.failed { background: rgba(230, 58, 46, 0.08); }
+.ai-file.failed { background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .ai-file.failed .ai-file-state { color: var(--danger); }
 .ai-file.running .ai-file-state { color: rgb(var(--accent-rgb)); }
 .ai-file-state { width: 44px; flex-shrink: 0; color: var(--text-muted); }
@@ -593,7 +713,7 @@ onBeforeUnmount(() => { cancelFlag = true })
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: rgba(230, 58, 46, 0.2);
+  background: color-mix(in srgb, var(--danger) 20%, transparent);
   color: var(--danger);
   display: inline-flex;
   align-items: center;
