@@ -80,6 +80,8 @@ better.md
 record-time.js
 
 # ---------- 8. 本地测试素材与运行期产物 ----------
+# 测试只在本机跑（用户 2026-09-22 决定：测试文件不入库，新写的测试文件同样不要提交）
+KX-Player/tests/
 test-media/
 .test-run/
 *.log
