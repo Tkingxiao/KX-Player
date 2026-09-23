@@ -52,6 +52,11 @@ pub struct Item {
     pub changed: bool,
     /// 还需要模型接着做（`04 §7.6` 的入口判据）
     pub needs_ai: bool,
+    /// **库里已核准的那个译名**（`rename_name_cache`，过了九道校验的才有）。
+    /// `preview_level` 是纯函数所以恒为 `None`；由 `ai_ledger::annotate` 在读库之后盖上 ——
+    /// 面板据此说「这一批能应用几条」，而不是让用户猜「生成译名」那一步做没做。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict: Option<Conflict>,
 }
@@ -138,6 +143,7 @@ pub fn preview_level(
             kind: if e.is_dir { Kind::Folder } else { Kind::File },
             verdict: j.verdict,
             needs_ai: after.needs_ai(),
+            suggested: None,
             reasons: j.reasons,
             changed: row.changed,
             conflict,

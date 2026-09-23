@@ -111,12 +111,17 @@ async fn chat_completion_full(opts: &AiChatPayload, timeout_ms: u64) -> Result<C
             headers.insert("Authorization", v);
         }
     }
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": opts.model,
         "messages": opts.messages,
         "temperature": opts.temperature.unwrap_or(0.3),
         "stream": false,
     });
+    // 只在软件侧给了上限时才写这个字段：各家 OpenAI 兼容接口对 `max_tokens: null` 的容忍度不一，
+    // 少发一个键比猜对方怎么解释 null 稳。
+    if let Some(n) = opts.max_tokens {
+        body["max_tokens"] = serde_json::json!(n);
+    }
     let resp = client()
         .post(url)
         .timeout(Duration::from_millis(timeout_ms))
@@ -158,6 +163,7 @@ pub async fn ping(opts: &AiChatPayload) -> AiPingResult {
         model: opts.model.clone(),
         messages: vec![crate::model::ChatMessage { role: "user".into(), content: "ping".into() }],
         temperature: Some(0.0),
+        max_tokens: None,
     };
     let started = std::time::Instant::now();
     match chat_completion_full(&minimal, 15_000).await {

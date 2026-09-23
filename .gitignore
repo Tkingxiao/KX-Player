@@ -82,6 +82,8 @@ record-time.js
 # ---------- 8. 本地测试素材与运行期产物 ----------
 # 测试只在本机跑（用户 2026-09-22 决定：测试文件不入库，新写的测试文件同样不要提交）
 KX-Player/tests/
+# 白屏探针：拉起无头浏览器看渲染帧，只在本机诊断用，按「仓库只留源码」不入库
+KX-Player/scripts/white-screen-probe.mjs
 test-media/
 .test-run/
 *.log

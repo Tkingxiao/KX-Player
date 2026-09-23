@@ -1,6 +1,7 @@
 //! 应用装配：插件/托盘/关窗到托盘/单实例/命令注册。
 
 mod ai;
+mod ai_cache;
 mod ai_chunk;
 mod ai_export;
 mod ai_job;
@@ -200,6 +201,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::system::ai_export_prompts,
             commands::system::ai_import_translations,
             commands::system::subtitle_scan_dir,
+            commands::system::ai_cache_folder_suggestions,
+            commands::system::ai_cache_record_folder,
             commands::player::player_play,
             commands::player::player_toggle,
             commands::player::player_seek,
@@ -225,6 +228,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::player::pip_set_pinned,
             commands::player::app_force_quit,
             commands::rename::rename_preview,
+            commands::rename::rename_suggest_names,
+            commands::rename::rename_reject_suggestion,
+            commands::rename::rename_apply,
+            commands::rename::rename_rollback,
+            commands::rename::rename_redo,
+            commands::rename::rename_batches,
             commands::taxonomy::taxonomy_list_categories,
             commands::taxonomy::taxonomy_create_category,
             commands::taxonomy::taxonomy_rename_category,

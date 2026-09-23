@@ -511,7 +511,9 @@ tags(id, name UNIQUE, color, kind DEFAULT 'topic', use_count)
    数量 ≤500）→ 解析出可翻译段 → 分块送 LLM → 回写**同目录 `{base}.zh.{ext}`**。
    文件写入走 `tools_save_file`（base64，见 `dialog_fs.rs`）。
 
-3. **视图** `src/features/ai/AiTranslateView.vue`（693 行）。
+3. **视图** `src/features/ai/AiTranslateView.vue`：工作台三区骨架（身份栏 / 左列 / 右区），
+   三个工种（字幕翻译 / 文件夹名翻译 / 规则改名）用 `v-show` 切换；
+   配套组件同目录（JobTable / FailureDetail / ActionRail / ProgressBand / queueStats）。
 
 **凭据处理**：`src/stores/settings.ts:56` 的注释写明「**API Key 仅存内存，不落盘**」，
 落盘快照 `snapshot()` 里确实只含 `aiBaseURL` / `aiModel`（`settings.ts:79`），

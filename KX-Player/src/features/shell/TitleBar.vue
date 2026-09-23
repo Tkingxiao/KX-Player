@@ -56,7 +56,7 @@ onBeforeUnmount(() => {
 <template>
   <header id="titlebar">
     <div class="tb-left">
-      <img class="tb-logo" src="/icon.svg" alt="" />
+      <img class="tb-logo" src="/favicon.ico" alt="" />
       <span class="tb-name">KX Player</span>
     </div>
 

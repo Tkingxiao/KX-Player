@@ -246,6 +246,9 @@ const stateLabel: Record<TaskState, string> = {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  /* 工具页自带面板底：浅色壁纸上裸文字不可读（与 AI 工作台同一反馈） */
+  background: var(--bg-card);
+  border-radius: var(--radius);
 }
 .convert-view.drop {
   outline: 2px dashed rgb(var(--accent-rgb));
@@ -256,7 +259,7 @@ const stateLabel: Record<TaskState, string> = {
   align-items: center;
   gap: 18px;
 }
-.cv-title { font-size: 20px; font-weight: 650; }
+.cv-title { font-size: 18px; font-weight: 600; }
 .cv-modes { display: flex; gap: 6px; }
 .cv-mode {
   padding: 6px 14px;

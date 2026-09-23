@@ -29,7 +29,7 @@ export interface AiTranslateJob {
 
 /** 队列行在翻译期间的最小状态面（视图侧再叠加展示字段） */
 export interface TranslateRow {
-  state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  state: 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'exempt'
   error?: string
   out?: string
 }

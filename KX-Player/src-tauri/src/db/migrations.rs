@@ -12,6 +12,9 @@ use rusqlite::Connection;
 pub(crate) const MIGRATIONS: &[(i64, &str, &str)] = &[
     (1, "001_init.sql", include_str!("../../migrations/001_init.sql")),
     (3, "003_taxonomy.sql", include_str!("../../migrations/003_taxonomy.sql")),
+    (4, "004_rename.sql", include_str!("../../migrations/004_rename.sql")),
+    (5, "005_ai_cache.sql", include_str!("../../migrations/005_ai_cache.sql")),
+    (6, "006_rename_name.sql", include_str!("../../migrations/006_rename_name.sql")),
 ];
 
 fn now_ms() -> i64 {

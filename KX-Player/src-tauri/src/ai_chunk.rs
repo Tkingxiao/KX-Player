@@ -116,10 +116,38 @@ impl<'a> Run<'a> {
     }
 }
 
-/// 翻译单个字幕文件。Ok(None) = 被取消。
+/// 翻译单个字幕文件。Ok(None) = 被取消。带「已翻译豁免 + 复用缓存」：
+/// - 源文件没变且 .zh 译文还在 → 直接复用（不读内容、不烧 token）；
+/// - 原文内容命中复用缓存 → 把缓存里那份译文写出来（也不用烧 token）；
+/// - 否则走 AI，翻完把「源指纹账」和「内容缓存」都落库。
 pub async fn translate_one(run: &Run<'_>, loc: Loc<'_>, path: &str) -> Result<Option<String>, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
     let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let out_path = prompt::translated_path(path, &ext);
+    let db = crate::paths::library_db_path();
+
+    // 0) 已翻译可豁免：源没变 + 译文还在 → 直接复用现成的 .zh.*，不重翻。
+    if crate::ai_cache::stat(path)
+        .map(|st| crate::db::with_db_text(&db, |c| Ok(crate::ai_cache::subtitle_exempt(c, path, &out_path, &st))).unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return Ok(Some(out_path));
+    }
+
+    let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+    let content_hash = crate::ai_cache::hash(prompt::SUBTITLE_PROMPT_VERSION, content.as_bytes());
+
+    // 1) 内容命中复用缓存：译文直接来自缓存，跳过 AI。
+    {
+        let cached: Option<String> =
+            crate::db::with_db_text(&db, |c| crate::ai_cache::get_content(c, &content_hash).map_err(|e| e.to_string()))
+                .map_err(|e| format!("读复用缓存失败: {e}"))?;
+        if let Some(rendered) = cached {
+            std::fs::write(&out_path, &rendered).map_err(|e| format!("写入失败: {e}"))?;
+            let _ = record_lookup(path, &out_path, &content_hash);
+            return Ok(Some(out_path));
+        }
+    }
+
     let doc = subs::parse(&content, &ext).ok_or_else(|| format!("不支持的字幕格式: .{ext}"))?;
     if doc.segment_count() == 0 {
         return Err("没有可翻译的文本".into());
@@ -128,9 +156,28 @@ pub async fn translate_one(run: &Run<'_>, loc: Loc<'_>, path: &str) -> Result<Op
         Some(list) => list,
         None => return Ok(None),
     };
-    let out_path = prompt::translated_path(path, doc.kind().as_str());
-    std::fs::write(&out_path, doc.render(&translated)).map_err(|e| format!("写入失败: {e}"))?;
+    let rendered = doc.render(&translated);
+    std::fs::write(&out_path, &rendered).map_err(|e| format!("写入失败: {e}"))?;
+    // 记账 + 内容缓存：失败只回退到「少了一级缓存」，不把翻译主流程挡住。
+    let _ = record_lookup(path, &out_path, &content_hash).and_then(|_| {
+        crate::db::with_db_text(&db, |c| {
+            crate::ai_cache::put_content(c, &content_hash, &rendered).map_err(|e| format!("写内容缓存失败: {e}"))
+        })
+    });
     Ok(Some(out_path))
+}
+
+/// 把「源文件 → 这次翻出来的 .zh」记进豁免账，附上配对的音频路径。
+fn record_lookup(path: &str, out_path: &str, content_hash: &str) -> Result<(), String> {
+    let db = crate::paths::library_db_path();
+    let audio = crate::ai_cache::audio_of(path);
+    let Some(st) = crate::ai_cache::stat(path) else {
+        return Ok(()); // 源已被删，账记不记都无所谓
+    };
+    crate::db::with_db_text(&db, |c| {
+        crate::ai_cache::record_subtitle(c, path, out_path, &st, content_hash, audio.as_deref())
+            .map_err(|e| format!("记录翻译账失败: {e}"))
+    })
 }
 
 /// 逐块并发翻译，块级取消。**返回一定与 `texts` 等长**：失败的块回退原文，绝不吐空行。
@@ -234,6 +281,8 @@ async fn attempt_batch(hub: &Arc<Hub>, texts: &[String]) -> Option<Vec<String>> 
             crate::model::ChatMessage { role: "user".into(), content: prompt::numbered_prompt(texts) },
         ],
         temperature: Some(0.3),
+        // 字幕一次要回多行，`04 §7.6.4` 那条按单行原文收紧的公式不适用，这里维持不限制
+        max_tokens: None,
     };
     for i in 0..hub.st.attempts.max(1) {
         match crate::ai::chat_completion(&payload, hub.st.timeout_ms).await {

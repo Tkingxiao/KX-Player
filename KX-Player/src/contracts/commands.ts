@@ -16,6 +16,7 @@ import type {
   AiChatResult,
   AiExportResult,
   AiImportResult,
+  AiModelKind,
   AiModelsResult,
   AiPingResult,
   AiTextsSpec,
@@ -30,7 +31,10 @@ import type {
   FfmpegInfo,
   MpvPlayerState,
   PlayProgress,
+  RenameBatch,
   RenamePreview,
+  RenameReport,
+  RenameSuggestReport,
   ScanResult,
   SubStyle,
   SubtitleScanItem,
@@ -132,6 +136,10 @@ export interface CommandSpecs {
   ai_task_cancel: { args: { taskId: number }, returns: boolean }
   ai_texts_start: { args: { spec: AiTextsSpec }, returns: number }
   ai_translate_start: { args: { spec: AiTranslateSpec }, returns: number }
+  /** AI 翻译豁免账：原目录名 / 文件名 → 译名建议（AI-15 缓存复用） */
+  ai_cache_folder_suggestions: { args: {}, returns: Record<string, string> }
+  /** 手动记一条文件夹名 / 文件名译名进豁免账，返回是否写入成功 */
+  ai_cache_record_folder: { args: { path: string, suggestion: string }, returns: boolean }
   close_window: { args: {}, returns: void }
   convert_cancel: { args: { taskId: number }, returns: boolean }
   convert_run: { args: { items: ConvertItem[] }, returns: number }
@@ -151,7 +159,16 @@ export interface CommandSpecs {
   toggle_fullscreen: { args: {}, returns: boolean }
 
   // ── 改名主干（commands/rename.rs）──
+  // 三条命令的输入只有「用户勾的目录」和「库里的批次号」：预览与落地之间不传条目，
+  // 后端自己重算一遍预览，屏幕上看到的和按钮改动的才是同一份判定（04 §7.7）
+  rename_apply: { args: { paths: string[] }, returns: RenameReport }
+  rename_batches: { args: { limit: number }, returns: RenameBatch[] }
   rename_preview: { args: { paths: string[] }, returns: RenamePreview }
+  rename_redo: { args: { batchId: string }, returns: RenameReport }
+  rename_rollback: { args: { batchId: string }, returns: RenameReport }
+  /** 生成模型译名：只往 `rename_name_cache` 写**过了九道校验**的名字，一个字都不改盘 */
+  rename_suggest_names: { args: { paths: string[], baseUrl: string, apiKey: string, model: string, modelKind?: AiModelKind | null }, returns: RenameSuggestReport }
+  rename_reject_suggestion: { args: { path: string, suggestion: string }, returns: void }
 }
 
 export type CommandName = keyof CommandSpecs

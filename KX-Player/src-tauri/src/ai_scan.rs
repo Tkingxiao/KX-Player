@@ -13,6 +13,21 @@ pub struct ScannedItem {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<String>,
+    /// 是否已翻译可豁免（字幕：账/译文符合；目录：已生成过译名）。扫描命令回填，默认 false。
+    #[serde(skip_serializing_if = "not_translated")]
+    pub translated: bool,
+}
+
+/// serde 的 skip_serializing_if 需要一个真值只出现一次的长寿命命中；这里用它把 false 从载荷里省掉，
+/// 老前端不认识这个新字段也不受影响（收到 false 时行为不变）。
+fn not_translated(b: &bool) -> bool {
+    !*b
+}
+
+impl ScannedItem {
+    pub fn new(path: String, name: String, ext: Option<String>) -> Self {
+        Self { path, name, ext, translated: false }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -57,13 +72,13 @@ fn walk(dir: &str, kind: ScanKind, depth: usize, max_depth: usize, limit: usize,
         let path = prompt::join_path(dir, &name);
         if is_dir {
             if kind == ScanKind::Dir {
-                out.push(ScannedItem { path: path.clone(), name: name.clone(), ext: None });
+                out.push(ScannedItem::new(path.clone(), name.clone(), None));
             }
             walk(&path, kind, depth + 1, max_depth, limit, out);
         } else if kind == ScanKind::Subtitle {
             let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
             if subs::SUBTITLE_EXTS.contains(&ext.as_str()) {
-                out.push(ScannedItem { path, name, ext: Some(ext) });
+                out.push(ScannedItem::new(path, name, Some(ext)));
             }
         }
     }

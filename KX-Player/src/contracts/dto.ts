@@ -261,6 +261,8 @@ export interface SubtitleScanItem {
   name: string
   /** 字幕文件才有（小写、无点） */
   ext?: string
+  /** 是否已翻译可豁免（源没变 + .zh 译文仍在）。kind=dir 时指「文件夹名已译」 */
+  translated?: boolean
 }
 
 /** `subtitle_scan_dir` 的 kind：字幕文件 / 子目录 */
@@ -437,6 +439,10 @@ export interface RenamePreviewItem {
   needsAi: boolean
   reasons: RenameReason[]
   changed: boolean
+  /** **译名库里已核准**的那个名字（过了九道校验、且没在这条上被拒过）。
+   *  后端 `rename_preview` 读库盖章，`rename_apply` 查的是同一张表 —— 屏幕上标出来的就是会落盘的。
+   *  只在 `needsAi` 的条目上出现；与当前同名时后端不填（那种条目应用时也不会动）。 */
+  suggested?: string
   conflict?: RenameConflict
 }
 
@@ -448,4 +454,56 @@ export interface RenamePreview {
   truncated: boolean
   /** 列不出来的目录（不存在 / 没权限）：不能静默当空目录 */
   unreadable: string[]
+}
+
+/** 一次执行的汇总。应用 / 回滚 / 重做三条命令共用这一个形状，区别只在 `batchId` 是新开的还是库里的 */
+export interface RenameReport {
+  batchId: string
+  /** 进了队列的条数（不含跳过项） */
+  planned: number
+  /** 真改成了多少条 —— `planned` 只是队列长度 */
+  applied: number
+  /** 没进队列的条数：译名库里还没核准的 + 撞名的；回滚/重做时是「盘上已经不是那个名字」的条数 */
+  skipped: number
+  /** **明细**而不是一个数：三百条里失败两条，只报数字没法查 */
+  failed: string[]
+  /** 追加进了哪份 `rename_history.json`；`null` = 那一层没有这个文件（不是失败，但要如实显示） */
+  historyFile: string | null
+  /** 这份账本里实际写入/撤掉了几条 —— 与 `applied` 可以不同（没有账本时是 0） */
+  historyWritten: number
+}
+
+/** 一次「生成译名」的汇总（Rust: `rename::ai_ask::NameReport`）。它**不落库**：核准的名字进
+ *  `rename_name_cache`，这份汇总只是给界面看的 —— 也是唯一能把「烧了 token 却没拿到可用名字」
+ *  说清楚的返回体，所以明细而不是计数。 */
+export interface RenameSuggestReport {
+  /** 需要模型的名字条数，按**条目**计：同一片段出现在两个条目里算两条 */
+  needed: number
+  /** 其中命中译名库、一个 token 都没花的 */
+  cached: number
+  /** 这一次新写进库的 */
+  generated: number
+  /** 重试过仍过不了九道校验的（`片段：卡在哪一关`），交回给人处理 */
+  review: string[]
+  /** 请求失败或没解析出译文的（`片段：原因`），下次点按钮会再来一遍 */
+  failed: string[]
+  model: string
+  /** 提示词版本（`04 §7.6.1`）：涨一次版本 = 库里那些键整体作废 */
+  promptVersion: string
+}
+
+/** 一批改名的账（`rename_batches` 的单表投影）。`rolledBack` 只翻标记不删行 —— 回滚本身是可回滚的 */
+export interface RenameBatch {
+  id: string
+  /** 本地规则批次一分钱都没花在模型上，这两列就是 `null`（`04 §7.11`） */
+  providerId: string | null
+  model: string | null
+  createdAt: number
+  /** `null` = 这一批还没跑完：半路崩了就看得出现在还没有落地 */
+  appliedAt: number | null
+  /** 明细行数，不是「计划条数」 */
+  itemCount: number
+  rolledBack: boolean
+  /** 人读的审计说明：`本地规则 · 计划 2 · 成功 2 · 跳过 0 · 失败 0` */
+  note: string | null
 }

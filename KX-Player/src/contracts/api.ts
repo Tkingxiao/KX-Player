@@ -10,6 +10,7 @@ import type {
   AiExportResult,
   AiImportResult,
   AiJobOptions,
+  AiModelKind,
   AiModelsResult,
   AiPingResult,
   AudioDevice,
@@ -22,7 +23,10 @@ import type {
   FfmpegInfo,
   MpvPlayerState,
   PlayProgress,
+  RenameBatch,
   RenamePreview,
+  RenameReport,
+  RenameSuggestReport,
   ScanKind,
   ScanResult,
   SubStyle,
@@ -116,6 +120,33 @@ export interface AppApi {
    * 给出档位分布 + 「当前名 → 规范化后」清单 + 冲突表。**不写盘、不改一个文件**。
    */
   renamePreview: (paths: string[]) => Promise<RenamePreview>
+  /**
+   * 应用改名：后端**重算一遍预览**，只动已经定稿的条目 —— 本地规则改完就算定稿，要问模型的
+   * 那条得先在 `rename_name_cache` 里有核准过的译名；撞名的一条不碰。
+   * 每改成一项立刻写 `rename_items(applied=1)`，记账失败就当项撤销 —— 回滚全靠这份账。
+   */
+  renameApply: (paths: string[]) => Promise<RenameReport>
+  /**
+   * 生成模型译名（`04 §7.6~7.7`）：清点要问模型的片段 → 一个片段一次请求 → 过九道校验 →
+   * 把核准的名字写进 `rename_name_cache`。**不改盘**：下一次 `renameApply` 才把它们落地上去。
+   * 一次最多 200 个名字，没有取消按钮，所以目录要挑小一点。
+   */
+  renameSuggestNames: (paths: string[], baseURL: string, apiKey: string, model: string, modelKind?: AiModelKind | null) => Promise<RenameSuggestReport>
+  /**
+   * 记一条「这个条目不要这个译名」（`04 §7.7` 第 9 条）。只写拒绝表，**不改盘也不删缓存**：
+   * 名字还留给别的条目用，但这一条从此不再生成、不再应用。写完之后重新预览就会看到它消失。
+   */
+  renameRejectSuggestion: (path: string, suggestion: string) => Promise<void>
+  /** 整批回滚：依据是**当时**落库的映射，不重新预览。返回体里的 batchId 就是被回滚的那一批 */
+  renameRollback: (batchId: string) => Promise<RenameReport>
+  /** 回滚的回滚：把这一批再执行一遍（`04 §7.8` 最后一条） */
+  renameRedo: (batchId: string) => Promise<RenameReport>
+  /** 最近的改名批次（挑哪一批回滚/重做），按创建时间倒序 */
+  renameBatches: (limit: number) => Promise<RenameBatch[]>
+  /** AI 翻译豁免账：原目录名 / 文件名 → 译名建议。翻译页据此复用已译的文件夹名，避免重复烧 token */
+  aiCacheFolderSuggestions: () => Promise<Record<string, string>>
+  /** 手动记一条文件夹名 / 文件名译名进豁免账（AI-15 缓存复用） */
+  aiCacheRecordFolder: (path: string, suggestion: string) => Promise<boolean>
   clipboardWriteText: (t: string) => Promise<boolean>
   showItemInFolder: (p: string) => Promise<boolean>
   getProgressAll: () => Promise<PlayProgress[]>

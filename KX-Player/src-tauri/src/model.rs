@@ -139,6 +139,10 @@ pub struct AiChatPayload {
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f64>,
+    /// 输出上限（`04 §7.6.4`）：按原文长度收紧，防本地模型进入复读或长篇解释。
+    /// `None` = 不由软件侧限制（字幕那条链路的既有行为，参数是第 11 批定的）。
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]

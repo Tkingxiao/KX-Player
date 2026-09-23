@@ -145,8 +145,9 @@ fn fold_dots(s: &str) -> String {
 }
 
 /// 全角空格→半角，连续空格→一个。前缀内部也要折叠，否则 `01  名称` 既命中 `whitespace`
-/// 又永远规范化不出变化，判定和结果自相矛盾。
-fn fold_ws(s: &str) -> String {
+/// 又永远规范化不出变化，判定和结果自相矛盾。`postcheck` 的第 8 条也用它 —— `§7.7` 给的阈值是
+/// 「3 个以上连续空格」，直接收成单空格比它更严，好处是同一条名字走本地规则与走后置校验得到同一个结果。
+pub(crate) fn fold_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_ws = false;
     for c in s.chars() {

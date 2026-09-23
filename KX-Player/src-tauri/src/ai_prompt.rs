@@ -7,6 +7,12 @@
 /// 送模型的系统提示词（与前端旧实现逐字一致）
 pub const SYSTEM_PROMPT: &str = "你是专业的音声字幕/歌词翻译器。用户会给出若干「编号. 文本」行。把每一行翻译成自然、口语化的简体中文：保持编号不变、逐行输出；保留原文中的★♪【】※等装饰符号与表情；拟声词可音译或保留；只输出译文，不要解释、不要合并行。";
 
+/// 字幕这套提示词的版本号，进 `ai_subtitle_content` 的缓存键（`ai_cache::hash`）。
+/// **改了 `SYSTEM_PROMPT` 的措辞就必须涨号**：旧译文是按旧措辞烧出来的，
+/// 留着命中就等于「改了提示词还拿旧译文」，`04 §7.6.2` 那条一致性账与 AI-19 的回归对比都会失真。
+/// 改名/文件夹名那套 prompt 用另一个号（`04 §7.6.1` 的 `PROMPT_VERSION`），两边互不作废。
+pub const SUBTITLE_PROMPT_VERSION: &str = "subtitle-1";
+
 /// 拼接目录与文件名（统一用正斜杠：前端与 mpv 都按这个约定消费路径）
 pub(crate) fn join_path(dir: &str, name: &str) -> String {
     let mut base = dir;

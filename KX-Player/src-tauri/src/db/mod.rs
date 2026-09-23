@@ -35,6 +35,16 @@ pub fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// 同 [`with_db`]，但闭包返回自己的错误文案。改名主干的失败原因是给用户看的中文句子
+/// （「记账失败（…），已撤销」这类），套进 `rusqlite::Error` 再拆出来只会绕一圈。
+/// 建表在这里做一次：调用方不用记着调，忘了也不会得到一句「no such table: rename_batches」。
+pub fn with_db_text<T>(db_path: &Path, f: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+    let _g = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let conn = open_raw(db_path).map_err(|e| format!("打开曲库失败：{e}"))?;
+    initialize_schema(&conn).map_err(|e| format!("建表失败：{e}"))?;
+    f(&conn)
+}
+
 /// P0-64 启动自检：校验曲库完整性。损坏只降级提示、不阻止启动 ——
 /// 曲库仍可通过重新扫描重建，把用户挡在门外不是更坏的结局。
 /// 同时充当迁移失败的兜底：`initialize_schema` 的错误一路上抛会被调用方吞掉、

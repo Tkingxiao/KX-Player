@@ -596,7 +596,7 @@ function applyResponsive(): void {
 | `settings/` | SettingsModal / BgEditorModal | **异步组件**（`defineAsyncComponent`，App.vue:27-29） |
 | `taxonomy/` | AutoTagReview | **异步组件** |
 | `convert/` | ConvertView | |
-| `ai/` | AiTranslateView | 693 行，AI 翻译 |
+| `ai/` | AiTranslateView | AI 工作台（身份栏 + 左列 + 右区三工种）；JobTable/FailureDetail/ActionRail/ProgressBand 同目录 |
 
 **异步加载策略**（`App.vue:2-4, 26-29`）：首屏只同步加载「立刻可见」的骨架
 （TitleBar / Sidebar / ContentArea / InspectorPanel / PlayerBar / StageView），

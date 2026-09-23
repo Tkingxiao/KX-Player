@@ -92,12 +92,20 @@
 
 | 命令 | 参数（JS 键名 : Rust 类型） | resolve | 位置 |
 |---|---|---|---|
+| `rename_apply` | `paths: Vec<String>` | `Report` | src-tauri/src/commands/rename.rs |
+| `rename_batches` | `limit: u32` | `Batch[]` | src-tauri/src/commands/rename.rs |
 | `rename_preview` | `paths: Vec<String>` | `Preview` | src-tauri/src/commands/rename.rs |
+| `rename_redo` | `batchId: String` | `Report` | src-tauri/src/commands/rename.rs |
+| `rename_reject_suggestion` | `path: String`, `suggestion: String` | `null` | src-tauri/src/commands/rename.rs |
+| `rename_rollback` | `batchId: String` | `Report` | src-tauri/src/commands/rename.rs |
+| `rename_suggest_names` | `paths: Vec<String>`, `baseUrl: String`, `apiKey: String`, `model: String`, `modelKind: Option<ModelKind>` | `NameReport` | src-tauri/src/commands/rename.rs |
 
 ## system
 
 | 命令 | 参数（JS 键名 : Rust 类型） | resolve | 位置 |
 |---|---|---|---|
+| `ai_cache_folder_suggestions` | — | `Record<string, string>` | src-tauri/src/commands/system.rs |
+| `ai_cache_record_folder` | `path: String`, `suggestion: String` | `boolean` | src-tauri/src/commands/system.rs |
 | `ai_chat` | `payload: AiChatPayload` | `AiChatResult` | src-tauri/src/commands/system.rs |
 | `ai_export_prompts` | `paths: Vec<String>` | `ExportResult` | src-tauri/src/commands/system.rs |
 | `ai_import_translations` | `paths: Vec<String>`, `text: String`, `apply: bool` | `ImportResult` | src-tauri/src/commands/system.rs |

@@ -9,6 +9,8 @@ import { computed, ref, watch } from 'vue'
 import { useUiStore } from '@/stores/ui'
 import { api } from '@/bridge/ipc'
 import { errText, toAppError } from '@/contracts/result'
+import ActionRail from './ActionRail.vue'
+import ManualAudit from './ManualAudit.vue'
 import type { AiExportResult, AiImportResult } from '@/contracts/api'
 
 const props = defineProps<{ paths: string[] }>()
@@ -20,6 +22,15 @@ const reading = ref(false)
 const applying = ref(false)
 const exported = ref<AiExportResult | null>(null)
 const preview = ref<AiImportResult | null>(null)
+/**
+ * 导出那一刻的队列快照：批次的序号是按它编的（ai_export.rs）。
+ * 之后队列一动（清除/重扫/重试），这份批次就对不上号，必须明示作废，
+ * 而不是让导入报「越界 N 段」让用户猜（audit B5）。
+ */
+const exportedPaths = ref<string[]>([])
+const stale = computed(
+  () => exported.value !== null && exportedPaths.value.join('|') !== props.paths.join('|'),
+)
 /** 合并后的译文文本：写入那一步要用它再跑一次同一个命令，不能靠用户重新选一遍文件 */
 let merged = ''
 
@@ -38,8 +49,7 @@ watch(
 )
 
 const readyCount = computed(() => preview.value?.ready ?? 0)
-const canApply = computed(() => readyCount.value > 0 && !reading.value && !applying.value)
-const shortFiles = computed(() => (preview.value?.files ?? []).filter((f) => !f.complete))
+const canApply = computed(() => readyCount.value > 0 && !stale.value && !reading.value && !applying.value)
 
 async function doExport(): Promise<void> {
   if (!props.paths.length || exporting.value) return
@@ -47,6 +57,7 @@ async function doExport(): Promise<void> {
   try {
     const r = await api.aiExportPrompts(props.paths)
     exported.value = r
+    exportedPaths.value = [...props.paths]
     preview.value = null
     merged = ''
     const skip = r.unexportable ? `，${r.unexportable} 条切不开已跳过` : ''
@@ -106,6 +117,21 @@ async function doApply(): Promise<void> {
   }
 }
 
+type StepState = 'pending' | 'active' | 'done' | 'skipped'
+/** 三步条状态（第 5 期）：导出 → 导入 → 写入。stale 时不亮任何一步（批次已作废） */
+const steps = computed(() => {
+  const done0 = exported.value !== null && !stale.value
+  const done1 = preview.value !== null && !stale.value
+  const s1: StepState = stale.value ? 'skipped' : done0 ? 'done' : 'pending'
+  const s2: StepState = stale.value ? 'skipped' : done1 ? 'done' : done0 ? 'active' : 'pending'
+  const s3: StepState = applying.value ? 'active' : done1 && readyCount.value > 0 ? 'active' : 'pending'
+  return [
+    { key: 'export', label: '导出批次', state: s1, note: done0 ? `${exported.value?.exported ?? 0} 段` : '' },
+    { key: 'import', label: '导入译文', state: s2, note: done1 ? `${preview.value?.matched ?? 0} 命中` : '' },
+    { key: 'apply', label: '写入', state: s3, note: done1 ? `${readyCount.value} 篇可写` : '' },
+  ]
+})
+
 async function copyPrompt(): Promise<void> {
   if (!exported.value) return
   const ok = await api.clipboardWriteText(exported.value.systemPrompt)
@@ -115,58 +141,45 @@ async function copyPrompt(): Promise<void> {
 
 <template>
   <div class="manual">
+    <!-- 三步条复用工作台的工序轨道（DESIGN.md「AI 工作台」§3.1）：不再自己画一份同款胶囊 -->
+    <ActionRail :phases="steps" />
+
     <div class="manual-row">
       <button class="btn-ghost" :disabled="!paths.length || exporting" @click="doExport">
         {{ exporting ? '导出中…' : '导出批次' }}
       </button>
-      <button class="btn-ghost" :disabled="!paths.length || reading" @click="doImport">
+      <button
+        class="btn-ghost"
+        :disabled="!paths.length || reading || stale"
+        :title="stale ? '批次已作废，先重新导出' : ''"
+        @click="doImport"
+      >
         {{ reading ? '校验中…' : '导入译文' }}
       </button>
-      <button class="btn-primary" :disabled="!canApply" @click="doApply">
+      <button class="btn-primary" :disabled="!canApply" :title="stale ? '批次已作废，先重新导出' : ''" @click="doApply">
         {{ applying ? '写入中…' : `写入 ${readyCount} 篇` }}
       </button>
-      <button v-if="exported" class="btn-ghost" @click="copyPrompt">复制提示词</button>
+      <button v-if="exported && !stale" class="btn-ghost" @click="copyPrompt">复制提示词</button>
     </div>
 
-    <p class="manual-hint">
-      不配 Provider 也能走完：把导出的 <code>prompts.txt</code> 交给任何工具（每段以 <code>### 序号 ###</code> 开头，
-      序号下面写译文），跑完再导回来。<b>整篇配上译文的文件才写盘</b>，缺的那几篇把空着的序号再跑一遍、合并导入即可。
-    </p>
+    <details class="manual-how">
+      <summary>怎么用</summary>
+      <p class="manual-hint">
+        把导出的 <code>prompts.txt</code> 交给任何工具（每段以 <code>### 序号 ###</code> 开头，序号下面写译文），
+        跑完再导回来。整篇配上译文的文件才写盘；缺的那几篇把空着的序号再跑一遍、合并导入即可。
+      </p>
+    </details>
 
-    <p v-if="exported" class="manual-line">
+    <p v-if="stale" class="manual-stale">
+      队列已变动（清除或重新扫描），这份批次的序号对不上现在的列表了。
+      <button class="btn-ghost manual-stale-btn" @click="doExport">重新导出批次</button>
+    </p>
+    <p v-if="exported && !stale" class="manual-line">
       已写出 {{ exported.path }} · {{ exported.exported }}/{{ exported.units }} 段 · {{ exported.files }} 个文件
     </p>
     <p v-for="e in exported?.errors ?? []" :key="`x-${e}`" class="manual-warn">{{ e }}</p>
 
-    <template v-if="preview">
-      <div class="manual-counts">
-        <span>块 {{ preview.blocks }}</span>
-        <span>命中 {{ preview.matched }}/{{ preview.units }}</span>
-        <span :class="{ bad: preview.missing > 0 }">缺 {{ preview.missing }}</span>
-        <span :class="{ bad: preview.duplicates > 0 }">重复 {{ preview.duplicates }}</span>
-        <span :class="{ bad: preview.outOfRange > 0 }">越界 {{ preview.outOfRange }}</span>
-        <span :class="{ bad: preview.empty > 0 }">空块 {{ preview.empty }}</span>
-        <span :class="{ bad: preview.unexportable > 0 }">切不开 {{ preview.unexportable }}</span>
-      </div>
-      <ul class="manual-files">
-        <li v-for="f in preview.files" :key="f.path">
-          <span :class="f.complete ? 'ok' : 'bad'">{{ f.complete ? '齐' : '缺' }}</span>
-          <span class="manual-name" :title="f.path">{{ f.name }}</span>
-          <span class="tnum">{{ f.matched }}/{{ f.total }}</span>
-          <span v-if="f.outPath" class="manual-out">→ {{ base(f.outPath) }}</span>
-        </li>
-      </ul>
-      <ul v-if="preview.samples.length" class="manual-samples">
-        <li v-for="s in preview.samples" :key="s.seq">
-          <span class="tnum">#{{ s.seq }}</span>
-          <span class="manual-from">{{ s.from }}</span>
-          <span class="manual-arrow">→</span>
-          <span class="manual-to">{{ s.to }}</span>
-        </li>
-      </ul>
-      <p v-if="shortFiles.length" class="manual-warn">{{ shortFiles.length }} 个文件没配齐，这一次不动它们。</p>
-      <p v-for="e in preview.errors" :key="`p-${e}`" class="manual-warn">{{ e }}</p>
-    </template>
+    <ManualAudit v-if="preview" :preview="preview" />
   </div>
 </template>
 
@@ -184,30 +197,26 @@ async function copyPrompt(): Promise<void> {
 .manual-hint code { font-size: 11px; color: var(--text-sub); }
 .manual-line { font-size: 11.5px; color: var(--text-sub); word-break: break-all; }
 .manual-warn { font-size: 11.5px; color: var(--warning); word-break: break-all; }
-
-.manual-counts { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11.5px; color: var(--text-sub); }
-.manual-counts .bad { color: var(--danger); }
-
-.manual-files,
-.manual-samples {
-  list-style: none;
+.manual-stale {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
-  max-height: 168px;
-  overflow-y: auto;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: var(--radius-sm);
   font-size: 11.5px;
+  color: var(--warning);
+}
+.manual-stale-btn { padding: 2px 10px; font-size: 11px; }
+
+.manual-how { font-size: 11.5px; color: var(--text-muted); }
+.manual-how summary {
+  cursor: pointer;
+  width: fit-content;
+  text-decoration: underline;
+  text-underline-offset: 3px;
   color: var(--text-sub);
 }
-.manual-files li,
-.manual-samples li { display: flex; align-items: baseline; gap: 8px; }
-.manual-files .ok { color: var(--success); }
-.manual-files .bad { color: var(--danger); }
-.manual-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.manual-out { color: var(--text-muted); }
-
-.manual-samples li { gap: 6px; }
-.manual-from { color: var(--text-muted); text-decoration: line-through; }
-.manual-arrow { color: var(--text-muted); }
-.manual-to { color: var(--text); }
+.manual-how[open] summary { color: rgb(var(--accent-rgb)); }
 </style>

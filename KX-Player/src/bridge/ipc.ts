@@ -174,9 +174,24 @@ export const api: AppApi = {
   aiImportTranslations: (paths, text, apply) => invoke('ai_import_translations', { paths, text, apply }),
   subtitleScanDir: (dir, kind, maxDepth, limit) =>
     invoke('subtitle_scan_dir', { dir, kind, maxDepth, limit }),
-  // 改名主干只走这一条命令：预览与落地是两个命令，前端手里拿到的永远只是预览。
+  // 改名主干：预览与落地是**分开的命令**，落地那三条的输入只有「用户勾的目录」或「库里的批次号」——
+  // 前端手里永远只是一份预览，从不回传「要改哪些」（04 §7.7）。
   // 不入 settings、不进历史队列（04 §7.8 的「同一条流水线」是 S2 的事）
   renamePreview: (paths) => invoke('rename_preview', { paths }),
+  renameApply: (paths) => invoke('rename_apply', { paths }),
+  // 生成译名：只写库不改盘，所以它排在 apply 前面 —— 用户先按这一条拿到名字，再按 apply 落地。
+  // 接入参数前端叫 baseURL（`AiJobOptions` 的口径），线形状是 baseUrl，映射收在边界这一层。
+  renameSuggestNames: (paths, baseURL, apiKey, model, modelKind) =>
+    invoke('rename_suggest_names', { paths, baseUrl: baseURL, apiKey, model, modelKind }),
+  // 拒绝一个译名 = 只往拒绝表写一行；生效的地方在后端每次查库时复核，不在这里记账
+  renameRejectSuggestion: (path, suggestion) => invoke('rename_reject_suggestion', { path, suggestion }),
+  renameRollback: (batchId) => invoke('rename_rollback', { batchId }),
+  renameRedo: (batchId) => invoke('rename_redo', { batchId }),
+  renameBatches: (limit) => invoke('rename_batches', { limit }),
+  aiCacheFolderSuggestions: () =>
+    invoke('ai_cache_folder_suggestions').catch(() => ({})),
+  aiCacheRecordFolder: (path, suggestion) =>
+    invoke('ai_cache_record_folder', { path, suggestion }).catch(() => false),
   renameDir: async (oldPath, newPath) => {
     try {
       await invoke('rename_dir', { oldPath, newPath })
