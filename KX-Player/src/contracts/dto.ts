@@ -122,6 +122,9 @@ export interface MpvPlayerState {
   /** 画面显示尺寸（物理像素，含像素长宽比）；0 = 未知。悬浮窗据此锁定窗口比例 */
   videoW: number
   videoH: number
+  /** 加载代际（P0-5）：前端 `playerPlay` 每次自增，Rust 原样回传。
+   *  小于当前代际的状态是上一首的迟到广播，必须丢弃（见 stores/player.ts）。 */
+  generation: number
 }
 
 /** 字幕轨（mpv/libass）；id<=0 表示「关闭字幕」 */

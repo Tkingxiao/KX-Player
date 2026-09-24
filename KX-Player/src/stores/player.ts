@@ -51,6 +51,9 @@ export const usePlayerStore = defineStore('player', () => {
   const error = ref('')
 
   let loadGeneration = 0
+  /** 最近一次「引擎确实为某一代报过状态」的代际（P0-5）。
+   *  进度回写只认它：手里的 position 若不是当前代的，写下去就是给新曲目记上一首的账。 */
+  let reportedGeneration = -1
   let progressTimer: ReturnType<typeof setInterval> | null = null
   let sleepTicker: ReturnType<typeof setInterval> | null = null
   let ending = false
@@ -81,6 +84,9 @@ export const usePlayerStore = defineStore('player', () => {
 
   // ── mpv 状态镜像 ──
   function applyMpvState(s: MpvPlayerState): void {
+    // 上一首的迟到广播（P0-5）：此刻 currentId/position 已经属于新曲目，收下就是「新曲目 + 旧进度」
+    if (s.generation < loadGeneration) return
+    reportedGeneration = s.generation
     playing.value = s.playing
     position.value = s.position
     if (s.duration > 0) duration.value = s.duration
@@ -96,7 +102,9 @@ export const usePlayerStore = defineStore('player', () => {
   }
 
   // ── 加载与播放 ──
-  async function loadTrack(track: Track, resumeMs: number, autoplay: boolean): Promise<boolean> {
+  /** 单次加载的结局：`ok` 这一代已生效｜`failed` 这一代失败了｜`stale` 已被更新的加载取代。
+   *  分出 `stale` 是为了让调用方在超车后彻底闭嘴：旧的失败/旧的收尾都不许碰当前这一代的状态。 */
+  async function loadTrack(track: Track, resumeMs: number, autoplay: boolean): Promise<'ok' | 'failed' | 'stale'> {
     const gen = ++loadGeneration
     loading.value = true
     position.value = resumeMs / 1000
@@ -115,15 +123,17 @@ export const usePlayerStore = defineStore('player', () => {
         muted: settings.muted,
         speed: settings.speed,
         videoActive,
+        generation: gen,
       })
     } catch (e) {
+      if (gen !== loadGeneration) return 'stale' // 失败也是迟到的：当前代正在加载，别把它按成错误态
       error.value = errText(e)
       loading.value = false
-      return false
+      return 'failed'
     }
-    if (gen !== loadGeneration) return false // 已被更新的加载取代，交由新流程收尾
+    if (gen !== loadGeneration) return 'stale' // 已被更新的加载取代，交由新流程收尾
     loading.value = false
-    return true
+    return 'ok'
   }
 
   /** 播放指定曲目（带队列上下文）。fromLast=true 时从上次进度续播。 */
@@ -144,7 +154,9 @@ export const usePlayerStore = defineStore('player', () => {
     bookmarks.value = []
     error.value = ''
     void refreshBookmarks(track.id)
-    if (!await loadTrack(track, resumeMs, true)) {
+    const outcome = await loadTrack(track, resumeMs, true)
+    if (outcome === 'stale') return // 载荷已过期：这次加载的收尾一概不做
+    if (outcome === 'failed') {
       // 加载失败：不查询字幕轨、不启动进度写入，避免为无法播放的条目写入假进度
       playing.value = false
       return
@@ -209,6 +221,9 @@ export const usePlayerStore = defineStore('player', () => {
   function writeProgress(finished: boolean): void {
     const id = currentId.value
     if (!id) return
+    // 手里的 position 必须是引擎为**这一代**报上来的（P0-5）：
+    // 超车切歌时 position 还停在上一首，写下去就是给新曲目记上一首的进度。
+    if (reportedGeneration !== loadGeneration) return
     const completed = completedOnWrite(position.value, duration.value || 0, finished)
     void api.setProgress(id, Math.round(position.value * 1000), completed ?? null, settings.speed)
     library.updateProgressLocal(id, Math.round(position.value * 1000), completed)
@@ -231,8 +246,15 @@ export const usePlayerStore = defineStore('player', () => {
   // ── mpv 事件（唯一事实源）──
   function initEventListeners(): void {
     onEvent<MpvPlayerState>('player:state', applyMpvState)
-    onEvent<unknown>('player:loading', () => { loading.value = true })
-    onEvent<{ reason: string }>('player:ended', ({ reason }) => {
+    onEvent<{ generation: number }>('player:loading', ({ generation }) => {
+      // 上一首的 StartFile 迟到时不许点亮新曲目的加载态
+      if (generation < loadGeneration) return
+      loading.value = true
+    })
+    onEvent<{ reason: string; generation: number }>('player:ended', ({ reason, generation }) => {
+      // 上一首自然播完/被换掉的那一下，用户可能已经点了别的曲目（P0-5）：
+      // 这一条属于它自己那一代，既不该写进度，也不该推进队列（否则一次点歌跳过两首）。
+      if (generation < loadGeneration) return
       if (reason === 'error') {
         error.value = '解码失败，已跳到下一条'
         if (queue.value.length > 1) void next()

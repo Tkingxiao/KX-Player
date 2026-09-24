@@ -26,6 +26,64 @@ pub struct PlayerCore {
     last_rect: parking_lot::Mutex<Option<embed::StageRect>>,
     /// 覆盖窗口当前是否挂靠在独立悬浮窗（pip）上
     pip_active: AtomicBool,
+    /// 已下发但尚未开始的加载代际（0 = 没有）。见 [`apply_property`]：
+    /// 起播命令与 mpv 的 `StartFile` 之间，事件线程收到的文件级属性全是上一首的。
+    pending_load: Arc<AtomicU64>,
+}
+
+/// 属于「某一条曲目」的属性：换曲时它们必须整批换掉。
+/// 音量/静音/倍速是**设置**，跨曲目有效，因此不在此列。
+fn is_file_scoped_property(name: &str) -> bool {
+    matches!(name, "time-pos" | "duration" | "video-params/dw" | "video-params/dh")
+}
+
+/// 把一次属性观察并进共享状态，返回「值变了、值得强推一次」。
+///
+/// `pending`（有事在加载）期间，文件级属性一律丢弃：前端发出 `player_play` 时
+/// 已经把 currentId 换成新曲目，此刻放行的旧 `time-pos`/`duration` 会被它当成
+/// 新曲目的进度（P0-5：旧请求的迟到属性不许改当前代）。
+///
+/// 判据只看「命令是否已下发、新文件是否已开始」：mpv 的事件队列是 FIFO，
+/// 旧文件的属性一定在它的 `EndFile` 之前、新文件的 `StartFile` 之前生成，
+/// 因此 `StartFile` 一到，后面收到的文件级属性必然属于新文件，不必再挡。
+fn apply_property(s: &mut PlayerState, name: &str, change: &PropertyData, pending: bool) -> bool {
+    if pending && is_file_scoped_property(name) {
+        return false;
+    }
+    match change {
+        PropertyData::Double(v) if name == "time-pos" => {
+            s.position = v.max(0.0);
+        }
+        PropertyData::Double(v) if name == "duration" && (s.duration - v).abs() > 0.01 => {
+            s.duration = v.max(0.0);
+            return true;
+        }
+        PropertyData::Flag(p) if name == "pause" && s.playing == *p => {
+            s.playing = !*p;
+            return true;
+        }
+        PropertyData::Double(v) if name == "speed" && (s.speed - v).abs() > 0.001 => {
+            s.speed = *v;
+            return true;
+        }
+        PropertyData::Double(v) if name == "volume" => {
+            s.volume = v.clamp(0.0, 100.0);
+        }
+        PropertyData::Flag(m) if name == "mute" && s.muted != *m => {
+            s.muted = *m;
+            return true;
+        }
+        PropertyData::Double(v) if name == "video-params/dw" && (s.video_w - v).abs() > 0.5 => {
+            s.video_w = *v;
+            return true;
+        }
+        PropertyData::Double(v) if name == "video-params/dh" && (s.video_h - v).abs() > 0.5 => {
+            s.video_h = *v;
+            return true;
+        }
+        _ => {}
+    }
+    false
 }
 
 /// mpv 的 `sub-back-color` 要 `#AARRGGBB`，而 `<input type="color">` 只给 `#RRGGBB` ——
@@ -64,6 +122,7 @@ impl PlayerCore {
             last_emit_ms: AtomicU64::new(0),
             last_rect: parking_lot::Mutex::new(None),
             pip_active: AtomicBool::new(false),
+            pending_load: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -120,39 +179,61 @@ impl PlayerCore {
         // 事件线程：属性观察 → 归一化 player:state
         let app = self.app.clone();
         let shared = Arc::clone(&self.shared);
+        let pending = Arc::clone(&self.pending_load);
         let last_emit = Arc::new(AtomicU64::new(0));
         std::thread::Builder::new()
             .name("mpv-events".into())
-            .spawn(move || event_loop(mpv, app, shared, last_emit))
+            .spawn(move || event_loop(mpv, app, shared, pending, last_emit))
             .map_err(|e| IpcError::with_detail(AppErrorCode::MpvInitFailed, "mpv 事件线程启动失败", e))?;
         crate::paths::append_log("[mpv] initialized with embedded window");
         Ok(())
     }
 
-    pub fn play_file(&self, path: &str, resume_ms: f64, vol: f64, muted: bool, speed: f64, video_active: bool) -> IpcResult<()> {
+    /// 起播一条曲目。`generation` 由前端每次加载自增（P0-5），随状态广播回传，
+    /// 前端据此丢弃上一代的迟到状态。
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_file(&self, path: &str, resume_ms: f64, vol: f64, muted: bool, speed: f64, video_active: bool, generation: u64) -> IpcResult<()> {
         let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
+        // 先立牌再动状态：从这一刻到 mpv 送出 StartFile 之间收到的文件级属性都是上一首的。
+        // 取 max 是为了让「更新的代际已经接手」时旧值不至于把牌子降回去。
+        self.pending_load.fetch_max(generation, Ordering::SeqCst);
         {
             let mut s = self.shared.lock();
+            s.generation = s.generation.max(generation);
             s.playing = true;
             s.position = 0.0;
             s.duration = 0.0;
             s.track_path = Some(path.to_string());
             s.video_active = video_active;
         }
-        mpv.set_property("volume", vol * 100.0).map_err(mpv_err)?;
-        mpv.set_property("mute", muted).map_err(mpv_err)?;
-        mpv.set_property("speed", speed).map_err(mpv_err)?;
-        if resume_ms > 0.0 {
-            mpv.set_property("start", resume_ms / 1000.0).map_err(mpv_err)?;
-        } else {
-            let _ = mpv.set_property("start", 0.0_f64);
+        let result = (|| -> IpcResult<()> {
+            mpv.set_property("volume", vol * 100.0).map_err(mpv_err)?;
+            mpv.set_property("mute", muted).map_err(mpv_err)?;
+            mpv.set_property("speed", speed).map_err(mpv_err)?;
+            if resume_ms > 0.0 {
+                mpv.set_property("start", resume_ms / 1000.0).map_err(mpv_err)?;
+            } else {
+                let _ = mpv.set_property("start", 0.0_f64);
+            }
+            // keep-open=yes 让 mpv 播完后停在「已暂停」，而 pause 属性会跨 loadfile 保留：
+            // 不显式清掉，之后每次起播都冻在首帧（进度不动、画面静止，前端一直显示加载中）。
+            mpv.set_property("pause", false).map_err(mpv_err)?;
+            mpv.command("loadfile", &[path]).map_err(mpv_err)
+        })();
+        if result.is_err() {
+            // 这一首根本没起播：把立牌和「正在播放」的假象一起收回。
+            // CAS 而不是直接清零——更新的代际若已接手，牌子是它的。
+            if self.pending_load.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                let mut s = self.shared.lock();
+                s.playing = false;
+                s.track_path = None;
+                s.position = 0.0;
+                s.duration = 0.0;
+            }
+            crate::paths::append_log(&format!("[mpv] 起播失败（generation {generation}）：{path}"));
         }
-        // keep-open=yes 让 mpv 播完后停在「已暂停」，而 pause 属性会跨 loadfile 保留：
-        // 不显式清掉，之后每次起播都冻在首帧（进度不动、画面静止，前端一直显示加载中）。
-        mpv.set_property("pause", false).map_err(mpv_err)?;
-        mpv.command("loadfile", &[path]).map_err(mpv_err)?;
         self.emit_state(true);
-        Ok(())
+        result
     }
 
     pub fn set_paused(&self, paused: bool) -> IpcResult<()> {
@@ -476,7 +557,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, _last_emit: Arc<AtomicU64>) {
+fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, pending: Arc<AtomicU64>, _last_emit: Arc<AtomicU64>) {
     let _ = mpv.disable_deprecated_events();
     let _ = mpv.observe_property("time-pos", Format::Double, 1);
     let _ = mpv.observe_property("duration", Format::Double, 2);
@@ -495,66 +576,27 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, _l
     loop {
         match mpv.wait_event(0.25) {
             Some(Ok(Event::PropertyChange { name, change, .. })) => {
-                let mut force = false;
-                {
+                let is_pending = pending.load(Ordering::SeqCst) != 0;
+                let force = {
                     let mut s = shared.lock();
-                    match change {
-                        PropertyData::Double(v) if name == "time-pos" => {
-                            s.position = v.max(0.0);
-                        }
-                        PropertyData::Double(v) if name == "duration" => {
-                            if (s.duration - v).abs() > 0.01 {
-                                s.duration = v.max(0.0);
-                                force = true;
-                            }
-                        }
-                        PropertyData::Flag(p) if name == "pause" => {
-                            if s.playing == p {
-                                s.playing = !p;
-                                force = true;
-                            }
-                        }
-                        PropertyData::Double(v) if name == "speed" => {
-                            if (s.speed - v).abs() > 0.001 {
-                                s.speed = v;
-                                force = true;
-                            }
-                        }
-                        PropertyData::Double(v) if name == "volume" => {
-                            s.volume = v.clamp(0.0, 100.0);
-                        }
-                        PropertyData::Flag(m) if name == "mute" => {
-                            if s.muted != m {
-                                s.muted = m;
-                                force = true;
-                            }
-                        }
-                        PropertyData::Double(v) if name == "video-params/dw" => {
-                            if (s.video_w - v).abs() > 0.5 {
-                                s.video_w = v;
-                                force = true;
-                            }
-                        }
-                        PropertyData::Double(v) if name == "video-params/dh"
-                            && (s.video_h - v).abs() > 0.5 => {
-                                s.video_h = v;
-                                force = true;
-                            }
-                        _ => {}
-                    }
-                }
+                    apply_property(&mut s, name, &change, is_pending)
+                };
                 emit_state_shared(&app, &shared, force, &mut None, Duration::from_millis(100));
             }
             Some(Ok(Event::StartFile)) => {
-                {
+                // 新文件已开始：这一代从「加载中」变成「在播」，牌子收回，
+                // 之后收到的文件级属性必然属于它（mpv 事件队列是 FIFO）。
+                let generation = {
+                    pending.swap(0, Ordering::SeqCst);
                     let mut s = shared.lock();
                     s.playing = true;
                     s.position = 0.0;
                     // 换曲即失配：不清掉的话悬浮窗会按上一首的比例开窗，新画面又要黑边补差
                     s.video_w = 0.0;
                     s.video_h = 0.0;
-                }
-                let _ = app.emit("player:loading", ());
+                    s.generation
+                };
+                let _ = app.emit("player:loading", serde_json::json!({ "generation": generation }));
                 emit_state_shared(&app, &shared, true, &mut None, Duration::from_millis(0));
             }
             Some(Ok(Event::FileLoaded)) => {
@@ -570,7 +612,14 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, _l
                     4 => "error",
                     _ => "unknown",
                 };
-                let _ = app.emit("player:ended", serde_json::json!({ "reason": payload }));
+                // 还没走到 StartFile 就结束了（加载失败 / 被 stop）：牌子顺手收回，
+                // 免得共享状态一直冻在「加载中」。
+                let pending_gen = pending.swap(0, Ordering::SeqCst);
+                let generation = if pending_gen != 0 { pending_gen } else { shared.lock().generation };
+                let _ = app.emit(
+                    "player:ended",
+                    serde_json::json!({ "reason": payload, "generation": generation }),
+                );
             }
             Some(Ok(Event::Shutdown)) => {
                 let _ = app.emit("player:error", serde_json::json!({ "message": "mpv 内核已关闭" }));
@@ -616,11 +665,64 @@ fn emit_state_shared(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_default_device, loudness_gain_db, sub_back_color_value};
-    use crate::model::AudioDevice;
+    use super::{apply_property, ensure_default_device, is_file_scoped_property, loudness_gain_db, sub_back_color_value};
+    use crate::model::{AudioDevice, PlayerState};
+    use libmpv2::events::PropertyData;
 
     fn dev(id: &str, label: &str) -> AudioDevice {
         AudioDevice { device_id: id.into(), label: label.into() }
+    }
+
+    /// P0-5：起播命令已下发、mpv 还没报出 StartFile 的这一段里，事件线程收到的
+    /// 文件级属性全是上一首的。前端此刻已经把 currentId 换成了新曲目，放行就是
+    /// 「新曲目 + 旧进度」——进度条跳一下，写盘的进度还落到新曲目名下。
+    #[test]
+    fn a_pending_load_drops_the_previous_tracks_file_properties() {
+        let mut s = PlayerState { duration: 301.0, ..Default::default() };
+        for name in ["time-pos", "duration", "video-params/dw", "video-params/dh"] {
+            assert!(is_file_scoped_property(name), "{name} 是文件级属性");
+        }
+        assert!(!is_file_scoped_property("volume"), "音量是设置，不是文件属性");
+        for (name, change) in [
+            ("time-pos", PropertyData::Double(128.5)),
+            ("duration", PropertyData::Double(302.0)),
+            ("video-params/dw", PropertyData::Double(1920.0)),
+            ("video-params/dh", PropertyData::Double(1080.0)),
+        ] {
+            assert!(!apply_property(&mut s, name, &change, true), "{name} 不该在加载期间进状态");
+        }
+        assert_eq!(
+            (s.position, s.duration, s.video_w, s.video_h),
+            (0.0, 301.0, 0.0, 0.0),
+            "上一首的值一个都不许漏进来"
+        );
+        // StartFile 之后牌子收回，同一批属性照单收下
+        assert!(apply_property(&mut s, "duration", &PropertyData::Double(302.0), false));
+        assert!(apply_property(&mut s, "video-params/dw", &PropertyData::Double(1920.0), false));
+        assert_eq!((s.duration, s.video_w), (302.0, 1920.0));
+    }
+
+    /// 加载期间被挡的是「某一条曲目的属性」；音量/静音/倍速/暂停是跨曲目的传输状态，
+    /// 挡下来会让用户在新曲目开始前调的音量被无声吞掉。
+    #[test]
+    fn a_pending_load_still_applies_transport_settings() {
+        let mut s = PlayerState { playing: true, ..Default::default() };
+        assert!(apply_property(&mut s, "pause", &PropertyData::Flag(true), true));
+        assert!(!s.playing, "pause 属性取反后写回 playing");
+        assert!(apply_property(&mut s, "mute", &PropertyData::Flag(true), true));
+        assert!(s.muted);
+        assert!(apply_property(&mut s, "speed", &PropertyData::Double(1.5), true));
+        assert_eq!(s.speed, 1.5);
+        assert!(!apply_property(&mut s, "volume", &PropertyData::Double(70.0), true));
+        assert_eq!(s.volume, 70.0, "音量照收，只是不值得为它强推一次状态");
+    }
+
+    #[test]
+    fn unknown_properties_do_not_touch_the_state() {
+        let mut s = PlayerState { position: 12.0, ..Default::default() };
+        assert!(!apply_property(&mut s, "sub-visibility", &PropertyData::Flag(false), false));
+        assert_eq!(s.position, 12.0);
+        assert_eq!(s.volume, 0.0);
     }
 
     /// P0-24：UI 给的是 `#RRGGBB` + 不透明度，mpv 要 `#AARRGGBB`。

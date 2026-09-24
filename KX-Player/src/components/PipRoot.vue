@@ -33,7 +33,7 @@ const win = getCurrentWindow()
 // ── 播放状态 ──
 const state = ref<MpvPlayerState>({
   playing: false, position: 0, duration: 0, speed: 1, volume: 85, muted: false,
-  trackPath: null, videoActive: false, videoW: 0, videoH: 0,
+  trackPath: null, videoActive: false, videoW: 0, videoH: 0, generation: 0,
 })
 
 const title = computed(() => {

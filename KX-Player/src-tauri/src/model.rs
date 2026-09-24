@@ -227,6 +227,11 @@ pub struct PlayerState {
     pub video_w: f64,
     #[serde(default)]
     pub video_h: f64,
+    /// 加载代际（P0-5）：前端每次 `player_play` 自增一个数随命令带下来。
+    /// 状态广播带上它，前端才能认出「这是上一首的迟到状态」并丢弃。
+    /// Rust 侧只做单调记账（`max`），不生成代际。
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// 字幕样式（mpv sub-* 属性遥控）

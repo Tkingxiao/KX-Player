@@ -25,8 +25,9 @@ export interface EventSpecs {
   'scanner:fsChanged': null
   // ── 播放内核 ──
   'player:state': MpvPlayerState
-  'player:loading': null
-  'player:ended': { reason: string }
+  /** mpv 开始读新文件（StartFile）。带代际：上一首的迟到通知不许点亮新曲目的加载态 */
+  'player:loading': { generation: number }
+  'player:ended': { reason: string; generation: number }
   'player:error': { message: string }
   // ── 悬浮窗 ──
   'pip:shown': null

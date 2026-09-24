@@ -70,7 +70,7 @@
 | `player_apply_loudness_gain` | `trackLufs: Option<f64>`, `targetLufs: f64` | `null` | src-tauri/src/commands/player.rs |
 | `player_get_state` | — | `PlayerState` | src-tauri/src/commands/player.rs |
 | `player_list_devices` | — | `AudioDevice[]` | src-tauri/src/commands/player.rs |
-| `player_play` | `trackPath: String`, `resumeMs: Option<f64>`, `vol: Option<f64>`, `muted: Option<bool>`, `speed: Option<f64>`, `videoActive: Option<bool>` | `null` | src-tauri/src/commands/player.rs |
+| `player_play` | `trackPath: String`, `resumeMs: Option<f64>`, `vol: Option<f64>`, `muted: Option<bool>`, `speed: Option<f64>`, `videoActive: Option<bool>`, `generation: u64` | `null` | src-tauri/src/commands/player.rs |
 | `player_seek` | `sec: f64` | `null` | src-tauri/src/commands/player.rs |
 | `player_set_device` | `deviceId: String` | `boolean` | src-tauri/src/commands/player.rs |
 | `player_set_muted` | `muted: bool` | `null` | src-tauri/src/commands/player.rs |
@@ -164,9 +164,9 @@
 | `pip:pinned` | `boolean` | src-tauri/src/commands/player.rs | src/bridge/ipc.ts |
 | `pip:restored` | `null` | src-tauri/src/commands/player.rs | src/bridge/ipc.ts |
 | `pip:shown` | `null` | src-tauri/src/commands/player.rs | src/components/PipRoot.vue |
-| `player:ended` | `{ reason: string }` | src-tauri/src/player/mod.rs | src/components/PipRoot.vue<br>src/stores/player.ts |
+| `player:ended` | `{ reason: string; generation: number }` | src-tauri/src/player/mod.rs | src/components/PipRoot.vue<br>src/stores/player.ts |
 | `player:error` | `{ message: string }` | src-tauri/src/player/mod.rs | src/stores/player.ts |
-| `player:loading` | `null` | src-tauri/src/player/mod.rs | src/stores/player.ts |
+| `player:loading` | `{ generation: number }` | src-tauri/src/player/mod.rs | src/stores/player.ts |
 | `player:state` | `MpvPlayerState` | src-tauri/src/player/mod.rs | src/components/PipRoot.vue<br>src/stores/player.ts |
 | `scanner:fsChanged` | `null` | src-tauri/src/watcher.rs | src/bridge/ipc.ts |
 | `scanner:progress` | `{ completed: number; total: number }` | src-tauri/src/scanner/mod.rs | src/bridge/ipc.ts |

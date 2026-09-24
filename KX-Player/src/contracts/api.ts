@@ -157,6 +157,8 @@ export interface AppApi {
     muted?: boolean
     speed?: number
     videoActive?: boolean
+    /** 加载代际（P0-5）：调用方每次起播自增；状态/事件按它丢弃上一首的迟到消息 */
+    generation: number
   }) => Promise<void>
   playerToggle: (paused: boolean) => Promise<void>
   playerSeek: (sec: number) => Promise<void>

@@ -216,6 +216,7 @@ export const api: AppApi = {
       muted: opts.muted ?? false,
       speed: opts.speed ?? 1,
       videoActive: opts.videoActive ?? false,
+      generation: opts.generation,
     }),
   playerToggle: (paused) => invoke('player_toggle', { paused }),
   playerSeek: (sec) => invoke('player_seek', { sec }),
@@ -234,7 +235,7 @@ export const api: AppApi = {
     }).catch(() => false),
   playerGetState: () => invoke('player_get_state').catch(() => ({
     playing: false, position: 0, duration: 0, speed: 1, volume: 85, muted: false,
-    trackPath: null, videoActive: false, videoW: 0, videoH: 0,
+    trackPath: null, videoActive: false, videoW: 0, videoH: 0, generation: 0,
   })),
   pipOpen: (x, y, w, h) =>
     invoke('pip_open', { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) }).catch(() => false),

@@ -108,7 +108,7 @@ export interface CommandSpecs {
   player_apply_loudness_gain: { args: { trackLufs: number | null, targetLufs: number }, returns: void }
   player_get_state: { args: {}, returns: MpvPlayerState }
   player_list_devices: { args: {}, returns: AudioDevice[] }
-  player_play: { args: { trackPath: string, resumeMs: number | null, vol: number | null, muted: boolean | null, speed: number | null, videoActive: boolean | null }, returns: void }
+  player_play: { args: { trackPath: string, resumeMs: number | null, vol: number | null, muted: boolean | null, speed: number | null, videoActive: boolean | null, generation: number }, returns: void }
   player_seek: { args: { sec: number }, returns: void }
   player_set_device: { args: { deviceId: string }, returns: boolean }
   player_set_muted: { args: { muted: boolean }, returns: void }

@@ -10,6 +10,8 @@ use crate::state::AppWindowsState;
 
 /// 参数表就是 IPC 契约本身（`contracts/commands.ts` 的 `player_play.args` 一一对应），
 /// 收进结构体要同时改前端调用点与 `docs/IPC.md`，随 S3 一起做，这里先不凑数。
+/// `generation`（P0-5）必填：前端每次加载自增，Rust 只记账并随状态广播回传；
+/// 不给默认值——一个不带的调用方会让整条代际链悄悄失效。
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn player_play(
@@ -22,6 +24,7 @@ pub async fn player_play(
     muted: Option<bool>,
     speed: Option<f64>,
     video_active: Option<bool>,
+    generation: u64,
 ) -> IpcResult<()> {
     // P0-1：mpv 拿到的路径必须是授权范围内的。曲目路径来自库（扫描时登记的根目录之下），
     // 所以正常播放一条都不受影响；拦的是「前端自己编一条路径让 mpv 去开」。
@@ -37,6 +40,7 @@ pub async fn player_play(
         muted.unwrap_or(false),
         speed.unwrap_or(1.0).clamp(0.5, 2.0),
         video_active.unwrap_or(false),
+        generation,
     )
 }
 
