@@ -30,7 +30,6 @@
 | `read_text_file` | `path: String` | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `select_bg_image` | — | `BgImageData ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `show_item_in_folder` | `path: String` | `boolean` | src-tauri/src/commands/dialog_fs.rs |
-| `tools_save_file` | `path: String`, `base64Data: String` | `boolean` | src-tauri/src/commands/dialog_fs.rs |
 
 ## library
 

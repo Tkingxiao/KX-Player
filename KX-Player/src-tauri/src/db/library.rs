@@ -49,6 +49,19 @@ fn load_track_rows(conn: &Connection) -> Result<Vec<TrackRow>> {
     rows.collect()
 }
 
+/// 库里已登记的根目录（P0-1 的授权来路之一：这些是应用自己写进库的，不是前端递进来的）。
+/// 单独给一个轻入口，不为了拿根目录去 `load_snapshot` 一遍整库。
+pub fn folder_paths(db_path: &Path) -> Vec<String> {
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    with_db(db_path, |conn| {
+        initialize_schema(conn)?;
+        Ok(meta_string(conn, "folderPaths").and_then(|raw| serde_json::from_str(&raw).ok()).unwrap_or_default())
+    })
+    .unwrap_or_default()
+}
+
 fn meta_string(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row("SELECT value FROM library_meta WHERE key = ?1", [key], |r| r.get(0)).ok()
 }

@@ -15,6 +15,7 @@ use crate::state::AppWindowsState;
 pub async fn player_play(
     window: WebviewWindow,
     state: State<'_, PlayerCore>,
+    scope: State<'_, crate::scope::PathScope>,
     track_path: String,
     resume_ms: Option<f64>,
     vol: Option<f64>,
@@ -22,6 +23,12 @@ pub async fn player_play(
     speed: Option<f64>,
     video_active: Option<bool>,
 ) -> IpcResult<()> {
+    // P0-1：mpv 拿到的路径必须是授权范围内的。曲目路径来自库（扫描时登记的根目录之下），
+    // 所以正常播放一条都不受影响；拦的是「前端自己编一条路径让 mpv 去开」。
+    if let Err(why) = scope.resolve(&track_path) {
+        crate::paths::append_log(&format!("[scope] player_play 拒绝 {track_path}（{why}）"));
+        return Err(crate::error::IpcError::outside_scope(&track_path, why));
+    }
     state.ensure_started(&window)?;
     state.play_file(
         &track_path,

@@ -2,8 +2,9 @@
 //! 全部 async + spawn_blocking：Tauri 同步命令会在主线程执行，任何 IO 都可能卡住 UI。
 
 use crate::model::{Bookmark, PlayProgress, ScanResult};
-use std::path::PathBuf;
-use tauri::{AppHandle, State};
+use crate::scope::PathScope;
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Manager, State};
 
 use crate::state::AppWindowsState;
 
@@ -11,9 +12,21 @@ fn db_path() -> PathBuf {
     crate::paths::library_db_path()
 }
 
+/// 扫描/改名这类「一批路径」入口的统一闸门（P0-1）：整批都得在授权范围内。
+/// 授权来自对话框选中的文件夹与库里已登记的根目录 —— 前端换一条路径递进来，这里就把它拦下。
+fn guard_roots(app: &AppHandle, paths: &[String], cmd: &str) -> bool {
+    match app.state::<PathScope>().check_all(paths) {
+        Ok(()) => true,
+        Err((bad, why)) => {
+            crate::paths::append_log(&format!("[scope] {cmd} 拒绝整批：{bad}（{why:?}）"));
+            false
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn scan_folders(app: AppHandle, paths: Vec<String>) -> Option<ScanResult> {
-    if paths.is_empty() {
+    if paths.is_empty() || !guard_roots(&app, &paths, "scan_folders") {
         return None;
     }
     let app2 = app.clone();
@@ -26,7 +39,7 @@ pub async fn scan_folders(app: AppHandle, paths: Vec<String>) -> Option<ScanResu
 
 #[tauri::command]
 pub async fn scan_folders_incremental(app: AppHandle, paths: Vec<String>) -> Option<ScanResult> {
-    if paths.is_empty() {
+    if paths.is_empty() || !guard_roots(&app, &paths, "scan_folders_incremental") {
         return None;
     }
     let app2 = app.clone();
@@ -40,7 +53,7 @@ pub async fn scan_folders_incremental(app: AppHandle, paths: Vec<String>) -> Opt
 /// 启动用静默增量同步：无变更时不发 stage/progress 事件，避免 UI 闪出「构建音乐库」与转圈。
 #[tauri::command]
 pub async fn startup_sync(app: AppHandle, paths: Vec<String>) -> Option<ScanResult> {
-    if paths.is_empty() {
+    if paths.is_empty() || !guard_roots(&app, &paths, "startup_sync") {
         return None;
     }
     let app2 = app.clone();
@@ -53,12 +66,21 @@ pub async fn startup_sync(app: AppHandle, paths: Vec<String>) -> Option<ScanResu
 
 #[tauri::command]
 pub async fn remove_folder(app: AppHandle, folder_path: String, remaining_paths: Vec<String>) -> Option<ScanResult> {
+    // 被移除的这个根与留下来的那些都得是授权的：前者用来确认「确实是从曲库里摘的」，
+    // 后者是下一次扫描的输入（扫描本身也拦一道，这里是让失败更早、更明确）
+    if !guard_roots(&app, std::slice::from_ref(&folder_path), "remove_folder") || !guard_roots(&app, &remaining_paths, "remove_folder") {
+        return None;
+    }
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let removed = folder_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         Some(crate::scanner::remove_folder(&app2, &folder_path, &remaining_paths, &db_path()))
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or(None);
+    // 从库里摘掉的目录当场收权：留着的话，被移除的根在本次会话里仍然是可读的
+    let _ = app.state::<PathScope>().revoke_root(Path::new(&removed));
+    result
 }
 
 #[tauri::command]
@@ -91,7 +113,21 @@ pub async fn get_track_covers(track_ids: Vec<String>) -> std::collections::HashM
 }
 
 #[tauri::command]
-pub async fn get_folder_covers(folder_paths: Vec<String>) -> std::collections::HashMap<String, String> {
+pub async fn get_folder_covers(app: AppHandle, folder_paths: Vec<String>) -> std::collections::HashMap<String, String> {
+    // 逐条筛：这个命令会**按参数指定的目录**去找封面图，路径必须落在授权根里。
+    // 这里不整批拒 —— 一条离线盘上的目录不该让整屏封面都不出来（扫描/改名那两处是整批拒，
+    // 因为它们是「要么全做要么不做」的语义）。
+    let scope = app.state::<PathScope>();
+    let folder_paths: Vec<String> = folder_paths
+        .into_iter()
+        .filter(|p| {
+            let ok = scope.allows(p);
+            if !ok {
+                crate::paths::append_log(&format!("[scope] get_folder_covers 跳过 {p}（Outside）"));
+            }
+            ok
+        })
+        .collect();
     tauri::async_runtime::spawn_blocking(move || {
         let mut out = std::collections::HashMap::new();
         for p in folder_paths {
@@ -141,9 +177,21 @@ static LOUDNESS_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// 任务 + 事件模式（红线条款：长任务不得同步阻塞 IPC）。
 /// 事件 `loudness:progress`：{ completed, total, current, done, failed, finished, cancelled }
 #[tauri::command]
-pub fn analyze_loudness(app: AppHandle, tracks: Vec<(String, String)>) -> bool {
+pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec<(String, String)>) -> bool {
     use std::sync::atomic::Ordering;
     use tauri::Emitter;
+    // 逐条筛（P0-1）：这条链路会拿参数里的路径去喂 ffmpeg 读文件。离线盘上的条目会被
+    // `resolve` 判不可解析 —— 与「路径本来就读不到」是同一个结局，不该因此拖垮整批
+    let tracks: Vec<(String, String)> = tracks
+        .into_iter()
+        .filter(|(_, path)| {
+            let ok = scope.resolve(path).is_ok();
+            if !ok {
+                crate::paths::append_log(&format!("[scope] analyze_loudness 跳过 {path}"));
+            }
+            ok
+        })
+        .collect();
     if tracks.is_empty() {
         return false;
     }
@@ -287,7 +335,18 @@ pub async fn remove_bookmark(id: String) -> bool {
 }
 
 #[tauri::command]
-pub fn start_watching(paths: Vec<String>, state: State<'_, AppWindowsState>) -> bool {
+pub fn start_watching(paths: Vec<String>, scope: State<'_, PathScope>, state: State<'_, AppWindowsState>) -> bool {
+    // 逐条筛（P0-1）：监听器只该挂在授权根上；离线盘的根解析不出来，本来也盯不住
+    let paths: Vec<String> = paths
+        .into_iter()
+        .filter(|p| {
+            let ok = scope.allows(p);
+            if !ok {
+                crate::paths::append_log(&format!("[scope] start_watching 跳过 {p}"));
+            }
+            ok
+        })
+        .collect();
     crate::watcher::start(&paths, state.watcher.clone());
     true
 }

@@ -78,6 +78,12 @@ impl IpcError {
         Self::new(AppErrorCode::InvalidArgument, message)
     }
 
+    /// 路径不在授权范围（P0-1）：`message` 给用户看，`detail` 记是哪一条路径、为什么
+    /// （`Denied` 的 `Display` 就是那句「为什么」）。
+    pub fn outside_scope(path: &str, why: impl Display) -> Self {
+        Self::with_detail(AppErrorCode::PermissionDenied, "路径不在已授权的范围内", format!("{path}（{why}）"))
+    }
+
     /// `PlayerCore` 的句柄还没建起来就收到播放指令。与「mpv 初始化失败」同码，
     /// 因为对用户的处置一样：重新触发一次起播。
     pub fn mpv_not_started() -> Self {

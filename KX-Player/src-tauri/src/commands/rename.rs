@@ -22,6 +22,17 @@ use crate::rename::batch::Batch;
 use crate::rename::judge::Skipped;
 use crate::rename::preview::Preview;
 use crate::rename::report::Report;
+use crate::scope::PathScope;
+
+/// 三条会走盘的入口共用的闸门（P0-1）：目录必须落在授权根里。
+/// 授权只有两个来路 —— 对话框选中的文件夹、库里已登记的根目录；前端换一条路径递进来，
+/// 这里给 `INVALID_ARGUMENT`（`PermissionDenied` 那条码留给「命令自己能读、但对象不该被碰」的场景）。
+fn guard_scope(scope: &PathScope, paths: &[String]) -> IpcResult<()> {
+    scope.check_all(paths).map_err(|(bad, why)| {
+        crate::paths::append_log(&format!("[scope] 改名拒绝 {bad}（{why}）"));
+        IpcError::outside_scope(&bad, why)
+    })
+}
 
 /// 改名干跑预览：把选中的目录各往下看一层，返回档位分布 + 会变动的条目 + 冲突。
 /// **一个字节都不写**：只 `read_dir` 加读一次译名库（给已经问到、且没被拒过的名字盖章），
@@ -32,10 +43,11 @@ use crate::rename::report::Report;
 /// 这里给的就是 `apply` 后来会用的那条判据（被拒过**那个名字**才跳过），预览列出的档位因此
 /// 与落地做的事对得上 —— 不会出现「预览说跳过、落地照改名」。
 #[tauri::command]
-pub async fn rename_preview(paths: Vec<String>) -> IpcResult<Preview> {
+pub async fn rename_preview(scope: tauri::State<'_, PathScope>, paths: Vec<String>) -> IpcResult<Preview> {
     if paths.is_empty() {
         return Err(IpcError::invalid_argument("没有选中要预览的目录"));
     }
+    guard_scope(&scope, &paths)?;
     join_task(
         "预览改名",
         tauri::async_runtime::spawn_blocking(move || {
@@ -54,10 +66,11 @@ pub async fn rename_preview(paths: Vec<String>) -> IpcResult<Preview> {
 /// 应用这一批已经定稿的改名。返回值里的 `applied` 才是真改了多少条 ——
 /// `planned` 是队列长度，`skipped` 是「模型译名还没生成 / 撞名」而**这一批没替用户做**的条数。
 #[tauri::command]
-pub async fn rename_apply(paths: Vec<String>) -> IpcResult<Report> {
+pub async fn rename_apply(scope: tauri::State<'_, PathScope>, paths: Vec<String>) -> IpcResult<Report> {
     if paths.is_empty() {
         return Err(IpcError::invalid_argument("没有选中要应用的目录"));
     }
+    guard_scope(&scope, &paths)?;
     join_task(
         "应用改名",
         tauri::async_runtime::spawn_blocking(move || in_db(|conn| crate::rename::apply::apply(conn, &paths)))
@@ -73,6 +86,7 @@ pub async fn rename_apply(paths: Vec<String>) -> IpcResult<Report> {
 /// 代价是这一条没有取消按钮，所以 `ai_ledger::MAX_NAMES` 把一次的上限压到 200 个名字。
 #[tauri::command]
 pub async fn rename_suggest_names(
+    scope: tauri::State<'_, PathScope>,
     paths: Vec<String>,
     base_url: String,
     api_key: String,
@@ -82,6 +96,7 @@ pub async fn rename_suggest_names(
     if paths.is_empty() {
         return Err(IpcError::invalid_argument("没有选中要生成译名的目录"));
     }
+    guard_scope(&scope, &paths)?;
     let kind = model_kind.unwrap_or_default();
     let plan = join_task(
         "清点待生成译名",

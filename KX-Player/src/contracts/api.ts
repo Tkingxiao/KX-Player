@@ -83,7 +83,6 @@ export interface AppApi {
   removeBgImage: () => Promise<boolean>
   /** 启动自检（P0-64）降级提示：取一次即清空，用于首屏 Toast */
   startupWarnings: () => Promise<string[]>
-  toolsSaveFile: (p: string, b64: string) => Promise<boolean>
   ffmpegExec: (args: string[]) => Promise<ExecResult>
   /** ffmpeg 可用性探测（转换页据此降级显示） */
   ffmpegProbe: () => Promise<FfmpegInfo>

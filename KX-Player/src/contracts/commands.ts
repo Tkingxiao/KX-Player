@@ -56,7 +56,6 @@ export interface CommandSpecs {
   read_text_file: { args: { path: string }, returns: string | null }
   select_bg_image: { args: {}, returns: BgImageData | null }
   show_item_in_folder: { args: { path: string }, returns: boolean }
-  tools_save_file: { args: { path: string, base64Data: string }, returns: boolean }
 
   // ── 曲库、进度、书签、分类与标签（commands/library.rs）──
   add_bookmark: { args: { trackId: string, atMs: number, label: string }, returns: Bookmark | null }

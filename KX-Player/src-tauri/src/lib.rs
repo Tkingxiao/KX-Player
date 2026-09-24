@@ -20,6 +20,7 @@ mod paths;
 mod player;
 mod rename;
 mod scanner;
+mod scope;
 mod settingsio;
 mod state;
 mod subtitles;
@@ -56,10 +57,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             scanner::covers::load_folder_cover_map();
             bgimage::migrate_oversized();
 
-            // asset 协议范围：封面目录 + 数据目录（背景图）
-            let scope = app.asset_protocol_scope();
-            let _ = scope.allow_directory(paths::covers_dir(), true);
-            let _ = scope.allow_directory(paths::data_dir(), true);
+            // asset 协议范围：封面目录（含子目录）+ 背景图这一个文件。
+            // 原来整个数据目录都放开了，等于把曲库 SQLite、设置与日志一并交给 WebView 去 fetch ——
+            // 它们各自有命令可读，不需要再开一条不经过命令层的口子。
+            let asset = app.asset_protocol_scope();
+            let _ = asset.allow_directory(paths::covers_dir(), true);
+            let _ = asset.allow_file(paths::bg_image_path());
+
+            // P0-1 路径能力：授权的三个来路在这里登记两个，第三个是原生对话框（commands::dialog_fs）
+            let scope = scope::PathScope::new();
+            scope.allow_root(&paths::covers_dir());
+            scope.allow_root(&paths::data_dir());
+            for root in db::library::folder_paths(&paths::library_db_path()) {
+                scope.allow_root(std::path::Path::new(&root));
+            }
+            app.manage(scope);
 
             state::set_app_handle(app.handle().clone());
             app.manage(AppWindowsState::new());
@@ -151,7 +163,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::dialog_fs::read_text_file,
             commands::dialog_fs::file_exists,
             commands::dialog_fs::list_dir,
-            commands::dialog_fs::tools_save_file,
             commands::dialog_fs::clipboard_write_text,
             commands::dialog_fs::show_item_in_folder,
             commands::library::scan_folders,

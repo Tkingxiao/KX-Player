@@ -1,26 +1,48 @@
 //! 命令层：对话框与文件系统。
+//!
+//! 对话框是**唯一**的授权来路（P0-1）：用户在原生对话框里点出来的路径当场登记进
+//! [`PathScope`]，之后 `read_*` / `file_exists` / `list_dir` / `show_item_in_folder`
+//! 才认它；前端直接递进来的路径一律先过 [`PathScope::resolve`]，过不了就当没这回事
+//! （返回类型不变，拒绝写日志 —— 改成错误信封是 P1-6 那一批的事）。
 
 use base64::Engine;
-use tauri::AppHandle;
+use std::path::Path;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
+
+use crate::scope::PathScope;
+
+/// 被拒的调用留一条记录：不写的话，前端只会看到「读不到」，排查时分不清是路径不对还是权限不对
+fn deny(cmd: &str, path: &str, why: crate::scope::Denied) {
+    crate::paths::append_log(&format!("[scope] {cmd} 拒绝 {path}（{why:?}）"));
+}
 
 #[tauri::command]
 pub async fn open_folder(app: AppHandle) -> Option<Vec<String>> {
-    tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
+    let app2 = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app2.dialog()
             .file()
             .set_title("选择音乐文件夹")
             .blocking_pick_folder()
             .map(|p| vec![p.to_string()])
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or(None);
+    if let Some(paths) = &picked {
+        let scope = app.state::<PathScope>();
+        for p in paths {
+            let _ = scope.allow_root(Path::new(p));
+        }
+    }
+    picked
 }
 
 #[tauri::command]
 pub async fn open_image_file(app: AppHandle) -> Option<String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
+    let app2 = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app2.dialog()
             .file()
             .set_title("选择图片")
             .add_filter("图片", &["png", "jpg", "jpeg", "bmp", "webp", "gif"])
@@ -28,13 +50,18 @@ pub async fn open_image_file(app: AppHandle) -> Option<String> {
             .map(|p| p.to_string())
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or(None);
+    if let Some(p) = &picked {
+        let _ = app.state::<PathScope>().allow_file(Path::new(p));
+    }
+    picked
 }
 
 #[tauri::command]
 pub async fn open_audio_files(app: AppHandle) -> Vec<String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
+    let app2 = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app2.dialog()
             .file()
             .set_title("选择音频/视频")
             .add_filter(
@@ -42,28 +69,39 @@ pub async fn open_audio_files(app: AppHandle) -> Vec<String> {
                 &["mp3", "flac", "wav", "ogg", "m4a", "aac", "wma", "opus", "ape", "wv", "aiff", "mp4", "mkv", "avi", "mov", "webm", "flv", "wmv"],
             )
             .blocking_pick_files()
-            .map(|list| list.iter().map(|p| p.to_string()).collect())
+            .map(|list| list.iter().map(|p| p.to_string()).collect::<Vec<_>>())
             .unwrap_or_default()
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    let scope = app.state::<PathScope>();
+    for p in &picked {
+        let _ = scope.allow_file(Path::new(p));
+    }
+    picked
 }
 
 /// AI-16 导入用的多选文本框：一批可以拆给几台机器跑，导回来合并（对齐靠序号，不靠顺序）。
 /// 与 `open_audio_files` 同口径：取消就是空数组，不用错误信封。
 #[tauri::command]
 pub async fn open_text_files(app: AppHandle) -> Vec<String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
+    let app2 = app.clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app2.dialog()
             .file()
             .set_title("选择译文文件")
             .add_filter("文本", &["txt"])
             .blocking_pick_files()
-            .map(|list| list.iter().map(|p| p.to_string()).collect())
+            .map(|list| list.iter().map(|p| p.to_string()).collect::<Vec<_>>())
             .unwrap_or_default()
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    let scope = app.state::<PathScope>();
+    for p in &picked {
+        let _ = scope.allow_file(Path::new(p));
+    }
+    picked
 }
 
 #[tauri::command]
@@ -76,6 +114,7 @@ pub async fn select_bg_image(app: AppHandle) -> Option<crate::model::BgImageData
             .add_filter("图片文件", &["jpg", "jpeg", "png", "bmp", "webp", "gif"])
             .blocking_pick_file()?;
         let path = picked.to_string();
+        // 路径来自上面的对话框，不经过前端；落盘目标固定是数据目录，不需要再走 [PathScope]
         crate::bgimage::select_and_save(&path)
     })
     .await
@@ -83,9 +122,16 @@ pub async fn select_bg_image(app: AppHandle) -> Option<crate::model::BgImageData
 }
 
 #[tauri::command]
-pub fn read_as_data_url(path: String) -> Option<String> {
+pub fn read_as_data_url(scope: tauri::State<'_, PathScope>, path: String) -> Option<String> {
+    let path = match scope.resolve(&path) {
+        Ok(p) => p,
+        Err(why) => {
+            deny("read_as_data_url", &path, why);
+            return None;
+        }
+    };
     let bytes = std::fs::read(&path).ok()?;
-    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let mime = match ext.as_str() {
         "jpg" | "jpeg" => "jpeg",
         "png" => "png",
@@ -98,7 +144,14 @@ pub fn read_as_data_url(path: String) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn read_text_file(path: String) -> Option<String> {
+pub fn read_text_file(scope: tauri::State<'_, PathScope>, path: String) -> Option<String> {
+    let path = match scope.resolve(&path) {
+        Ok(p) => p,
+        Err(why) => {
+            deny("read_text_file", &path, why);
+            return None;
+        }
+    };
     let bytes = std::fs::read(&path).ok()?;
     // BOM 处理
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -135,9 +188,15 @@ pub fn read_text_file(path: String) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// 存在性探测：**放行范围**先判，再看盘上有没有 —— 不许用它当目录探针
+/// （「根外有没有 X 这个文件」本身也是信息）。
 #[tauri::command]
-pub fn file_exists(path: String) -> bool {
-    std::path::Path::new(&path).exists()
+pub fn file_exists(scope: tauri::State<'_, PathScope>, path: String) -> bool {
+    if !scope.allows(&path) {
+        deny("file_exists", &path, crate::scope::Denied::Outside);
+        return false;
+    }
+    Path::new(&path).exists()
 }
 
 #[derive(serde::Serialize)]
@@ -149,8 +208,15 @@ pub struct DirEntryInfo {
 }
 
 #[tauri::command]
-pub fn list_dir(path: String) -> Vec<DirEntryInfo> {
-    match std::fs::read_dir(&path) {
+pub fn list_dir(scope: tauri::State<'_, PathScope>, path: String) -> Vec<DirEntryInfo> {
+    let path = match scope.resolve(&path) {
+        Ok(p) => p,
+        Err(why) => {
+            deny("list_dir", &path, why);
+            return vec![];
+        }
+    };
+    match std::fs::read_dir(path) {
         Ok(entries) => entries
             .flatten()
             .map(|e| DirEntryInfo {
@@ -161,18 +227,6 @@ pub fn list_dir(path: String) -> Vec<DirEntryInfo> {
             .collect(),
         Err(_) => vec![],
     }
-}
-
-#[tauri::command]
-pub fn tools_save_file(path: String, base64_data: String) -> bool {
-    let bytes = match base64::engine::general_purpose::STANDARD.decode(&base64_data) {
-        Ok(b) => b,
-        Err(e) => {
-            crate::paths::append_log(&format!("[tools:saveFile] 解码失败: {e}"));
-            return false;
-        }
-    };
-    std::fs::write(&path, bytes).is_ok()
 }
 
 #[tauri::command]
@@ -206,7 +260,7 @@ fn set_clipboard_win(text: &str) -> bool {
             if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
                 windows_sys::Win32::System::Memory::GlobalUnlock(handle);
-                if !windows_sys::Win32::System::DataExchange::SetClipboardData(
+                if windows_sys::Win32::System::DataExchange::SetClipboardData(
                     13, // CF_UNICODETEXT
                     handle as _,
                 )
@@ -231,8 +285,12 @@ fn set_clipboard_win(text: &str) -> bool {
 /// 不需要 reactor，也就不该因为取不到运行时（`fftools::runtime()` 失败）而误报 false。
 /// 含空格的路径由 `Command` 按 CreateProcess 规则补引号，explorer 能正确解析。
 #[tauri::command]
-pub fn show_item_in_folder(path: String) -> bool {
+pub fn show_item_in_folder(scope: tauri::State<'_, PathScope>, path: String) -> bool {
     if path.is_empty() {
+        return false;
+    }
+    if !scope.allows(&path) {
+        deny("show_item_in_folder", &path, crate::scope::Denied::Outside);
         return false;
     }
     #[cfg(windows)]

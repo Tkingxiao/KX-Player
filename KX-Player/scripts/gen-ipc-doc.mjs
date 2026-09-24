@@ -81,8 +81,14 @@ function moduleOf(file) {
   return parts[parts.length - 1]
 }
 
-/** Tauri 自己注入的参数，不是前端要传的。 */
-const INJECTED = new Set(['app', 'window', 'webview', 'state', 'manager', 'resolver', 'uri_scheme', 'window_label'])
+/**
+ * Tauri 自己注入的参数，不是前端要传的。
+ * 判据是**类型**而不是形参名：注入与否由 Tauri 在调用时按类型决定，`State<'_, PathScope>`
+ * 叫 `scope` 还是 `state` 都是注入；反过来，真有前端实参叫 `app`/`window` 时，
+ * 按名字白名单会把它静默漏检 —— 按类型不会。
+ */
+const INJECTED_TYPE =
+  /^(?:&(?:'[a-z]+\s*)?)?(?:tauri::)?(?:AppHandle|WebviewWindow|Webview|Window|State|PathResolver|UriSchemeContext)\s*(?:<|$)/
 
 /**
  * 抓 `#[tauri::command]` 之后那个 fn。签名常跨行，先按括号配平往下吃，
@@ -107,7 +113,7 @@ function rustCommands() {
       const close = matchClose(sig, open, '(', ')')
       if (close < 0) continue
       const params = splitTop(sig.slice(open + 1, close))
-        .filter((p) => !INJECTED.has(p.split(':')[0].trim()))
+        .filter((p) => !INJECTED_TYPE.test(p.split(/:(.+)/)[1]?.trim() ?? ''))
         .map((p) => {
           const [rust, type] = p.split(/:(.+)/).map((s) => s.trim())
           return { rust, ts: toCamel(rust), type: type ?? '', optional: /^Option</.test(type ?? '') }

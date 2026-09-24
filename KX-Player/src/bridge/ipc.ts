@@ -133,7 +133,6 @@ export const api: AppApi = {
   saveBgImage: (d) => invoke('save_bg_image', { dataUrl: d }),
   removeBgImage: () => invoke('remove_bg_image'),
   startupWarnings: () => invoke('startup_warnings'),
-  toolsSaveFile: (p, b) => invoke('tools_save_file', { path: p, base64Data: b }),
   ffmpegExec: (a) => invoke('ffmpeg_exec', { args: a }),
   ffmpegProbe: () =>
     invoke('ffmpeg_probe').catch(() => ({ available: false, path: null, version: null })),
