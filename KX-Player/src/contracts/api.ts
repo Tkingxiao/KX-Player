@@ -76,7 +76,8 @@ export interface AppApi {
   onBeforeClose: (cb: () => void) => () => void
   startWatching: (paths: string[]) => Promise<boolean>
   stopWatching: () => Promise<boolean>
-  onFsChanged: (cb: () => void) => () => void
+  /** 曲库根下有媒体文件变化；参数是这一批的脏路径（已去重，最多 1024 条） */
+  onFsChanged: (cb: (dirtyPaths: string[]) => void) => () => void
   loadBgImage: () => Promise<BgImageData | null>
   saveBgImage: (dataUrl: string) => Promise<boolean>
   removeBgImage: () => Promise<boolean>

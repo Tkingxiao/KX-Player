@@ -22,7 +22,7 @@ export interface EventSpecs {
   // ── 扫描 ──
   'scanner:progress': { completed: number; total: number }
   'scanner:stage': string
-  'scanner:fsChanged': null
+  'scanner:fsChanged': string[]
   // ── 播放内核 ──
   'player:state': MpvPlayerState
   /** mpv 开始读新文件（StartFile）。带代际：上一首的迟到通知不许点亮新曲目的加载态 */

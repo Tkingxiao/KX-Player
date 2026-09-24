@@ -269,7 +269,7 @@ db::* / scanner::* / player::PlayerCore / fftools::* / taxonomy::* / ai::*
 | `player:error` | `{ message }` | player/mod.rs:576 | stores/player.ts |
 | `scanner:progress` | `{ completed, total }` | scanner/mod.rs:87 | App.vue:151 → library store |
 | `scanner:stage` | `string` | scanner/mod.rs:91 | App.vue:155 |
-| `scanner:fsChanged` | `null` | watcher.rs:35 | App.vue:159 |
+| `scanner:fsChanged` | `string[]`（这一批的脏路径，去重、最多 1024 条） | watcher.rs（单 debounce worker） | App.vue:170 |
 | `convert:progress` | `{...}`（7 处发） | fftools.rs:285-336 | convert 视图 |
 | `window:beforeClose` | `null` | lib.rs:262、system.rs:80、player.rs:184 | App.vue:169（落盘设置） |
 | `window:maximizeChange` | `boolean` | lib.rs:108 | TitleBar |

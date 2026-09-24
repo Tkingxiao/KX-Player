@@ -1,6 +1,7 @@
 //! 命令层：曲库/扫描/封面/进度/书签/文件监听。
 //! 全部 async + spawn_blocking：Tauri 同步命令会在主线程执行，任何 IO 都可能卡住 UI。
 
+use crate::error::IpcResult;
 use crate::model::{Bookmark, PlayProgress, ScanResult};
 use crate::scope::PathScope;
 use std::path::{Path, PathBuf};
@@ -335,7 +336,7 @@ pub async fn remove_bookmark(id: String) -> bool {
 }
 
 #[tauri::command]
-pub fn start_watching(paths: Vec<String>, scope: State<'_, PathScope>, state: State<'_, AppWindowsState>) -> bool {
+pub fn start_watching(paths: Vec<String>, scope: State<'_, PathScope>, state: State<'_, AppWindowsState>) -> IpcResult<bool> {
     // 逐条筛（P0-1）：监听器只该挂在授权根上；离线盘的根解析不出来，本来也盯不住
     let paths: Vec<String> = paths
         .into_iter()
@@ -347,8 +348,17 @@ pub fn start_watching(paths: Vec<String>, scope: State<'_, PathScope>, state: St
             ok
         })
         .collect();
-    crate::watcher::start(&paths, state.watcher.clone());
-    true
+    // 挂不上的根（离线盘/目录不存在）逐条记日志，命令层如实回 false —— 不再无条件报成功
+    let failed = crate::watcher::start(&paths, &state.watcher)?;
+    if !failed.is_empty() {
+        crate::paths::append_log(&format!(
+            "[watcher] start_watching 有 {}/{} 个根没挂上：{}",
+            failed.len(),
+            paths.len(),
+            failed.join("、")
+        ));
+    }
+    Ok(failed.is_empty())
 }
 
 #[tauri::command]

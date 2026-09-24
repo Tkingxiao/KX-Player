@@ -168,7 +168,7 @@
 | `player:error` | `{ message: string }` | src-tauri/src/player/mod.rs | src/stores/player.ts |
 | `player:loading` | `{ generation: number }` | src-tauri/src/player/mod.rs | src/stores/player.ts |
 | `player:state` | `MpvPlayerState` | src-tauri/src/player/mod.rs | src/components/PipRoot.vue<br>src/stores/player.ts |
-| `scanner:fsChanged` | `null` | src-tauri/src/watcher.rs | src/bridge/ipc.ts |
+| `scanner:fsChanged` | `string[]` | src-tauri/src/watcher.rs | src/bridge/ipc.ts |
 | `scanner:progress` | `{ completed: number; total: number }` | src-tauri/src/scanner/mod.rs | src/bridge/ipc.ts |
 | `scanner:stage` | `string` | src-tauri/src/scanner/mod.rs | src/bridge/ipc.ts |
 | `window:beforeClose` | `null` | src-tauri/src/commands/player.rs<br>src-tauri/src/commands/system.rs<br>src-tauri/src/lib.rs | src/bridge/ipc.ts |
