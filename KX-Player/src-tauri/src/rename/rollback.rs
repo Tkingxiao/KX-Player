@@ -12,6 +12,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::rename::batch::{self, Pair};
+use crate::rename::journal;
 use crate::rename::paths::{move_one, parents_of, resolve, sort_pairs};
 use crate::rename::report::{sync, undo, Report};
 
@@ -40,6 +41,13 @@ fn reverse(conn: &Connection, batch_id: &str, forward: bool) -> Result<Report, S
     // 重做就是再应用一遍，顺序与 `04 §7.7` 相同（深目录先）；回滚把方向反过来：**文件夹自顶向下
     // 先回，文件最后回**，这样每一行动手时它存的两端都是**当时真实**的路径。
     sort_pairs(&mut pairs, !forward);
+
+    // 反向执行同样会真实搬文件，同样先落意图（P1-11）。history 的根用**计划**的全集而不是
+    // 只成功的那几条 —— 恢复时手里只有 intent 里这一份，两边算了不同的根，`history::locate`
+    // 就可能一边写得进、一边写不进。
+    let roots = parents_of(&pairs);
+    let dir = if forward { journal::REDO } else { journal::ROLLBACK };
+    journal::write(&journal::Intent::new(batch_id, dir, &pairs, &roots))?;
 
     let mut rep = Report::new(batch_id.to_string(), pairs.len(), 0);
     let mut moved: Vec<(String, String)> = Vec::new();
@@ -82,7 +90,9 @@ fn reverse(conn: &Connection, batch_id: &str, forward: bool) -> Result<Report, S
         rep.failed.len()
     );
     batch::mark_rolled_back(conn, batch_id, !forward, &note)?;
-    let roots = parents_of(&done);
-    sync(&mut rep, &roots, &done, true);
+    // history 欠着就不收意图：留着它，下一次启动只补这一步（补账是幂等的）
+    if sync(&mut rep, &roots, &done, true) {
+        journal::clear(batch_id);
+    }
     Ok(rep)
 }

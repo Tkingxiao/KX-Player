@@ -16,6 +16,7 @@ pub mod ai_name;
 pub mod apply;
 pub mod batch;
 pub mod history;
+pub mod journal;
 pub mod judge;
 pub mod listing;
 pub mod norm;

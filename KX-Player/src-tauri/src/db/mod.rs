@@ -4,7 +4,7 @@ pub mod library;
 pub mod migrations;
 pub mod progress;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -124,7 +124,15 @@ fn backup_once(path: &Path) {
 /// 判据是纯函数式的（只改 `id != uuid5(path)` 的行），所以每次启动都可以调用，
 /// 迁完第二次即空操作，无需版本标记。封面文件名与 settings 里的
 /// `recents/favs/pls` 一起改，否则进度、书签、收藏与缓存会集体失联。
+///
+/// 跨三处（曲库事务 + 封面文件 + 设置），所以**动手之前先落意图**（P1-11）：事务提交那一刻
+/// `legacy_id_map` 就再也问不出旧 ID 了，崩在提交之后的下一次启动只会看到「没有要迁的」。
 pub fn migrate_legacy_ids(db_path: &Path, settings_path: &Path) -> usize {
+    migrate_legacy_ids_in(db_path, settings_path, &crate::journal::dir())
+}
+
+/// 意图文件放哪儿由调用方给（生产的那个入口在 [`migrate_legacy_ids`]，测试往临时目录里摆）。
+fn migrate_legacy_ids_in(db_path: &Path, settings_path: &Path, jdir: &Path) -> usize {
     if !db_path.exists() {
         return 0;
     }
@@ -136,34 +144,163 @@ pub fn migrate_legacy_ids(db_path: &Path, settings_path: &Path) -> usize {
             return 0;
         }
     };
+    // 封面要动哪些先问清楚（只读）。放在事务之前是为了能写进意图 —— 事务之后再问，
+    // `tracks.id` 已经是新的，旧 ID 一条也查不出来。
+    let covers = match with_db(db_path, |conn| cover_rewrites(conn, &map)) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::paths::append_log(&format!("id 迁移中止：读取封面路径失败 {e}"));
+            return 0;
+        }
+    };
+    let intent = LegacyIntent {
+        map: map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        covers: covers
+            .iter()
+            .filter(|c| c.present)
+            .map(|c| (c.from.to_string_lossy().into_owned(), c.to.to_string_lossy().into_owned()))
+            .collect(),
+    };
+    if let Err(e) = write_legacy_intent(jdir, &intent) {
+        // 写不下意图就不迁：这三处没有共同的事务，没有线索的迁移崩了一半只能靠人猜
+        crate::paths::append_log(&format!("id 迁移中止（数据未改动）：{e}"));
+        return 0;
+    }
     checkpoint(db_path);
     backup_once(db_path);
     backup_once(settings_path);
 
-    let renames = match with_db(db_path, |conn| {
+    if let Err(e) = with_db(db_path, |conn| {
         // 改写期间必须关掉外键：子表先指向新 ID 时，tracks 的主键还是旧 ID。
         // 而 `PRAGMA foreign_keys` 在事务内是空操作，只能放在开启事务之前。
         conn.execute_batch("PRAGMA foreign_keys=OFF")?;
-        let applied = apply_id_map(conn, &map);
+        let applied = apply_id_map(conn, &map, &covers);
         conn.execute_batch("PRAGMA foreign_keys=ON")?;
         applied
     }) {
-        Ok(r) => r,
-        Err(e) => {
-            crate::paths::append_log(&format!("id 迁移中止（数据未改动，备份见 *.pre-uuid5）：{e}"));
-            return 0;
+        crate::paths::append_log(&format!("id 迁移中止（数据未改动，备份见 *.pre-uuid5）：{e}"));
+        return 0;
+    }
+    for c in covers.iter().filter(|c| c.present) {
+        // 不覆盖：新名字上已经有文件（多半是重扫又生成了一张）就跳过，留给人看
+        if let Err(e) = crate::rename::paths::move_one(&c.from.to_string_lossy(), &c.to.to_string_lossy()) {
+            crate::paths::append_log(&format!("封面改名失败：{}（{e}）", c.from.display()));
         }
-    };
-    for (old, new) in renames {
-        let _ = std::fs::rename(&old, &new);
     }
     remap_settings_ids(settings_path, &map);
+    remove_legacy_intent(jdir);
     map.len()
 }
 
+/// 旧 ID 迁移的意图文件（P1-11）。事务提交之后崩掉的话，`legacy_id_map` 再也问不出旧 ID，
+/// 封面永远搬不过去、设置永远指不到新条目 —— 这份文件就是那条唯一的线索。
+const LEGACY_INTENT: &str = "legacy-ids.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyIntent {
+    /// 旧 ID → 新 ID：settings 里以条目 ID 寻址的三处按它改写
+    map: HashMap<String, String>,
+    /// 要跟着改名的封面（旧路径, 新路径）；只收此刻真的在盘上的
+    covers: Vec<(String, String)>,
+}
+
+fn write_legacy_intent(jdir: &Path, intent: &LegacyIntent) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(intent).map_err(|e| format!("序列化失败：{e}"))?;
+    crate::journal::put(jdir, LEGACY_INTENT, &body)
+}
+
+fn remove_legacy_intent(jdir: &Path) {
+    crate::journal::remove(jdir, LEGACY_INTENT);
+}
+
+/// 上一次旧 ID 迁移没做完的补偿（P1-11）。`None` = 没有未完成的迁移。
+pub fn recover_legacy_ids(settings_path: &Path) -> Option<String> {
+    recover_legacy_ids_in(&crate::journal::dir(), settings_path)
+}
+
+/// 与改名的恢复不同，这一步**会动盘**：封面是应用自己管的文件（名字就是条目 ID），
+/// 用户不会去改它，而放着不搬的后果是「封面全没了」。判据只有「旧名在、新名不在」这一条，
+/// 新名已经在就绝不覆盖。两件活都是幂等的（搬过了就不再搬、值已经是新 ID 不算改动），
+/// 所以跑几遍和跑一遍一样。
+fn recover_legacy_ids_in(jdir: &Path, settings_path: &Path) -> Option<String> {
+    let path = jdir.join(LEGACY_INTENT);
+    if !path.is_file() {
+        return None;
+    }
+    let intent: LegacyIntent = match crate::journal::read(&path)
+        .and_then(|t| serde_json::from_str(&t).map_err(|e| format!("解析失败：{e}")))
+    {
+        Ok(v) => v,
+        Err(e) => return Some(format!("意图文件读不出来（{e}），未做任何改动")),
+    };
+
+    let (mut moved, mut nothing, mut retry) = (0usize, 0usize, Vec::new());
+    let mut conflicts = Vec::new();
+    for (old, new) in &intent.covers {
+        match (Path::new(old).is_file(), Path::new(new).exists()) {
+            (true, false) => match crate::rename::paths::move_one(old, new) {
+                Ok(()) => moved += 1,
+                Err(e) => retry.push(format!("{old}：{e}")),
+            },
+            (false, true) => nothing += 1, // 上一次恢复到一半又崩：这条已经搬过了
+            (true, true) => conflicts.push(format!("{old}：新名 {new} 已被占用，未覆盖")),
+            (false, false) => nothing += 1,
+        }
+    }
+    let n = intent.map.len();
+    remap_settings_ids(settings_path, &intent.map);
+    let mut line = format!(
+        "封面补搬 {moved} 个 · 无需搬 {nothing} 个 · 说不清 {} 个 · 设置按 {n} 条映射重写",
+        conflicts.len()
+    );
+    if !retry.is_empty() {
+        // 搬不动是暂时性的（占用/权限），意图留着下次启动再试
+        line.push_str(&format!("；{} 个没搬成：{}", retry.len(), retry.join(" | ")));
+    }
+    if !conflicts.is_empty() {
+        line.push_str(&format!("；{}", conflicts.join(" | ")));
+    }
+    if retry.is_empty() {
+        remove_legacy_intent(jdir);
+    }
+    Some(line)
+}
+
+/// 一条要跟着改名的封面。`present` 说的是文件此刻在不在盘上 —— 不在也照样要改 `cover_path`
+/// （库里记的路径跟着新 ID 走），只是没有文件可搬。
+struct CoverRewrite {
+    id: String,
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+    present: bool,
+}
+
+/// 这一次迁移要动哪些封面文件（只读）。判据与老实现一字不差：`cover_path` 的文件名
+/// 必须正好是 `{旧 ID}.jpg`，别的封面（用户自己挑的图）不碰。
+fn cover_rewrites(conn: &Connection, map: &HashMap<String, String>) -> rusqlite::Result<Vec<CoverRewrite>> {
+    let mut q = conn.prepare("SELECT cover_path FROM tracks WHERE id = ?1")?;
+    let mut out = Vec::new();
+    for (old, new) in map {
+        let cover = q.query_row([old], |r| r.get::<_, Option<String>>(0)).optional()?.flatten();
+        let Some(cover) = cover else { continue };
+        let file = Path::new(&cover);
+        if file.file_name().map(|n| n.to_string_lossy().into_owned()) != Some(format!("{old}.jpg")) {
+            continue;
+        }
+        out.push(CoverRewrite {
+            id: old.clone(),
+            from: file.to_path_buf(),
+            to: file.with_file_name(format!("{new}.jpg")),
+            present: file.is_file(),
+        });
+    }
+    Ok(out)
+}
+
 /// 在一个事务里改 5 张子表 → 封面路径 → tracks 主键（外键已在调用方关闭）。
-/// 返回需要改名的封面文件对，交给调用方在事务提交后再动磁盘。
-fn apply_id_map(conn: &Connection, map: &HashMap<String, String>) -> rusqlite::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+/// 封面文件的改名不在这里：事务提交之后才动磁盘（`covers` 由 [`cover_rewrites`] 在事务之前备好）。
+fn apply_id_map(conn: &Connection, map: &HashMap<String, String>, covers: &[CoverRewrite]) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("CREATE TEMP TABLE legacy_map (old_id TEXT PRIMARY KEY, new_id TEXT NOT NULL)", [])?;
     {
@@ -186,30 +323,10 @@ fn apply_id_map(conn: &Connection, map: &HashMap<String, String>) -> rusqlite::R
         )?;
     }
 
-    let mut renames = Vec::new();
     {
-        let mut stmt = tx.prepare(
-            "SELECT id, cover_path FROM tracks \
-             WHERE cover_path IS NOT NULL AND id IN (SELECT old_id FROM legacy_map)",
-        )?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>();
         let mut upd = tx.prepare("UPDATE tracks SET cover_path = ?2 WHERE id = ?1")?;
-        for (id, cover_path) in rows {
-            let Some(new_id) = map.get(&id) else {
-                continue;
-            };
-            let file = std::path::Path::new(&cover_path);
-            if file.file_name().map(|n| n.to_string_lossy().into_owned()) != Some(format!("{id}.jpg")) {
-                continue;
-            }
-            let new_file = file.with_file_name(format!("{new_id}.jpg"));
-            if file.is_file() {
-                renames.push((file.to_path_buf(), new_file.clone()));
-            }
-            upd.execute((id, new_file.to_string_lossy().into_owned()))?;
+        for c in covers {
+            upd.execute((&c.id, c.to.to_string_lossy().into_owned()))?;
         }
     }
     tx.execute(
@@ -219,7 +336,7 @@ fn apply_id_map(conn: &Connection, map: &HashMap<String, String>) -> rusqlite::R
     )?;
     tx.execute("DROP TABLE temp.legacy_map", [])?;
     tx.commit()?;
-    Ok(renames)
+    Ok(())
 }
 
 /// settings.json 中以条目 ID 寻址的三处：`recents[*]`、`favs[*].trackIds[*]`、`pls[*].trackIds[*]`。
@@ -259,7 +376,10 @@ fn remap_settings_ids(settings_path: &Path, lookup: &HashMap<String, String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize_schema, migrations, migrate_legacy_ids, open_raw, with_db};
+    use super::{
+        initialize_schema, migrations, migrate_legacy_ids_in, open_raw, recover_legacy_ids_in, with_db,
+        LEGACY_INTENT,
+    };
     use rusqlite::Connection;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -333,7 +453,9 @@ mod tests {
         let db = dir.join("library.db");
         let settings = dir.join("settings.json");
         let covers = dir.join("covers");
+        let jdir = dir.join("journal");
         std::fs::create_dir_all(&covers).expect("封面目录");
+        std::fs::create_dir_all(&jdir).expect("意图目录");
         let old_cover = covers.join(format!("{legacy}.jpg"));
         std::fs::write(&old_cover, b"jpeg").expect("写入旧封面");
 
@@ -373,7 +495,7 @@ mod tests {
         )
         .expect("写入设置");
 
-        assert_eq!(migrate_legacy_ids(&db, &settings), 1);
+        assert_eq!(migrate_legacy_ids_in(&db, &settings, &jdir), 1);
 
         with_db(&db, |conn| {
             assert_eq!(scalar_i64(conn, &format!("SELECT COUNT(*) FROM tracks WHERE id='{new}'")), 1);
@@ -399,8 +521,100 @@ mod tests {
         assert_eq!(doc["vol"].as_f64(), Some(0.5), "无关设置键应保持原样");
         assert!(covers.join(format!("{new}.jpg")).is_file() && !old_cover.exists(), "封面文件未改名");
         assert!(db.with_extension("db.pre-uuid5").is_file(), "缺少改前备份");
+        assert!(
+            crate::journal::list(&jdir, LEGACY_INTENT).is_empty(),
+            "跑完了就要把意图收掉，不然下次启动会误以为迁移没做完"
+        );
 
-        assert_eq!(migrate_legacy_ids(&db, &settings), 0, "再次执行应为空操作");
+        assert_eq!(migrate_legacy_ids_in(&db, &settings, &jdir), 0, "再次执行应为空操作");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 崩溃窗口（P1-11）：事务提交之后、封面与设置还没改完。那一刻 `legacy_id_map` 已经是空的，
+    /// 没有意图文件的话这一步永远不会有人来补 —— 封面和设置会一直指着已经不存在的老 ID。
+    /// 现场是**手工摆回**的：先正经跑一遍迁移，再把封面文件与设置退回崩溃那一刻的样子。
+    #[test]
+    fn a_crashed_legacy_migration_is_finished_by_the_next_start() {
+        let legacy = "0123456789ab";
+        let dir = temp_dir("recov");
+        let db = dir.join("library.db");
+        let settings = dir.join("settings.json");
+        let covers = dir.join("covers");
+        let jdir = dir.join("journal");
+        std::fs::create_dir_all(&covers).expect("封面目录");
+        std::fs::create_dir_all(&jdir).expect("意图目录");
+        let new = crate::scanner::meta::file_id("C:\\Music\\A\\song.mp3");
+        with_db(&db, |conn| {
+            initialize_schema(conn)?;
+            conn.execute("INSERT INTO artists (artist_id, name, root_path) VALUES (1, 'a', 'C:\\Music')", [])?;
+            conn.execute("INSERT INTO albums (album_id, artist_id, name, artist_name) VALUES (1, 1, 'al', 'a')", [])?;
+            conn.execute(
+                "INSERT INTO tracks (id, artist_id, album_id, name, path, duration, artist, album, \
+                 format, is_video, cover_path, file_mtime, file_size) \
+                 VALUES (?1, 1, 1, 's', 'C:\\Music\\A\\song.mp3', 100, 'a', 'al', 'mp3', 0, ?2, 0, 1)",
+                (legacy, covers.join(format!("{legacy}.jpg")).to_str().unwrap()),
+            )?;
+            Ok(())
+        })
+        .expect("装配旧库");
+        std::fs::write(covers.join(format!("{legacy}.jpg")), b"jpeg").expect("旧封面");
+        let legacy_settings = format!(r#"{{"recents":["{legacy}"],"vol":0.5}}"#);
+        std::fs::write(&settings, &legacy_settings).expect("写入设置");
+
+        assert_eq!(migrate_legacy_ids_in(&db, &settings, &jdir), 1);
+        // 退回崩溃那一刻：曲库已经迁完、封面还在旧名下、设置还指着旧 ID、意图文件还在
+        std::fs::rename(covers.join(format!("{new}.jpg")), covers.join(format!("{legacy}.jpg"))).expect("退回封面");
+        std::fs::write(&settings, &legacy_settings).expect("退回设置");
+        let body = serde_json::json!({
+            "map": { legacy: new },
+            "covers": [[covers.join(format!("{legacy}.jpg")).to_string_lossy(), covers.join(format!("{new}.jpg")).to_string_lossy()]],
+        })
+        .to_string();
+        crate::atomic::write_str(&jdir.join(LEGACY_INTENT), &body).expect("摆意图文件");
+
+        let line = recover_legacy_ids_in(&jdir, &settings).expect("有意图文件就该有恢复");
+        assert!(line.contains("封面补搬 1 个"), "{line}");
+        assert!(covers.join(format!("{new}.jpg")).is_file(), "封面要补搬过去");
+        assert!(!covers.join(format!("{legacy}.jpg")).exists());
+        let doc = crate::settingsio::load(&settings);
+        assert_eq!(doc["recents"][0].as_str(), Some(new.as_str()), "设置要按意图里的映射重写");
+        assert_eq!(doc["vol"].as_f64(), Some(0.5), "无关设置键不该动");
+        assert!(crate::journal::list(&jdir, LEGACY_INTENT).is_empty(), "补完了就收掉意图");
+
+        // 幂等：再跑一遍不该有任何新动作（这时已经没有意图文件了）
+        assert!(recover_legacy_ids_in(&jdir, &settings).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新名字上已经有封面（多半是重扫又生成了一张）：**绝不覆盖**，报出来给人看，
+    /// 但设置那半照样补完 —— 剩下的只是一个没人用的旧文件，不值得一直挂着一份未完成的意图。
+    #[test]
+    fn the_legacy_recovery_never_overwrites_a_newer_cover() {
+        let dir = temp_dir("coverclash");
+        let settings = dir.join("settings.json");
+        let jdir = dir.join("journal");
+        std::fs::create_dir_all(&jdir).expect("意图目录");
+        let (old, new) = (dir.join("旧.jpg"), dir.join("新.jpg"));
+        std::fs::write(&old, "老的").unwrap();
+        std::fs::write(&new, "新的").unwrap();
+        std::fs::write(&settings, r#"{"recents":["0123456789ab"]}"#).unwrap();
+        let body = serde_json::json!({
+            "map": { "0123456789ab": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+            "covers": [[old.to_string_lossy(), new.to_string_lossy()]],
+        })
+        .to_string();
+        crate::atomic::write_str(&jdir.join(LEGACY_INTENT), &body).expect("摆意图文件");
+
+        let line = recover_legacy_ids_in(&jdir, &settings).expect("有意图文件就该有恢复");
+        assert!(line.contains("已被占用"), "{line}");
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "新的", "新封面不许被覆盖");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "老的", "旧文件也不动");
+        assert_eq!(
+            crate::settingsio::load(&settings)["recents"][0].as_str(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "封面搬不动不影响设置那一半"
+        );
+        assert!(crate::journal::list(&jdir, LEGACY_INTENT).is_empty(), "能补的都补了，别再挂着一份意图");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -35,19 +35,32 @@ impl Report {
             history_written: 0,
         }
     }
+
+    /// 一条都没动、但得说清楚为什么（恢复时「读不出来 / 找不到这一批」走这条）。
+    pub(crate) fn with_failure(planned: usize, why: String) -> Self {
+        let mut rep = Self::new(String::new(), planned, 0);
+        rep.failed.push(why);
+        rep
+    }
 }
 
 /// history 那一侧的账。找不到文件不是失败（`04 §7.1` 只说「有就追加」），但读写出问题必须报。
-pub(crate) fn sync(rep: &mut Report, roots: &[String], done: &[Pair], undo: bool) {
+/// 返回「这一步过了没有」—— 调用方据此决定意图文件收不收：history 还欠着就得留着，
+/// 下一次启动只补这一步（补账是幂等的）。
+pub(crate) fn sync(rep: &mut Report, roots: &[String], done: &[Pair], undo: bool) -> bool {
     if done.is_empty() {
-        return;
+        return true;
     }
     match batch::sync_history(roots, done, undo) {
         Ok((file, n)) => {
             rep.history_file = file;
             rep.history_written = n;
+            true
         }
-        Err(e) => rep.failed.push(format!("rename_history.json：{e}")),
+        Err(e) => {
+            rep.failed.push(format!("rename_history.json：{e}"));
+            false
+        }
     }
 }
 

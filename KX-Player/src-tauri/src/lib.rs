@@ -17,6 +17,7 @@ mod db;
 mod error;
 mod ffprobe;
 mod fftools;
+mod journal;
 mod limits;
 mod model;
 mod paths;
@@ -53,9 +54,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let _ = paths::ensure_data_dir();
             let _ = paths::ensure_covers_dir();
             db::check_integrity();
+            // P1-11：改名与旧 ID 迁移都跨「文件系统 + 曲库 + 设置」三处，崩在中间留下的是一半
+            // 改完的盘和一本没写完的账。启动时先把没删掉的意图核对一遍：改名只补账、不动盘；
+            // 旧 ID 迁移的封面该搬的补搬（判据只有「旧名在、新名不在」）。
+            rename::journal::recover_at_startup();
             let migrated = db::migrate_legacy_ids(&paths::library_db_path(), &paths::settings_path());
             if migrated > 0 {
                 paths::append_log(&format!("条目 ID 迁移：{migrated} 条旧 ID 已改写为 UUIDv5，备份见 *.pre-uuid5"));
+            }
+            if let Some(line) = db::recover_legacy_ids(&paths::settings_path()) {
+                paths::append_log(&format!("[迁移] 崩溃后恢复：{line}"));
+                state::startup_warn(format!(
+                    "上次的旧 ID 迁移没有正常结束：{line}。已按现状补完，若封面显示异常可在设置中重新扫描。"
+                ));
             }
             scanner::covers::load_folder_cover_map();
             bgimage::migrate_oversized();

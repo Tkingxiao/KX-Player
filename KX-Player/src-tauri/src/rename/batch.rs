@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -106,14 +106,36 @@ pub fn set_item(conn: &Connection, batch_id: &str, p: &Pair, applied: bool) -> R
     }
 }
 
-/// 改盘成功之后**立刻**写这一行（`04 §7.7` 第 3 条）
-pub fn add_item(conn: &Connection, batch_id: &str, p: &Pair) -> Result<(), String> {
+/// 改盘成功（或崩溃后核对出「其实已经生效」）之后写这一行（`04 §7.7` 第 3 条）。
+/// `applied` 只在恢复时会给 `false` —— 正向执行写下来的每一行都是已生效的。
+pub fn add_item(conn: &Connection, batch_id: &str, p: &Pair, applied: bool) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO rename_items (batch_id, old_path, new_path, level, applied) VALUES (?1, ?2, ?3, ?4, 1)",
-        params![batch_id, p.old, p.new, p.level],
+        "INSERT INTO rename_items (batch_id, old_path, new_path, level, applied) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![batch_id, p.old, p.new, p.level, i64::from(applied)],
     )
     .map_err(|e| format!("记账失败（{e}）"))?;
     Ok(())
+}
+
+/// 一行明细的旗子。`None` = 库里根本没有这一行 —— 与「有行、旗子是 0」是两件事：
+/// 前者是「崩在记账之前」，后者是「已经回滚过」。恢复要按这个区别决定补哪种动作。
+pub fn item_state(conn: &Connection, batch_id: &str, old_path: &str) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT applied FROM rename_items WHERE batch_id = ?1 AND old_path = ?2",
+        params![batch_id, old_path],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// 首次应用收尾了没有（`finish` 填的就是这一列）。恢复靠它区分「应用没跑完」与
+/// 「后面那一步（回滚/重做）没跑完」—— 后者不该改写它，它记的是首次应用。
+pub fn applied_at(conn: &Connection, batch_id: &str) -> Result<Option<i64>, String> {
+    conn.query_row("SELECT applied_at FROM rename_batches WHERE id = ?1", params![batch_id], |r| r.get(0))
+        .optional()
+        .map_err(|e| e.to_string())
+        .map(Option::flatten)
 }
 
 /// 取这一批的映射。`applied`：1 = 现在盘上是新名，0 = 已回滚/未生效。
@@ -292,9 +314,9 @@ mod tests {
         let conn = db();
         open(&conn, "b1", None).unwrap();
         let p = pair("L:/nor/特典~", "L:/nor/特典～", FOLDER);
-        add_item(&conn, "b1", &p).unwrap();
+        add_item(&conn, "b1", &p, true).unwrap();
         // 同一条改名的 old_path 重复登记：主键挡下来，而不是留下两行互相矛盾的账
-        assert!(add_item(&conn, "b1", &p).unwrap_err().contains("记账失败"));
+        assert!(add_item(&conn, "b1", &p, true).unwrap_err().contains("记账失败"));
         assert_eq!(pairs(&conn, "b1", 1).unwrap(), vec![p.clone()]);
 
         set_item(&conn, "b1", &p, false).unwrap();
@@ -310,8 +332,14 @@ mod tests {
     fn finish_counts_the_rows_it_has_rather_than_the_number_it_was_told() {
         let conn = db();
         open(&conn, "b1", None).unwrap();
-        add_item(&conn, "b1", &pair("L:/a~", "L:/a", FILE)).unwrap();
-        add_item(&conn, "b1", &pair("L:/b~", "L:/b", FOLDER)).unwrap();
+        add_item(&conn, "b1", &pair("L:/a~", "L:/a", FILE), true).unwrap();
+        add_item(&conn, "b1", &pair("L:/b~", "L:/b", FOLDER), true).unwrap();
+        // 恢复专用：一条「已回滚」的明细，旗子是 0 —— `item_state` 要能分别「没有这一行」
+        // 与「有行、旗子是 0」（前者是崩在记账之前，后者是已经回滚过）
+        let p = pair("L:/c~", "L:/c", FILE);
+        add_item(&conn, "b1", &p, false).unwrap();
+        assert_eq!(item_state(&conn, "b1", "L:/c~").unwrap(), Some(0));
+        assert_eq!(item_state(&conn, "b1", "L:/没登记过").unwrap(), None);
         finish(&conn, "b1", "本地规则", 2, 2, 0, 0).unwrap();
         open(&conn, "b2", None).unwrap();
         finish(&conn, "b2", "本地规则", 0, 0, 3, 0).unwrap();
@@ -319,7 +347,7 @@ mod tests {
         let rows = list(&conn, 10).unwrap();
         assert_eq!(rows.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["b2", "b1"]);
         let b1 = rows.iter().find(|b| b.id == "b1").unwrap();
-        assert_eq!(b1.item_count, 2, "item_count 是行数，不是传进来的数");
+        assert_eq!(b1.item_count, 3, "item_count 是行数（旗子为 0 的那行也算），不是传进来的数");
         assert!(b1.applied_at.is_some());
         assert_eq!(b1.note.as_deref(), Some("本地规则 · 计划 2 · 成功 2 · 跳过 0 · 失败 0"));
         let b2 = rows.iter().find(|b| b.id == "b2").unwrap();
@@ -333,7 +361,8 @@ mod tests {
         mark_rolled_back(&conn, "b1", true, "回滚 · 计划 2 · 成功 2").unwrap();
         let after = list(&conn, 10).unwrap();
         let b1 = after.iter().find(|b| b.id == "b1").unwrap();
-        assert_eq!((b1.rolled_back, b1.item_count, b1.note.as_deref()), (true, 2, Some("回滚 · 计划 2 · 成功 2")));
+        assert!(b1.rolled_back);
+        assert_eq!((b1.item_count, b1.note.as_deref()), (3, Some("回滚 · 计划 2 · 成功 2")));
         assert_eq!(b1.applied_at, rows.iter().find(|b| b.id == "b1").unwrap().applied_at);
     }
 

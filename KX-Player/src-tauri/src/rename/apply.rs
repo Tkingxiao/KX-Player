@@ -22,6 +22,7 @@ use rusqlite::Connection;
 
 use crate::rename::ai_ledger;
 use crate::rename::batch::{self, Pair, FOLDER};
+use crate::rename::journal;
 use crate::rename::paths::{move_one, resolve, sort_pairs};
 use crate::rename::preview::{Item, Kind, Preview};
 use crate::rename::report::{sync, undo, Report};
@@ -39,7 +40,13 @@ pub fn apply(conn: &Connection, roots: &[String]) -> Result<Report, String> {
     }
     let Queue { pairs, skipped, model, ai } = queue(conn, &preview);
     let id = batch::new_batch_id();
-    batch::open(conn, &id, model.as_deref())?;
+    // 动手之前先落意图（P1-11）：从这一刻起，哪怕进程被拔掉，下一次启动也认得这一批动到哪儿了。
+    // 写不下就不开工 —— 没有这份文件的批次，崩了之后没有任何线索。
+    journal::write(&journal::Intent::new(&id, journal::APPLY, &pairs, roots))?;
+    if let Err(e) = batch::open(conn, &id, model.as_deref()) {
+        journal::clear(&id); // 连批次行都没建起来，等于什么都没发生
+        return Err(e);
+    }
 
     let mut rep = Report::new(id.clone(), pairs.len(), skipped);
     let mut moved: Vec<(String, String)> = Vec::new();
@@ -52,7 +59,7 @@ pub fn apply(conn: &Connection, roots: &[String]) -> Result<Report, String> {
             rep.failed.push(format!("{from}：{e}"));
             continue;
         }
-        match batch::add_item(conn, &id, p) {
+        match batch::add_item(conn, &id, p, true) {
             Ok(()) => {
                 rep.applied += 1;
                 moved.push((p.old.clone(), p.new.clone()));
@@ -69,7 +76,10 @@ pub fn apply(conn: &Connection, roots: &[String]) -> Result<Report, String> {
     // 说明里带上这批有没有模型参与：`04 §7.11` 要能一眼看出本地规则批次一分钱 token 没花
     let kind = if ai > 0 { "本地规则 + 模型译名" } else { "本地规则" };
     batch::finish(conn, &id, kind, planned, applied, skipped, failed)?;
-    sync(&mut rep, roots, &done, false);
+    // history 欠着就不收意图：留着它，下一次启动只补这一步（补账是幂等的）
+    if sync(&mut rep, roots, &done, false) {
+        journal::clear(&id);
+    }
     Ok(rep)
 }
 

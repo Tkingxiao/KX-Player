@@ -58,12 +58,50 @@ pub(crate) fn move_one(from: &str, to: &str) -> Result<(), String> {
     if Path::new(to).exists() {
         return Err("目标名已被占用，未覆盖".into());
     }
-    std::fs::rename(from, to).map(|_| ()).map_err(|e| format!("改名失败：{e}"))
+    rename_noreplace(Path::new(from), Path::new(to)).map_err(|e| {
+        // 目标在这一次 check 与 rename 之间被别人占住：报成「已占用」而不是一句笼统的改名失败
+        if Path::new(to).exists() {
+            "目标名已被占用，未覆盖".to_string()
+        } else {
+            format!("改名失败：{e}")
+        }
+    })
+}
+
+/// 搬一个名字，**目标已存在就失败**（P1-11）。
+///
+/// `std::fs::rename` 在 Windows 上是带 `MOVEFILE_REPLACE_EXISTING` 的 `MoveFileExW`：
+/// 目标存在就**覆盖**。`move_one` 上面那两句 `exists` 只是快速拒绝 —— 检查和改名的空隙里
+/// 被人塞进一个同名文件，旧实现就把那个文件无声吞掉了（TOCTOU）。所以真正的保证在这一层：
+/// 走不带 REPLACE 的 `MoveFileW`，目标存在即失败，检查与动作之间的空隙就不再有后果。
+#[cfg(windows)]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+
+    fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+    let (f, t) = (wide(from), wide(to));
+    // SAFETY: 两个指针都指向以 NUL 结尾的、在调用期间存活的宽字符串
+    let ok = unsafe { MoveFileW(f.as_ptr(), t.as_ptr()) };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// 非 Windows 构建不发布（本产品只有 Windows 版），这里退回普通 `rename` ——
+/// 调用方那两句 `exists` 已经是这一层能做的最好，POSIX 没有「不覆盖」的标准 rename 入口。
+#[cfg(not(windows))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{move_one, resolve, sort_pairs};
+    use super::{move_one, rename_noreplace, resolve, sort_pairs};
     use crate::rename::batch::{Pair, FILE, FOLDER};
     use std::path::{Path, PathBuf};
 
@@ -103,6 +141,31 @@ mod tests {
             "按路径分量比：nor 不能命中 northern"
         );
         assert_eq!(sl(&resolve("L:/其它/甲/f~.mp3", &moved)), "L:/其它/甲/f~.mp3", "不相干的根不动");
+    }
+
+    /// `move_one` 上面那两句 `exists` 挡不住「检查之后、改名之前」塞进来的同名文件 ——
+    /// 真正的保证来自底层那一下不带 REPLACE 的 `MoveFileW`。这里绕过上层检查直接钉住它：
+    /// 目标已存在时必须失败，且目标的内容一个字都不能变（旧实现会把它覆盖掉）。
+    #[test]
+    fn the_move_primitive_never_replaces_an_existing_target() {
+        let base = tree("noreplace");
+        std::fs::create_dir(base.join("占位的目录")).unwrap();
+        std::fs::create_dir(base.join("要搬的目录")).unwrap();
+        std::fs::write(base.join("占用者.txt"), "别人的内容").unwrap();
+        std::fs::write(base.join("源.txt"), "我的内容").unwrap();
+
+        assert!(rename_noreplace(&base.join("源.txt"), &base.join("占用者.txt")).is_err());
+        assert_eq!(std::fs::read_to_string(base.join("占用者.txt")).unwrap(), "别人的内容", "目标不许被覆盖");
+        assert_eq!(std::fs::read_to_string(base.join("源.txt")).unwrap(), "我的内容", "源还在原地");
+
+        // 目录同理（改名主链里一半的条目是文件夹）
+        assert!(rename_noreplace(&base.join("要搬的目录"), &base.join("占位的目录")).is_err());
+        assert!(base.join("要搬的目录").is_dir() && base.join("占位的目录").is_dir());
+
+        // 目标不在时才搬得动
+        rename_noreplace(&base.join("源.txt"), &base.join("新名.txt")).expect("正常改名");
+        assert_eq!(names(&base), ["占位的目录", "占用者.txt", "新名.txt", "要搬的目录"]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
