@@ -22,9 +22,9 @@
 | `clipboard_write_text` | `text: String` | `boolean` | src-tauri/src/commands/dialog_fs.rs |
 | `file_exists` | `path: String` | `boolean` | src-tauri/src/commands/dialog_fs.rs |
 | `list_dir` | `path: String` | `DirEntryInfo[]` | src-tauri/src/commands/dialog_fs.rs |
-| `open_audio_files` | — | `string[]` | src-tauri/src/commands/dialog_fs.rs |
 | `open_folder` | — | `string[] ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `open_image_file` | — | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
+| `open_media_files` | `kind: String` | `string[]` | src-tauri/src/commands/dialog_fs.rs |
 | `open_text_files` | — | `string[]` | src-tauri/src/commands/dialog_fs.rs |
 | `read_as_data_url` | `path: String` | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `read_text_file` | `path: String` | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
@@ -113,7 +113,6 @@
 | `close_window` | — | `null` | src-tauri/src/commands/system.rs |
 | `convert_cancel` | `taskId: u64` | `boolean` | src-tauri/src/commands/system.rs |
 | `convert_run` | `items: Vec<crate::fftools::ConvertItem>` | `number` | src-tauri/src/commands/system.rs |
-| `ffmpeg_exec` | `args: Vec<String>` | `ExecResult` | src-tauri/src/commands/system.rs |
 | `ffmpeg_probe` | — | `FfmpegInfo` | src-tauri/src/commands/system.rs |
 | `force_close_window` | — | `null` | src-tauri/src/commands/system.rs |
 | `is_maximized` | — | `boolean` | src-tauri/src/commands/system.rs |

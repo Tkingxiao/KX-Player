@@ -27,7 +27,6 @@ import type {
   Category,
   ConvertItem,
   DirEntry,
-  ExecResult,
   FfmpegInfo,
   MpvPlayerState,
   PlayProgress,
@@ -48,7 +47,7 @@ export interface CommandSpecs {
   clipboard_write_text: { args: { text: string }, returns: boolean }
   file_exists: { args: { path: string }, returns: boolean }
   list_dir: { args: { path: string }, returns: DirEntry[] }
-  open_audio_files: { args: {}, returns: string[] }
+  open_media_files: { args: { kind: string }, returns: string[] }
   open_folder: { args: {}, returns: string[] | null }
   open_image_file: { args: {}, returns: string | null }
   open_text_files: { args: {}, returns: string[] }
@@ -137,7 +136,6 @@ export interface CommandSpecs {
   close_window: { args: {}, returns: void }
   convert_cancel: { args: { taskId: number }, returns: boolean }
   convert_run: { args: { items: ConvertItem[] }, returns: number }
-  ffmpeg_exec: { args: { args: string[] }, returns: ExecResult }
   ffmpeg_probe: { args: {}, returns: FfmpegInfo }
   force_close_window: { args: {}, returns: void }
   is_maximized: { args: {}, returns: boolean }

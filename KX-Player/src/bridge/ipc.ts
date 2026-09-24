@@ -69,7 +69,7 @@ function decorateBg(b: BgImageData | null): BgImageData | null {
 export const api: AppApi = {
   openFolder: () => invoke('open_folder'),
   openImageFile: () => invoke('open_image_file'),
-  openAudioFiles: () => invoke('open_audio_files'),
+  openMediaFiles: (kind) => invoke('open_media_files', { kind }),
   openTextFiles: () => invoke('open_text_files'),
   scanFoldersWithProgress: (p) => invoke('scan_folders', { paths: p }).then(decorateScan),
   scanFoldersIncremental: (p) => invoke('scan_folders_incremental', { paths: p }).then(decorateScan),
@@ -133,9 +133,10 @@ export const api: AppApi = {
   saveBgImage: (d) => invoke('save_bg_image', { dataUrl: d }),
   removeBgImage: () => invoke('remove_bg_image'),
   startupWarnings: () => invoke('startup_warnings'),
-  ffmpegExec: (a) => invoke('ffmpeg_exec', { args: a }),
   ffmpegProbe: () =>
-    invoke('ffmpeg_probe').catch(() => ({ available: false, path: null, version: null })),
+    invoke('ffmpeg_probe').catch(
+      () => ({ available: false, path: null, version: null, source: null, warn: null }) as const,
+    ),
   convertRun: (items: ConvertItem[]) => invoke('convert_run', { items }).catch(() => 0),
   convertCancel: (taskId: number) => invoke('convert_cancel', { taskId }).catch(() => false),
   // 注意：Tauri 会把 Rust 参数 base_url 归一化为 baseUrl（serde camelCase 同理），

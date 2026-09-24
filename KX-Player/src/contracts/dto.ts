@@ -158,18 +158,16 @@ export type AssOverride = 'no' | 'yes' | 'force' | 'scale' | 'strip'
 
 // ── ffmpeg 任务 ─────────────────────────────────────────────
 
+/** ffmpeg.exe 的来路（Rust: `paths::FfmpegSource`，P1-12） */
+export type FfmpegSource = 'env' | 'appDir' | 'fixed' | 'path'
+
 export interface FfmpegInfo {
   available: boolean
   path: string | null
   version: string | null
-}
-
-/** Rust: `fftools::ExecResult` */
-export interface ExecResult {
-  code: number
-  stdout: string | null
-  stderr: string | null
-  error: string | null
+  source: FfmpegSource | null
+  /** 来路不在应用掌控中时的提示；null = 不必提示 */
+  warn: string | null
 }
 
 export interface ConvertItem {

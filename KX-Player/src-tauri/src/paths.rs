@@ -45,41 +45,71 @@ pub fn log_path() -> PathBuf {
     data_dir().join("kx-player-log.txt")
 }
 
-/// 定位 ffmpeg.exe：环境变量 → exe 旁 / 资源目录 → 常见安装位置 → PATH
-pub fn locate_ffmpeg() -> Option<PathBuf> {
+/// ffmpeg.exe 是从哪儿找到的（P1-12：来路要能说清楚）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FfmpegSource {
+    /// 环境变量 `KX_FFMPEG`
+    Env,
+    /// 程序目录（含 NSIS resources 子目录）
+    AppDir,
+    /// 常见安装位置（写死的两个路径）
+    Fixed,
+    /// PATH 里第一个同名文件
+    Path,
+}
+
+impl FfmpegSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            FfmpegSource::Env => "环境变量 KX_FFMPEG",
+            FfmpegSource::AppDir => "程序目录",
+            FfmpegSource::Fixed => "常见安装位置",
+            FfmpegSource::Path => "PATH",
+        }
+    }
+}
+
+/// 定位 ffmpeg.exe：环境变量 → exe 旁 / 资源目录 → 常见安装位置 → PATH。
+/// 返回来路，供启动日志与转换页提示（[`FfmpegSource`]）。
+pub fn locate_ffmpeg_ex() -> Option<(PathBuf, FfmpegSource)> {
     if let Ok(p) = std::env::var("KX_FFMPEG") {
         if std::path::Path::new(&p).exists() {
-            return Some(PathBuf::from(p));
+            return Some((PathBuf::from(p), FfmpegSource::Env));
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("ffmpeg.exe");
             if candidate.exists() {
-                return Some(candidate);
+                return Some((candidate, FfmpegSource::AppDir));
             }
             // NSIS resources 目录
             let candidate = dir.join("ffmpeg").join("ffmpeg.exe");
             if candidate.exists() {
-                return Some(candidate);
+                return Some((candidate, FfmpegSource::AppDir));
             }
         }
     }
     for p in ["C:\\ffmpeg\\bin\\ffmpeg.exe", "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"] {
         let candidate = PathBuf::from(p);
         if candidate.exists() {
-            return Some(candidate);
+            return Some((candidate, FfmpegSource::Fixed));
         }
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("ffmpeg.exe");
             if candidate.exists() {
-                return Some(candidate);
+                return Some((candidate, FfmpegSource::Path));
             }
         }
     }
     None
+}
+
+pub fn locate_ffmpeg() -> Option<PathBuf> {
+    locate_ffmpeg_ex().map(|(p, _)| p)
 }
 
 pub fn locate_ffprobe() -> Option<PathBuf> {

@@ -58,6 +58,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             scanner::covers::load_folder_cover_map();
             bgimage::migrate_oversized();
+            // P1-12：把「这次用的是哪个 ffmpeg」记进日志（后台线程，不挡启动）
+            fftools::log_ffmpeg_identity();
 
             // asset 协议范围：封面目录（含子目录）+ 背景图这一个文件。
             // 原来整个数据目录都放开了，等于把曲库 SQLite、设置与日志一并交给 WebView 去 fetch ——
@@ -144,6 +146,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // 失焦隐藏视频覆盖层（避免浮在别的应用上），聚焦恢复
                     player.focus_changed(*focused);
                 }
+                // 往窗口里拖文件 = 用户手势，与「对话框选中」同级：在这里登记授权，
+                // 前端随后递回来的同一批路径才过得了 [PathScope]（不靠前端自报授权）。
+                WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                    let scope: tauri::State<scope::PathScope> = window.app_handle().state();
+                    for p in paths {
+                        let _ = scope.allow_file(p);
+                    }
+                }
                 WindowEvent::Destroyed => {
                     let player: tauri::State<PlayerCore> = window.app_handle().state();
                     player.destroy_host();
@@ -158,7 +168,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             commands::dialog_fs::open_folder,
             commands::dialog_fs::open_image_file,
-            commands::dialog_fs::open_audio_files,
+            commands::dialog_fs::open_media_files,
             commands::dialog_fs::open_text_files,
             commands::dialog_fs::select_bg_image,
             commands::dialog_fs::read_as_data_url,
@@ -200,7 +210,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::system::is_maximized,
             commands::system::force_close_window,
             commands::system::toggle_fullscreen,
-            commands::system::ffmpeg_exec,
             commands::system::ffmpeg_probe,
             commands::system::convert_run,
             commands::system::convert_cancel,

@@ -57,17 +57,26 @@ pub async fn open_image_file(app: AppHandle) -> Option<String> {
     picked
 }
 
+/// 转换页的选文件入口（`kind` = audio | video）。走这里而不是前端 `<input type=file>`：
+/// 只有对话框选中的路径才会登记进 [`PathScope`]，`convert_run` 的输入校验只认这个来路。
+/// 除了文件本身，**连它们的所在目录一起授权** —— 转换的输出固定落在源目录（产品规则），
+/// 前端还要靠 `file_exists` 在源目录里探「同名加序号」，不授权目录这两件事都做不了；
+/// 粒度与 AI 翻译页的「选一个目录」（`open_folder`）一致。
+/// 与 `open_*` 其余命令同口径：取消就是空数组，不用错误信封。
 #[tauri::command]
-pub async fn open_audio_files(app: AppHandle) -> Vec<String> {
+pub async fn open_media_files(app: AppHandle, kind: String) -> Vec<String> {
+    let video = kind == "video";
     let app2 = app.clone();
     let picked = tauri::async_runtime::spawn_blocking(move || {
+        let (title, filter) = if video {
+            ("选择视频", ["mp4", "mkv", "avi", "mov", "webm", "flv", "wmv"].to_vec())
+        } else {
+            ("选择音频", ["mp3", "flac", "wav", "ogg", "m4a", "aac", "wma", "opus", "ape", "wv", "aiff"].to_vec())
+        };
         app2.dialog()
             .file()
-            .set_title("选择音频/视频")
-            .add_filter(
-                "音频/视频",
-                &["mp3", "flac", "wav", "ogg", "m4a", "aac", "wma", "opus", "ape", "wv", "aiff", "mp4", "mkv", "avi", "mov", "webm", "flv", "wmv"],
-            )
+            .set_title(title)
+            .add_filter(if video { "视频" } else { "音频" }, &filter)
             .blocking_pick_files()
             .map(|list| list.iter().map(|p| p.to_string()).collect::<Vec<_>>())
             .unwrap_or_default()
@@ -76,7 +85,11 @@ pub async fn open_audio_files(app: AppHandle) -> Vec<String> {
     .unwrap_or_default();
     let scope = app.state::<PathScope>();
     for p in &picked {
-        let _ = scope.allow_file(Path::new(p));
+        let path = Path::new(p);
+        let _ = scope.allow_file(path);
+        if let Some(dir) = path.parent() {
+            let _ = scope.allow_root(dir);
+        }
     }
     picked
 }

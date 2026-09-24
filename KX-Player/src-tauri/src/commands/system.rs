@@ -96,21 +96,25 @@ pub fn toggle_fullscreen(window: WebviewWindow) -> IpcResult<bool> {
 
 // ── ffmpeg ──────────────────────────────────────────────────────
 
-#[tauri::command]
-pub fn ffmpeg_exec(args: Vec<String>) -> crate::fftools::ExecResult {
-    crate::fftools::exec_ffmpeg(&args)
-}
-
 /// ffmpeg 可用性探测（转换页据此降级）
 #[tauri::command]
 pub fn ffmpeg_probe() -> crate::fftools::FfmpegInfo {
     crate::fftools::probe_ffmpeg()
 }
 
-/// 启动转换队列（任务 + convert:progress 事件），返回 taskId
+/// 启动转换队列（任务 + convert:progress 事件），返回 taskId。
+/// 通用执行器 `ffmpeg_exec` 已删除（P0-2）：前端只能走这条白名单通道，
+/// 校验不过整批拒，不会把一个任意 argv 交给 ffmpeg。
 #[tauri::command]
-pub fn convert_run(app: AppHandle, items: Vec<crate::fftools::ConvertItem>) -> u64 {
-    crate::fftools::run_convert_queue(app, items)
+pub fn convert_run(app: AppHandle, scope: State<'_, crate::scope::PathScope>, items: Vec<crate::fftools::ConvertItem>) -> IpcResult<u64> {
+    match crate::fftools::validate_items(&scope, &items) {
+        Ok(()) => Ok(crate::fftools::run_convert_queue(app, items)),
+        Err(crate::fftools::Reject::Outside(p)) => {
+            crate::paths::append_log(&format!("[scope] convert_run 拒绝整批：{p}"));
+            Err(IpcError::outside_scope(&p, "输入不在已授权路径内"))
+        }
+        Err(crate::fftools::Reject::Invalid(m)) => Err(IpcError::invalid_argument(m)),
+    }
 }
 
 /// 取消转换队列（幂等）

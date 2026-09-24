@@ -4,6 +4,7 @@
  *  编码参数保持源声道数与采样率（ASMR 双耳录音红线）；同名输出自动加序号。
  */
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { api, onEvent } from '@/bridge/ipc'
 import { useUiStore } from '@/stores/ui'
 import type { ConvertItem, ConvertProgress, FfmpegInfo } from '@/contracts/api'
@@ -27,9 +28,8 @@ const mode = ref<'convert' | 'extract'>('convert')
 const format = ref('mp3')
 const tasks = ref<Task[]>([])
 const taskId = ref(0) // 后端队列句柄；0 = 未运行
-const fileInput = ref<HTMLInputElement | null>(null)
 const dropActive = ref(false)
-const ffmpeg = ref<FfmpegInfo>({ available: true, path: null, version: null })
+const ffmpeg = ref<FfmpegInfo>({ available: true, path: null, version: null, source: null, warn: null })
 const ffmpegChecked = ref(false)
 
 const running = computed(() => taskId.value > 0)
@@ -45,6 +45,7 @@ const FORMATS = [
 
 let taskSeq = 0
 let unlisten: (() => void) | null = null
+let unlistenDrop: (() => void) | null = null
 
 const AUDIO_EXTS = new Set(['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'wma', 'opus', 'ape', 'wv', 'aiff'])
 const VIDEO_EXTS = new Set(['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'])
@@ -76,20 +77,9 @@ function addPaths(paths: string[]): void {
   if (!added && paths.length) ui.toast('没有符合当前模式的文件', 'info')
 }
 
-function onPick(): void {
-  fileInput.value?.click()
-}
-
-async function onFiles(e: Event): Promise<void> {
-  const input = e.target as HTMLInputElement
-  if (input.files) addPaths([...input.files].map((f) => (f as File & { path: string }).path).filter(Boolean))
-  input.value = ''
-}
-
-function onDrop(e: DragEvent): void {
-  dropActive.value = false
-  const files = e.dataTransfer?.files
-  if (files) addPaths([...files].map((f) => (f as File & { path: string }).path).filter(Boolean))
+/** 选文件走原生对话框：只有对话框/拖入出来的路径才在 Rust 的授权范围内（P0-2）。 */
+async function pickFiles(): Promise<void> {
+  addPaths(await api.openMediaFiles(mode.value === 'extract' ? 'video' : 'audio'))
 }
 
 /** 输出路径：同目录 + 同名加序号（红线：不静默覆盖）。Rust 侧 file_exists 同步探测。 */
@@ -120,12 +110,12 @@ async function runAll(): Promise<void> {
     t.outPath = await uniqueOutputPath(t.path, t.format)
     items.push({ id: t.id, path: t.path, outPath: t.outPath, kind: t.kind, format: t.format })
   }
-  const id = await api.convertRun(items)
-  if (!id) {
-    ui.toast('转换队列启动失败', 'error')
-    return
+  // 校验不过整批拒（越界 / 目标已存在 / 格式不在白名单）：把后端那句话原样给用户
+  try {
+    taskId.value = await api.convertRun(items)
+  } catch (e) {
+    ui.toast(`转换未开始：${e instanceof Error ? e.message : String(e)}`, 'error', 6000)
   }
-  taskId.value = id
 }
 
 function cancelAll(): void {
@@ -143,6 +133,16 @@ const doneCount = computed(() => tasks.value.filter((t) => t.state === 'done').l
 onMounted(async () => {
   ffmpeg.value = await api.ffmpegProbe()
   ffmpegChecked.value = true
+  // 拖入走系统级事件（HTML5 的 drop 在 WebView2 + dragDropEnabled 下收不到）：
+  // Rust 侧同一事件里把路径登记进授权范围，这里只负责入队
+  unlistenDrop = await getCurrentWindow().onDragDropEvent((e) => {
+    if (e.payload.type === 'enter' || e.payload.type === 'over') {
+      dropActive.value = true
+      return
+    }
+    dropActive.value = false
+    if (e.payload.type === 'drop') addPaths(e.payload.paths)
+  })
   unlisten = onEvent<ConvertProgress>('convert:progress', (p) => {
     if (p.state === 'queue-finished') {
       taskId.value = 0
@@ -162,6 +162,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   unlisten?.()
+  unlistenDrop?.()
   // 离开页面不自动取消：转换在后台继续，事件仍会写日志
 })
 
@@ -178,9 +179,6 @@ const stateLabel: Record<TaskState, string> = {
   <div
     class="convert-view"
     :class="{ drop: dropActive }"
-    @dragover.prevent="dropActive = true"
-    @dragleave="dropActive = false"
-    @drop.prevent="onDrop"
   >
     <div class="cv-head">
       <h1 class="cv-title">格式转换</h1>
@@ -199,11 +197,15 @@ const stateLabel: Record<TaskState, string> = {
       </div>
     </div>
 
-    <div class="cv-dropzone" @click="onPick">
+    <!-- ffmpeg 来路提示（P1-12）：能用，但来源不在应用掌控中 -->
+    <div v-if="ffmpegChecked && ffmpeg.available && ffmpeg.warn" class="cv-note" :title="ffmpeg.path ?? ''">
+      使用的 ffmpeg 来自{{ ffmpeg.source === 'path' ? ' PATH' : ffmpeg.source === 'env' ? '环境变量 KX_FFMPEG' : '不受控的位置' }}：{{ ffmpeg.warn }}
+    </div>
+
+    <div class="cv-dropzone" @click="pickFiles">
       <svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7,10 12,15 17,10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
       <p>拖入{{ mode === 'extract' ? '视频' : '音频' }}文件，或点击选择</p>
       <p class="cv-drop-sub">输出到源目录，同名自动追加序号；保持源声道数与采样率</p>
-      <input ref="fileInput" type="file" multiple hidden @change="onFiles" />
     </div>
 
     <div class="cv-format-row">
@@ -287,6 +289,15 @@ const stateLabel: Record<TaskState, string> = {
 }
 .cv-warning strong { color: var(--text); }
 .cv-warning-sub { color: var(--text-sub); font-size: 11px; }
+.cv-note {
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-hover);
+  color: var(--text-sub);
+  font-size: 11px;
+  line-height: 1.6;
+}
 .cv-dropzone {
   display: flex;
   flex-direction: column;

@@ -273,8 +273,7 @@ export const DTO_NO_TABLE = {
   // —— 不进库：文件系统与运行期探测 ——
   DirEntry: '文件系统条目（commands/dialog_fs.rs），不进库。',
   SubtitleScanItem: 'subtitle_scan_dir 的递归扫描结果（ai_scan::ScannedItem），读目录即得，不落库。',
-  FfmpegInfo: '运行期探测 ffmpeg 的结果（paths::locate_ffmpeg），不落库。',
-  ExecResult: 'ffmpeg 子进程的 stdout/stderr 返回体，不落库。',
+  FfmpegInfo: '运行期探测 ffmpeg 的结果（fftools::probe_ffmpeg，含来路与提示），不落库。',
 
   // —— 不进库：mpv 运行期状态（Rust 侧只是镜像）——
   MpvPlayerState: 'mpv 属性镜像（player/* 推给前端），不落库。',

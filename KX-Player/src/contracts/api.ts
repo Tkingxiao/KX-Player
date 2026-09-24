@@ -19,7 +19,6 @@ import type {
   Category,
   ConvertItem,
   DirEntry,
-  ExecResult,
   FfmpegInfo,
   MpvPlayerState,
   PlayProgress,
@@ -41,7 +40,7 @@ export * from './dto'
 export interface AppApi {
   openFolder: () => Promise<string[] | null>
   openImageFile: () => Promise<string | null>
-  openAudioFiles: () => Promise<string[]>
+  openMediaFiles: (kind: 'audio' | 'video') => Promise<string[]>
   /** AI-16 导入用的多选文本框；取消 = 空数组 */
   openTextFiles: () => Promise<string[]>
   scanFoldersWithProgress: (paths: string[]) => Promise<ScanResult | null>
@@ -83,7 +82,6 @@ export interface AppApi {
   removeBgImage: () => Promise<boolean>
   /** 启动自检（P0-64）降级提示：取一次即清空，用于首屏 Toast */
   startupWarnings: () => Promise<string[]>
-  ffmpegExec: (args: string[]) => Promise<ExecResult>
   /** ffmpeg 可用性探测（转换页据此降级显示） */
   ffmpegProbe: () => Promise<FfmpegInfo>
   /** 启动转换队列（任务 + convert:progress 事件），返回 taskId */
