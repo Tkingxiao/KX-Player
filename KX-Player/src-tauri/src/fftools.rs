@@ -1,7 +1,13 @@
-//! ffmpeg 执行器：定位 + 参数列表式运行（600s 超时），退出时回收子进程。
+//! ffmpeg 执行器：定位 + 参数列表式运行（按调用方给的超时），退出时回收子进程。
 //! 安全：等价 subprocess.run([...], shell=False)；固定程序名 + 参数数组，无 shell 参与。
 
 use once_cell::sync::Lazy;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,80 +45,248 @@ fn spawn_hidden(exe: std::path::PathBuf, args: &[String]) -> tokio::process::Com
 }
 
 async fn exec_async(exe: std::path::PathBuf, args: &[String], timeout_secs: u64) -> ExecResult {
+    let tail = crate::limits::MAX_CHILD_TAIL_BYTES;
+    let c = run(exe, args, Duration::from_secs(timeout_secs), OutCap::Tail(tail), OutCap::Tail(tail)).await;
+    // 超时/被杀/起不来：保持旧语义 —— stdout/stderr 一律为空，调用方只看 `error`
+    if let Some(e) = c.error {
+        return ExecResult { code: c.code, stdout: None, stderr: None, error: Some(e) };
+    }
+    ExecResult {
+        code: c.code,
+        stdout: Some(String::from_utf8_lossy(&c.stdout).into_owned()),
+        stderr: Some(String::from_utf8_lossy(&c.stderr).into_owned()),
+        error: None,
+    }
+}
+
+/// 子进程输出的收法。
+#[derive(Debug, Clone, Copy)]
+pub enum OutCap {
+    /// 只留**尾部** `n` 字节，前面的读完就丢（ffmpeg 用：报错在尾部，内存有界）
+    Tail(usize),
+    /// 最多收 `n` 字节，**超了就整份不要**（ffprobe 用：JSON 在开头，半截解析不了）
+    Head(u64),
+}
+
+/// 一次子进程捕获的结果。`error` 非空 = 没跑成（起不来/超时/被杀/运行时不可用），
+/// 此时 `stdout`/`stderr` 一律为空。
+#[derive(Debug, Default)]
+pub struct Captured {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub error: Option<String>,
+    /// stdout 触到了上限：`Tail` 模式＝前面的字节被丢了（ffmpeg 用，不判定）；
+    /// `Head` 模式＝已整份清空，调用方必须按「读不到」处理（ffprobe 用）。
+    /// stderr 只有滑动窗口一种收法，调用方不需要判定，故不设对应字段。
+    pub stdout_capped: bool,
+}
+
+// ── 在飞子进程登记表（P1-4）───────────────────────────────────
+//
+// `tokio::process::Child` 只有 `&mut` 接口，跨线程去杀它必须让**持有它的那个任务自己**动手；
+// 也不能按 pid 杀 —— pid 会被系统回收，误杀别人的进程比不杀更糟。所以这里登记的是
+// 「通知 + 回执」：`kill_all` 逐个通知，任务自己 kill 完再 wait 到真的退出，最后置回执。
+
+struct Live {
+    kill: Arc<Notify>,
+    done: Arc<AtomicBool>,
+}
+
+static LIVE: Lazy<parking_lot::Mutex<std::collections::BTreeMap<u64, Live>>> =
+    Lazy::new(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()));
+static LIVE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 退出闸门：`kill_all` 置位后不再允许新的子进程出生（见 `register`）
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// 退出路径是否已经在收摊。给还带循环的任务用来提前收尾（别在退出途中起下一个进程）。
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
+/// 在飞条数（只给用例看）
+#[cfg(test)]
+fn live_count_for_test() -> usize {
+    LIVE.lock().len()
+}
+
+/// 用例里 `kill_all` 会把闸门关上；跑完放回原状，否则同进程里后续用例全被挡
+#[cfg(test)]
+fn reopen_after_test() {
+    SHUTDOWN.store(false, Ordering::SeqCst);
+}
+
+/// 登记一个「即将出生」的子进程。**先登记后 spawn**：登记与 `kill_all` 的置位在同一把锁下
+/// 定序，于是只有两种结果 —— 要么已被 `kill_all` 通知到（`Notify` 会存下这个许可，
+/// 任务随后立刻走 kill 分支），要么看到闸门已关、根本不 spawn。
+fn register() -> Option<(u64, Arc<Notify>, Arc<AtomicBool>)> {
+    let mut live = LIVE.lock();
+    if SHUTDOWN.load(Ordering::SeqCst) {
+        return None;
+    }
+    let id = LIVE_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let kill = Arc::new(Notify::new());
+    let done = Arc::new(AtomicBool::new(false));
+    live.insert(id, Live { kill: Arc::clone(&kill), done: Arc::clone(&done) });
+    Some((id, kill, done))
+}
+
+/// 摘表并置回执：`kill_all` 看到回执时，表里已经没有这一条。
+fn unregister(id: u64, done: &AtomicBool) {
+    LIVE.lock().remove(&id);
+    done.store(true, Ordering::SeqCst);
+}
+
+/// kill 之后**等到它真的退出**（reap）。只 `start_kill` 不 wait，退出路径上就会留下
+/// 还活着的子进程：两种平台上的 kill 都是异步生效的，进程表里的记录要等 wait 才收掉。
+async fn kill_and_reap(child: &mut tokio::process::Child, grace: Duration) -> bool {
+    if child.start_kill().is_err() {
+        // 已经退出了（或拿不到句柄）：wait 一次把状态收掉
+        return child.wait().await.is_ok();
+    }
+    matches!(tokio::time::timeout(grace, child.wait()).await, Ok(Ok(_)))
+}
+
+/// 收流：`Tail` 滑动窗口 / `Head` 超限清空。**读到尾**（EOF）才返回 —— 提前不读会让
+/// 子进程堵在写满的管道上。
+async fn read_capped<R>(s: Option<R>, cap: OutCap) -> (Vec<u8>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut s) = s else {
+        return (Vec::new(), false);
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut capped = false;
+    loop {
+        match s.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                match cap {
+                    OutCap::Tail(window) => {
+                        if buf.len() > window {
+                            let cut = buf.len() - window;
+                            buf.drain(..cut);
+                            capped = true;
+                        }
+                    }
+                    OutCap::Head(max) => {
+                        if buf.len() as u64 > max {
+                            capped = true;
+                        }
+                        if capped {
+                            buf.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (buf, capped)
+}
+
+/// 跑一个子进程并捕获输出：带超时、带输出上限、退出前可被 `kill_all` 收走。
+async fn run(exe: PathBuf, args: &[String], timeout: Duration, oc: OutCap, ec: OutCap) -> Captured {
+    let Some((id, kill, done)) = register() else {
+        return Captured { code: 1, error: Some("应用正在退出，未启动子进程".into()), ..Default::default() };
+    };
     let mut child = match spawn_hidden(exe, args).spawn() {
         Ok(c) => c,
-        Err(e) => return ExecResult { code: -1, stdout: None, stderr: None, error: Some(format!("启动失败: {e}")) },
+        Err(e) => {
+            unregister(id, &done);
+            return Captured { code: -1, error: Some(format!("启动失败: {e}")), ..Default::default() };
+        }
     };
     let out = child.stdout.take();
     let err = child.stderr.take();
-    let wait = async {
-        let (so, se, status) = tokio::join!(read_stream(out), read_err(err), child.wait());
-        ExecResult {
+
+    // 读流与等退出并行；离开 `body` 之后才能再碰 child（它借走了 &mut child）
+    let mut body = Box::pin(async { tokio::join!(read_capped(out, oc), read_capped(err, ec), child.wait()) });
+    let expired = tokio::time::sleep(timeout);
+    tokio::pin!(expired);
+    let notified = kill.notified();
+    tokio::pin!(notified);
+    let (finished, timed_out) = tokio::select! {
+        r = &mut body => (Some(r), false),
+        _ = &mut expired => (None, true),
+        _ = &mut notified => (None, false),
+    };
+    drop(body);
+
+    let result = match finished {
+        Some((so, se, status)) => Captured {
             code: status.map(|s| s.code().unwrap_or(1)).unwrap_or(1),
-            stdout: Some(so),
-            stderr: Some(se),
+            stdout: so.0,
+            stderr: se.0,
+            stdout_capped: so.1,
             error: None,
+        },
+        None => {
+            let reaped = kill_and_reap(&mut child, KILL_GRACE).await;
+            let what = if timed_out {
+                format!("ffmpeg 超时（{} 秒）", timeout.as_secs())
+            } else {
+                "应用退出".to_string()
+            };
+            let msg = if reaped {
+                format!("{what}，子进程已终止并回收")
+            } else {
+                format!("{what}，但子进程没有在 {} 秒内退出", KILL_GRACE.as_secs())
+            };
+            crate::paths::append_log(&format!("[ffmpeg] {msg}"));
+            Captured { code: 1, error: Some(msg), ..Default::default() }
         }
     };
-    tokio::select! {
-        r = wait => r,
-        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-            let _ = child.start_kill();
-            ExecResult { code: 1, stdout: None, stderr: None, error: Some("ffmpeg 超时(600s)".into()) }
-        }
+    unregister(id, &done);
+    result
+}
+
+/// kill 之后等它退出的宽限期；超时只是记日志（不能被一个卡死的子进程拖住退出）。
+const KILL_GRACE: Duration = Duration::from_secs(5);
+/// `kill_all` 等全部回执的总上限。
+const KILL_ALL_GRACE: Duration = Duration::from_secs(5);
+
+/// 同步捕获（阻塞调用线程，借共享运行时驱动）。给 ffprobe 这类「一次探测」用。
+pub fn exec_capture(exe: PathBuf, args: &[String], timeout: Duration, oc: OutCap, ec: OutCap) -> Captured {
+    match runtime() {
+        Ok(rt) => rt.block_on(run(exe, args, timeout, oc, ec)),
+        Err(e) => Captured { code: -1, error: Some(e), ..Default::default() },
     }
 }
 
-async fn read_stream(s: Option<tokio::process::ChildStdout>) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut s = match s {
-        Some(s) => s,
-        None => return String::new(),
-    };
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match s.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > 64 * 1024 {
-                    let cut = buf.len() - 64 * 1024;
-                    buf.drain(..cut);
-                }
-            }
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-async fn read_err(s: Option<tokio::process::ChildStderr>) -> String {
-    use tokio::io::AsyncReadExt;
-    let mut s = match s {
-        Some(s) => s,
-        None => return String::new(),
-    };
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match s.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > 64 * 1024 {
-                    let cut = buf.len() - 64 * 1024;
-                    buf.drain(..cut);
-                }
-            }
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// 应用退出时回收全部 ffmpeg 子进程
+/// 应用退出时回收全部子进程。**必须等它们真的退出再返回**：调用方随后就 `app.exit(0)`，
+/// 只通知不等回收，父进程先没了，ffmpeg 就成了孤儿 —— 还在写盘，谁也看不见。
 pub fn kill_all() {
-    // tokio Child 默认 kill_on_drop=false；进程随主进程退出由 OS 回收，
-    // 转换任务取消将在 convert 模块接入时通过句柄表实现。
+    // 1) 先关闸门并取快照：这一步之后不会再有新的子进程出生（与 spawn 的定序见 register）
+    let live: Vec<Live> = {
+        let table = LIVE.lock();
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        table.values().map(|l| Live { kill: Arc::clone(&l.kill), done: Arc::clone(&l.done) }).collect()
+    };
+    // 2) 队列也要停：否则杀掉当前这个之后，循环会接着起下一个
+    for flag in CONVERT_FLAGS.lock().values() {
+        flag.store(true, Ordering::SeqCst);
+    }
+    if live.is_empty() {
+        return;
+    }
+    for l in &live {
+        l.kill.notify_one();
+    }
+    // 3) 等每个任务自己 kill+wait 完（有总上限：退出不能被一个卡死的子进程拖住）
+    let deadline = Instant::now() + KILL_ALL_GRACE;
+    for l in &live {
+        while !l.done.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                crate::paths::append_log("[ffmpeg] 退出时仍有子进程未确认回收，不再等待");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 // ── 可用性探测 ────────────────────────────────────────────────
@@ -301,7 +475,6 @@ pub fn measure_loudness(path: &str) -> LoudnessResult {
 // ── 转换任务（可取消，任务 + 事件）─────────────────────────────
 
 use std::collections::HashMap as StdHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 /// 转换任务句柄表：task_id → 取消旗标（句柄表模式，见 kill_all 注释）
 static CONVERT_FLAGS: Lazy<parking_lot::Mutex<StdHashMap<u64, std::sync::Arc<AtomicBool>>>> =
@@ -440,7 +613,7 @@ fn build_convert_args(item: &ConvertItem) -> Option<Vec<String>> {
 /// 运行转换队列（前端已排好序）；逐项发 `convert:progress` 事件。
 /// 事件载荷：{ taskId, itemId, state: 'running'|'done'|'failed'|'cancelled', error?, activeCount }
 pub fn run_convert_queue(app: tauri::AppHandle, items: Vec<ConvertItem>) -> u64 {
-    let task_id = CONVERT_SEQ.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+    let task_id = CONVERT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     let cancel = std::sync::Arc::new(AtomicBool::new(false));
     CONVERT_FLAGS.lock().insert(task_id, std::sync::Arc::clone(&cancel));
     std::thread::spawn(move || {
@@ -456,7 +629,7 @@ pub fn run_convert_queue(app: tauri::AppHandle, items: Vec<ConvertItem>) -> u64 
             return;
         };
         for item in &items {
-            if cancel.load(AtomicOrdering::SeqCst) {
+            if cancel.load(Ordering::SeqCst) {
                 let _ = app.emit("convert:progress", serde_json::json!({
                     "taskId": task_id, "itemId": item.id, "state": "cancelled",
                 }));
@@ -476,7 +649,7 @@ pub fn run_convert_queue(app: tauri::AppHandle, items: Vec<ConvertItem>) -> u64 
                 Ok(rt) => rt.block_on(exec_async(exe.clone(), &args, 3600)),
                 Err(e) => ExecResult { code: -1, stdout: None, stderr: None, error: Some(e) },
             };
-            if cancel.load(AtomicOrdering::SeqCst) {
+            if cancel.load(Ordering::SeqCst) {
                 let _ = app.emit("convert:progress", serde_json::json!({
                     "taskId": task_id, "itemId": item.id, "state": "cancelled",
                 }));
@@ -514,7 +687,7 @@ pub fn run_convert_queue(app: tauri::AppHandle, items: Vec<ConvertItem>) -> u64 
 /// 取消转换队列：剩余项标 cancelled（正在执行的 ffmpeg 会跑完当前文件，符合「文件级取消」粒度）
 pub fn cancel_convert_queue(task_id: u64) -> bool {
     if let Some(flag) = CONVERT_FLAGS.lock().get(&task_id) {
-        flag.store(true, AtomicOrdering::SeqCst);
+        flag.store(true, Ordering::SeqCst);
         true
     } else {
         false
@@ -551,7 +724,6 @@ mod tests {
         assert_eq!(parse_integrated_lufs("I: -inf LUFS"), None);
         assert_eq!(parse_integrated_lufs("no loudness here"), None);
     }
-
     // ── 转换项校验（P0-2）────────────────────────────────────────
 
     use super::{build_convert_args, validate_items, ConvertItem, Reject};
@@ -723,5 +895,148 @@ mod tests {
         assert_eq!(ex_args[i + 1], ex.path, "输入紧跟在 -i 后面");
         assert_eq!(ex_args.last().unwrap(), &ex.out_path, "输出路径是最后一个参数");
         assert!(!ex_args.iter().any(|a| a == "-ac" || a == "-ar"), "保持源声道/采样率");
+    }
+
+    // ── 子进程通道：超时 / 输出上限 / 退出回收（P1-4）──────────────
+
+    use super::{exec_capture, kill_all, live_count_for_test, reopen_after_test, shutdown_requested, OutCap};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// 这些用例会真的起子进程、还会动全局的退出闸门，串行跑以免互相踩
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 会输出一行文本的子进程（用系统自带的 echo，不依赖 ffmpeg）
+    fn echo(text: &str) -> (PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            (PathBuf::from("cmd.exe"), vec!["/C".into(), format!("echo {text}")])
+        } else {
+            (PathBuf::from("sh"), vec!["-c".into(), format!("echo {text}")])
+        }
+    }
+
+    /// 会活很久的子进程。**不套 cmd/sh**：套一层的话被杀的只是外层壳，
+    /// 里面那个进程会顶替成新的孤儿，正好盖住要验的东西。
+    fn sleeper(secs: u32) -> (PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            (PathBuf::from("ping.exe"), vec!["-n".into(), (secs + 1).to_string(), "127.0.0.1".into()])
+        } else {
+            (PathBuf::from("sleep"), vec![secs.to_string()])
+        }
+    }
+
+    fn tail(n: usize) -> OutCap {
+        OutCap::Tail(n)
+    }
+
+    #[test]
+    fn a_child_that_exits_normally_reports_code_and_output() {
+        let _serial = serial();
+        let (exe, args) = echo("hi");
+        let c = exec_capture(exe, &args, Duration::from_secs(20), tail(64), tail(64));
+        assert!(c.error.is_none(), "{:?}", c.error);
+        assert_eq!(c.code, 0);
+        assert_eq!(String::from_utf8_lossy(&c.stdout).trim(), "hi");
+        assert!(!c.stdout_capped);
+        assert_eq!(live_count_for_test(), 0, "正常收尾也要摘表");
+    }
+
+    #[test]
+    fn tail_mode_keeps_only_the_last_bytes() {
+        let _serial = serial();
+        let (exe, args) = echo("0123456789");
+        let c = exec_capture(exe, &args, Duration::from_secs(20), tail(6), tail(64));
+        assert!(c.error.is_none(), "{:?}", c.error);
+        assert!(c.stdout_capped, "超出窗口要如实标记");
+        assert_eq!(String::from_utf8_lossy(&c.stdout).trim(), "6789");
+    }
+
+    /// ffprobe 的 JSON 在开头：超限必须整份拒绝，不能留半截（半截也解析不了）
+    #[test]
+    fn head_mode_rejects_a_stream_over_the_cap_instead_of_truncating() {
+        let _serial = serial();
+        let (exe, args) = echo("0123456789");
+        let c = exec_capture(exe, &args, Duration::from_secs(20), OutCap::Head(4), tail(64));
+        assert_eq!(c.code, 0, "子进程本身是成功的：判不判定上限是调用方的事");
+        assert!(c.stdout_capped);
+        assert!(c.stdout.is_empty(), "超限必须整份丢弃，不能留半截");
+    }
+
+    #[test]
+    fn a_program_that_does_not_exist_is_reported_not_panicked() {
+        let _serial = serial();
+        let c = exec_capture(
+            PathBuf::from("kx-definitely-not-a-program"),
+            &[],
+            Duration::from_secs(5),
+            tail(64),
+            tail(64),
+        );
+        assert_eq!(c.code, -1);
+        assert!(c.error.as_deref().unwrap_or("").contains("启动失败"), "{:?}", c.error);
+        assert_eq!(live_count_for_test(), 0, "起不来也要把登记摘掉");
+    }
+
+    /// 到点就回：不等子进程自己跑完，且 kill 之后必须 wait 到它真的退出（reap）
+    #[test]
+    fn a_timeout_kills_and_reaps_the_child() {
+        let _serial = serial();
+        let (exe, args) = sleeper(30);
+        let t0 = Instant::now();
+        let c = exec_capture(exe, &args, Duration::from_millis(300), tail(64), tail(64));
+        let dt = t0.elapsed();
+        assert!(c.error.as_deref().unwrap_or("").contains("超时"), "要如实说是超时：{:?}", c.error);
+        assert!(dt < Duration::from_secs(10), "到点就该回来，不能等它自己跑完：{dt:?}");
+        assert_eq!(live_count_for_test(), 0, "kill 之后必须等到真的退出，表里不能留档");
+    }
+
+    /// 退出路径：`kill_all` 通知在飞子进程自己 kill+wait，**等回收完才返回**
+    /// （调用方随后就 app.exit(0)，只通知不等＝留下还在写盘的孤儿）
+    #[test]
+    fn kill_all_stops_and_reaps_an_in_flight_child() {
+        let _serial = serial();
+        let (exe, args) = sleeper(30);
+        let handle = std::thread::spawn(move || {
+            exec_capture(exe, &args, Duration::from_secs(120), tail(64), tail(64))
+        });
+        let t0 = Instant::now();
+        while live_count_for_test() == 0 {
+            assert!(t0.elapsed() < Duration::from_secs(10), "子进程没有登记上，用例前提不成立");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t1 = Instant::now();
+        kill_all();
+        let dt = t1.elapsed();
+        let c = handle.join().expect("执行线程应结束");
+        assert!(dt < Duration::from_secs(10), "kill_all 必须等到回收完才返回：{dt:?}");
+        assert!(c.error.is_some(), "被杀的子进程不该报成功：{c:?}");
+        assert_eq!(live_count_for_test(), 0);
+        assert!(shutdown_requested(), "闸门要关上");
+        reopen_after_test();
+        assert!(!shutdown_requested());
+    }
+
+    #[test]
+    fn kill_all_with_nothing_running_is_a_no_op() {
+        let _serial = serial();
+        kill_all();
+        assert_eq!(live_count_for_test(), 0);
+        reopen_after_test();
+    }
+
+    /// 闸门关上之后不再出生新子进程：否则退出途中还会起进程，而那时已经没人收了
+    #[test]
+    fn no_child_is_born_after_kill_all() {
+        let _serial = serial();
+        kill_all();
+        let (exe, args) = echo("hi");
+        let c = exec_capture(exe, &args, Duration::from_secs(10), tail(64), tail(64));
+        assert!(c.error.as_deref().unwrap_or("").contains("退出"), "{:?}", c.error);
+        assert!(c.stdout.is_empty());
+        assert_eq!(live_count_for_test(), 0);
+        reopen_after_test();
     }
 }

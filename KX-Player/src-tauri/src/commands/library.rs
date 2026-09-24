@@ -206,8 +206,11 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
         let mut failed = 0usize;
         let mut cancelled = false;
         for (id, path) in &tracks {
-            // 被新任务取代或收到取消请求时退出
-            if LOUDNESS_CANCEL.load(Ordering::SeqCst) || LOUDNESS_GENERATION.load(Ordering::SeqCst) != gen {
+            // 被新任务取代、收到取消请求，或应用正在退出时收尾
+            if LOUDNESS_CANCEL.load(Ordering::SeqCst)
+                || LOUDNESS_GENERATION.load(Ordering::SeqCst) != gen
+                || crate::fftools::shutdown_requested()
+            {
                 cancelled = true;
                 break;
             }

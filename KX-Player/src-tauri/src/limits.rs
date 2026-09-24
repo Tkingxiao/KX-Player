@@ -22,6 +22,13 @@ pub const MAX_DIR_ENTRIES: usize = 20_000;
 /// 单次 HTTP 响应体的上限（AI 对话、模型清单）。对流式/无 `Content-Length` 的响应
 /// 也要在读到上限时停下，不能等对方把话说完。
 pub const MAX_AI_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// 子进程（ffmpeg）输出的**尾部**窗口：有价值的信息（报错、ebur128 汇总）都在最后几行，
+/// 前面的大段进度没有价值。超出部分读完就丢 —— 管道照常抽干，子进程不会因为没人读而堵住。
+pub const MAX_CHILD_TAIL_BYTES: usize = 64 * 1024;
+/// ffprobe 单次探测 stdout 的上限。ffprobe 的 JSON 在**开头**，所以这里不能只留尾部：
+/// 超限就**整份拒绝**（半截 JSON 解析不了，比读不到更难查）。正常文件是几 KB 级，
+/// 4 MiB 是「真的用得上的最大值再留一倍」之外再留一档。
+pub const MAX_FFPROBE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 超限就拒绝，**不截断**：截出来的文本会静默变成「另一份歌词」，截出来的图片是坏图 ——
 /// 比直接读不到更难排查。`Err` 里的句子直接进日志。
