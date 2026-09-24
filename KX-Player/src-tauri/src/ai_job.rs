@@ -188,6 +188,25 @@ pub fn cancel(task_id: u64) -> bool {
     }
 }
 
+/// 命令层在开跑前就拦下的启动（路径越界等）：**不登记任务表**（没有东西在跑，
+/// `cancel` 也不该认它），只把原因用与正常收尾同构的一条事件送达 ——
+/// `ai_translate_start` 的返回类型是 taskId、回不了错误信封，前端也就少一个分支。
+pub fn reject(app: AppHandle, units: usize, error: String) -> u64 {
+    let task_id = AI_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Err(e) = app.emit("ai:progress", rejected_event(task_id, units, error)) {
+        crate::paths::append_log(&format!("[ai] 启动被拒且事件也投不出去: {e}"));
+    }
+    task_id
+}
+
+/// 拒绝事件的口径与 `run_all` 的提前退出完全一致：`queue-finished` 带 error，
+/// 位置字段是「整批的队首」（`file_index = 0`、`file_count = 条数`）。
+fn rejected_event(task_id: u64, units: usize, error: String) -> AiProgress {
+    let mut p = progress(task_id, "queue-finished", Loc::new("", 0, units));
+    p.error = Some(error);
+    p
+}
+
 pub(crate) fn progress(task_id: u64, state: &str, loc: Loc<'_>) -> AiProgress {
     AiProgress {
         task_id,
@@ -321,5 +340,15 @@ mod tests {
         assert!(serde_json::to_value(&ok).unwrap().get("error").is_none());
         ok.error = Some("请求失败: 连接被拒绝".into());
         assert_eq!(serde_json::to_value(&ok).unwrap()["error"], "请求失败: 连接被拒绝");
+    }
+
+    /// 启动被拒（路径越界）走的是与收尾同形的一条事件：前端只认 `queue-finished` 收工，
+    /// 位置字段是整批队首，`fileCount` 仍是这批的条数（界面要显示「这一批几行」）。
+    #[test]
+    fn a_rejected_start_still_finishes_the_queue_with_the_reason() {
+        let p = rejected_event(11, 3, "路径不在已授权的范围内：x.lrc（不在任何已授权目录里）".into());
+        assert_eq!((p.task_id, p.state.as_str(), p.file_index, p.file_count), (11, "queue-finished", 0, 3));
+        assert_eq!(p.error.as_deref(), Some("路径不在已授权的范围内：x.lrc（不在任何已授权目录里）"));
+        assert!(p.translated.is_none(), "被拒的启动不带译文");
     }
 }

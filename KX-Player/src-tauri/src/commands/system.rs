@@ -3,10 +3,11 @@
 use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::model::{AiChatPayload, AiChatResult, AiModelsResult, AiPingResult, BgImageData};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use super::join_task;
+use crate::scope::PathScope;
 use crate::state::AppWindowsState;
 
 // ── 设置 ────────────────────────────────────────────────────────
@@ -150,9 +151,31 @@ pub async fn ai_list_models(base_url: String, api_key: String) -> AiModelsResult
     crate::ai::list_models(&base_url, api_key.as_str()).await
 }
 
+/// AI 命令的路径闸门（P0-1 的 AI 侧）：与 `rename` / `convert` 同口径 —— 任一条不在授权范围内
+/// 就**整批拒**（要么全做要么不做）。返回「哪一条 + 为什么」，文案由调用方组装：能回错误信封的
+/// 用 `IpcError::outside_scope`，`ai_translate_start` 回不了（它的返回类型是 taskId），
+/// 改用收尾事件的 `error` 送达。合法来路只有一条：路径出自 `open_folder` 选中的目录
+/// （`subtitle_scan_dir` 扫出来的），所以正常流程走不到这里 —— 这是道边界，不是默认路径。
+fn scope_denial(scope: &PathScope, cmd: &str, paths: &[String]) -> Option<(String, String)> {
+    match scope.check_all(paths) {
+        Ok(()) => None,
+        Err((bad, why)) => {
+            crate::paths::append_log(&format!("[scope] {cmd} 拒绝整批：{bad}（{why:?}）"));
+            Some((bad, why.to_string()))
+        }
+    }
+}
+
 /// 启动字幕翻译任务（返回 taskId；进度与结果走 ai:progress 事件，见 B3）
 #[tauri::command]
-pub fn ai_translate_start(app: AppHandle, spec: crate::ai_job::AiTranslateSpec) -> u64 {
+pub fn ai_translate_start(
+    app: AppHandle,
+    scope: State<'_, crate::scope::PathScope>,
+    spec: crate::ai_job::AiTranslateSpec,
+) -> u64 {
+    if let Some((bad, why)) = scope_denial(&scope, "ai_translate_start", &spec.paths) {
+        return crate::ai_job::reject(app, spec.paths.len(), format!("路径不在已授权的范围内：{bad}（{why}）"));
+    }
     crate::ai_job::run_translate(app, spec)
 }
 
@@ -173,9 +196,16 @@ pub fn ai_texts_start(app: AppHandle, spec: crate::ai_job::AiTextsSpec) -> u64 {
 /// 整条链路不碰 Provider（`05` 第 16 条要的兜底路径），参数只有路径列表。
 /// 保存框被取消回 `CANCELLED`（前端据此不出 Toast），写盘失败才回 `IO_FAILED`。
 #[tauri::command]
-pub async fn ai_export_prompts(app: AppHandle, paths: Vec<String>) -> IpcResult<crate::ai_export::ExportResult> {
+pub async fn ai_export_prompts(
+    app: AppHandle,
+    scope: State<'_, crate::scope::PathScope>,
+    paths: Vec<String>,
+) -> IpcResult<crate::ai_export::ExportResult> {
     if paths.is_empty() {
         return Err(IpcError::invalid_argument("没有选中的字幕文件"));
+    }
+    if let Some((bad, why)) = scope_denial(&scope, "ai_export_prompts", &paths) {
+        return Err(IpcError::outside_scope(&bad, why));
     }
     join_task(
         "导出翻译批次",
@@ -213,12 +243,20 @@ pub async fn ai_export_prompts(app: AppHandle, paths: Vec<String>) -> IpcResult<
 /// 一点不碰磁盘 —— 预览与落地是同一个函数，所以「报可以写几篇」和「实际写了几篇」不会脱节。
 /// 译文文本由前端读（`read_text_file` 管编码），这里不再开第二次对话框。
 #[tauri::command]
-pub async fn ai_import_translations(paths: Vec<String>, text: String, apply: bool) -> IpcResult<crate::ai_export::ImportResult> {
+pub async fn ai_import_translations(
+    scope: State<'_, crate::scope::PathScope>,
+    paths: Vec<String>,
+    text: String,
+    apply: bool,
+) -> IpcResult<crate::ai_export::ImportResult> {
     if paths.is_empty() {
         return Err(IpcError::invalid_argument("没有选中的字幕文件"));
     }
     if text.trim().is_empty() {
         return Err(IpcError::invalid_argument("译文是空的"));
+    }
+    if let Some((bad, why)) = scope_denial(&scope, "ai_import_translations", &paths) {
+        return Err(IpcError::outside_scope(&bad, why));
     }
     join_task(
         "导入翻译批次",
@@ -238,10 +276,21 @@ pub async fn ai_import_translations(paths: Vec<String>, text: String, apply: boo
 /// async + spawn_blocking：整棵树的 readdir 是 IO，同步命令会在主线程跑（见 `commands/library.rs` 的口径）。
 #[tauri::command]
 pub async fn subtitle_scan_dir(
+    app: AppHandle,
     dir: String,
     max_depth: Option<usize>,
     limit: Option<usize>,
 ) -> Vec<crate::ai_scan::ScannedItem> {
+    // 扫描整批拒（与 `scan_folders` 同口径）：回不了错误信封，拒绝就是空列表（原因在 `[scope]` 日志里）。
+    // scope 从 `AppHandle` 取而不是当入参：Tauri 不允许「带引用的 async 命令返回非 Result」，
+    // 而且这里要在 `spawn_blocking().await` 之前就把借用放掉。
+    let denied = {
+        let scope = app.state::<PathScope>();
+        scope_denial(&scope, "subtitle_scan_dir", std::slice::from_ref(&dir)).is_some()
+    };
+    if denied {
+        return vec![];
+    }
     // 深度与数量的缺省值来自旧前端那次递归：字幕 4/500
     let max_depth = max_depth.unwrap_or(4);
     let limit = limit.unwrap_or(500);
@@ -264,5 +313,37 @@ pub async fn subtitle_scan_dir(
             crate::paths::append_log(&format!("[ai] subtitle_scan_dir 阻塞任务失败: {e}"));
             vec![]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AI 命令共用的闸门：一条越界整批拒，并且要**指出是哪一条** ——
+    /// 用户侧只能看到「这批没跑」，日志与错误文案是唯一能定位到那个文件的地方。
+    #[test]
+    fn the_ai_scope_gate_refuses_the_whole_batch_and_names_the_offender() {
+        let root = std::env::temp_dir().join(format!("kx-ai-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("music")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let inside = root.join("music").join("a.lrc");
+        let outside = root.join("other").join("b.lrc");
+        std::fs::write(&inside, "[00:01.00]x").unwrap();
+        std::fs::write(&outside, "[00:01.00]x").unwrap();
+
+        let scope = PathScope::new();
+        let ok = vec![inside.to_string_lossy().to_string()];
+        let mixed = vec![ok[0].clone(), outside.to_string_lossy().to_string()];
+
+        let (bad, _) = scope_denial(&scope, "t", &ok).expect("空范围里什么都该拒");
+        assert!(bad.ends_with("a.lrc"), "{bad}");
+        assert!(scope.allow_root(&root.join("music")));
+        assert!(scope_denial(&scope, "t", &ok).is_none(), "授权目录里的文件必须放行");
+        let (bad, why) = scope_denial(&scope, "t", &mixed).expect("混进一条越界就得整批拒");
+        assert!(bad.ends_with("b.lrc"), "要指出是哪一条：{bad}");
+        assert!(why.contains("不在任何已授权目录里"), "{why}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
