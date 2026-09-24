@@ -227,49 +227,28 @@ pub async fn ai_import_translations(paths: Vec<String>, text: String, apply: boo
     )
 }
 
-/// 递归扫描目录（subtitle = 字幕文件，dir = 子目录）。替代前端的 api.listDir 递归：
+/// 递归扫描字幕文件。替代前端的 api.listDir 递归：
 /// 旧实现每层一次 IPC，一个音乐库目录树要几百次往返，且顺序随 readdir 漂移。
 /// async + spawn_blocking：整棵树的 readdir 是 IO，同步命令会在主线程跑（见 `commands/library.rs` 的口径）。
 #[tauri::command]
 pub async fn subtitle_scan_dir(
     dir: String,
-    kind: String,
     max_depth: Option<usize>,
     limit: Option<usize>,
 ) -> Vec<crate::ai_scan::ScannedItem> {
-    let kind = match kind.as_str() {
-        "dir" => crate::ai_scan::ScanKind::Dir,
-        _ => crate::ai_scan::ScanKind::Subtitle,
-    };
-    // 深度与数量的缺省值来自旧前端的两处递归：字幕 4/500、目录 3/300
-    let (default_depth, default_limit) = match kind {
-        crate::ai_scan::ScanKind::Dir => (3, 300),
-        crate::ai_scan::ScanKind::Subtitle => (4, 500),
-    };
-    let max_depth = max_depth.unwrap_or(default_depth);
-    let limit = limit.unwrap_or(default_limit);
+    // 深度与数量的缺省值来自旧前端那次递归：字幕 4/500
+    let max_depth = max_depth.unwrap_or(4);
+    let limit = limit.unwrap_or(500);
     let db = crate::paths::library_db_path();
-    let db2 = db.clone();
     match tauri::async_runtime::spawn_blocking(move || {
-        let mut items = crate::ai_scan::scan_dir(&dir, kind, max_depth, limit);
-        // 回填「已翻译可豁免」：字幕 → 上级账命中且译文还在；目录 → 已生成过译名。
-        // 缓存读失败不阻断扫描（默认全部未翻译）。
-        if kind == crate::ai_scan::ScanKind::Subtitle {
-            let _ = crate::db::with_db_text(&db, |c| {
-                for i in items.iter_mut() {
-                    i.translated = crate::ai_cache::subtitle_cached(c, &i.path);
-                }
-                Ok(())
-            });
-        } else {
-            let suggestions = crate::db::with_db_text(&db2, |c| {
-                crate::ai_cache::load_folder_suggestions(c).map_err(|e| e.to_string())
-            })
-            .unwrap_or_default();
+        let mut items = crate::ai_scan::scan_dir(&dir, max_depth, limit);
+        // 回填「已翻译可豁免」：上级账命中且译文文件还在。缓存读失败不阻断扫描（默认全部未翻译）。
+        let _ = crate::db::with_db_text(&db, |c| {
             for i in items.iter_mut() {
-                i.translated = suggestions.contains_key(&i.path);
+                i.translated = crate::ai_cache::subtitle_cached(c, &i.path);
             }
-        }
+            Ok(())
+        });
         items
     })
     .await
@@ -280,26 +259,4 @@ pub async fn subtitle_scan_dir(
             vec![]
         }
     }
-}
-
-/// AI 翻译豁免账：已生成的文件夹名译名（原目录名 → 译名）。改名的确定性建议落在这里，
-/// 没应用前也有，重新点「生成译名」就从账里复用而不是再问一次模型。
-#[tauri::command]
-pub fn ai_cache_folder_suggestions() -> std::collections::HashMap<String, String> {
-    crate::db::with_db_text(&crate::paths::library_db_path(), |c| {
-        crate::ai_cache::load_folder_suggestions(c).map_err(|e| e.to_string())
-    })
-    .unwrap_or_default()
-}
-
-/// 手动记一条文件夹名译名（前端「生成译名」成功后调用，让豁免账跟上）。
-#[tauri::command]
-pub fn ai_cache_record_folder(path: String, suggestion: String) -> bool {
-    if path.trim().is_empty() || suggestion.trim().is_empty() {
-        return false;
-    }
-    crate::db::with_db_text(&crate::paths::library_db_path(), |c| {
-        crate::ai_cache::record_folder(c, path.trim(), suggestion.trim()).map_err(|e| format!("记录失败: {e}"))
-    })
-    .is_ok()
 }

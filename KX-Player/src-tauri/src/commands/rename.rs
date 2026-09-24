@@ -4,7 +4,8 @@
 //! 同一个纯函数。前端回传「要改哪些」等于把判定权交给一份可能已经过期的列表 —— 列表一变，
 //! 手上那份映射就指向别的文件（接力棒坑 33）。模型译名同理：`rename_suggest_names` 只把名字
 //! **写进库**，落地的仍然是 `rename_apply` 按片段查出来的那一份；`rename_reject_suggestion` 也只是
-//! 往拒绝表里写一行，显示侧与落地侧各自在查库时复核（`04 §7.7` 第 9 条）。
+//! 往拒绝表里写一行，显示侧与落地侧共用同一条判据（`ai_ledger::ledger_state`，`04 §7.7` 第 9 条）——
+//! 预览说「跳过」的那一条，落地时确实一个字都不会动它。
 //!
 //! 会写盘的是 `rename_apply` / `rename_rollback` / `rename_redo` 三条，它们只动**已经定稿**的那部分
 //! （本地规则改完就算定稿，要问模型的得先在译名库里过完九道校验；撞名的都不碰），
@@ -18,6 +19,7 @@ use crate::error::{IpcError, IpcResult};
 use crate::rename::ai_ask::{self, NameReport};
 use crate::rename::ai_ledger;
 use crate::rename::batch::Batch;
+use crate::rename::judge::Skipped;
 use crate::rename::preview::Preview;
 use crate::rename::report::Report;
 
@@ -25,6 +27,10 @@ use crate::rename::report::Report;
 /// **一个字节都不写**：只 `read_dir` 加读一次译名库（给已经问到、且没被拒过的名字盖章），
 /// 不改名、不建批次、不写 history。
 /// 目录列不出来时不静默当空目录，路径进 `unreadable` 如实上报（`04 §7.1` 第 5 条的边界）。
+///
+/// 判定树手里没有库，所以「锁定 / 已拒绝」（`04 §7.2` 第 1 条）靠一个探针按库里的事实回答：
+/// 这里给的就是 `apply` 后来会用的那条判据（被拒过**那个名字**才跳过），预览列出的档位因此
+/// 与落地做的事对得上 —— 不会出现「预览说跳过、落地照改名」。
 #[tauri::command]
 pub async fn rename_preview(paths: Vec<String>) -> IpcResult<Preview> {
     if paths.is_empty() {
@@ -34,7 +40,9 @@ pub async fn rename_preview(paths: Vec<String>) -> IpcResult<Preview> {
         "预览改名",
         tauri::async_runtime::spawn_blocking(move || {
             in_db(|conn| {
-                let mut p = crate::rename::listing::preview_roots(&paths);
+                let mut p = crate::rename::listing::preview_roots_with(&paths, &|it| {
+                    ai_ledger::blocked_by_refusal(conn, it).then_some(Skipped::Rejected)
+                });
                 ai_ledger::annotate(conn, &mut p);
                 Ok(p)
             })

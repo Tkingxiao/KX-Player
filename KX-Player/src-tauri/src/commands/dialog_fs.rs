@@ -164,11 +164,6 @@ pub fn list_dir(path: String) -> Vec<DirEntryInfo> {
 }
 
 #[tauri::command]
-pub fn rename_dir(old_path: String, new_path: String) -> crate::error::IpcResult<()> {
-    crate::ai::rename_dir(&old_path, &new_path)
-}
-
-#[tauri::command]
 pub fn tools_save_file(path: String, base64_data: String) -> bool {
     let bytes = match base64::engine::general_purpose::STANDARD.decode(&base64_data) {
         Ok(b) => b,

@@ -165,31 +165,6 @@ pub fn put_content(conn: &Connection, key: &str, content: &str) -> rusqlite::Res
     Ok(())
 }
 
-/// 已生成的文件夹名译名（按目录路径）。给「生成译名」点第二次时复用，不烧 token。
-pub fn load_folder_suggestions(conn: &Connection) -> rusqlite::Result<std::collections::HashMap<String, String>> {
-    let mut out = std::collections::HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT source_path, result_text FROM ai_translate_cache WHERE kind = 'folder' AND result_text IS NOT NULL",
-    )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    for r in rows {
-        let (path, text) = r?;
-        out.insert(path, text);
-    }
-    Ok(out)
-}
-
-/// 记一条文件夹名译名建议。
-pub fn record_folder(conn: &Connection, path: &str, suggestion: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO ai_translate_cache (kind, source_path, result_text, translated_at) \
-         VALUES ('folder', ?1, ?2, ?3) \
-         ON CONFLICT(source_path) DO UPDATE SET result_text=excluded.result_text, translated_at=excluded.translated_at",
-        rusqlite::params![path, suggestion, now_ms()],
-    )?;
-    Ok(())
-}
-
 /// 该字幕文件是否「已翻译可豁免」。扫描命令对每个扫到的字幕调它回填 `translated`。
 pub fn subtitle_cached(conn: &Connection, path: &str) -> bool {
     let Some(st) = stat(path) else { return false };
@@ -294,23 +269,6 @@ mod tests {
         put_content(&conn, "new", "y").unwrap();
         assert_eq!(get_content(&conn, "new").unwrap().as_deref(), Some("y"));
         assert_eq!(get_content(&conn, "f000").unwrap(), None, "最旧应被淘汰");
-    }
-
-    #[test]
-    fn folder_suggestion_is_recorded_and_loaded() {
-        let conn = db();
-        record_folder(&conn, "C:/主目录", "Main").unwrap();
-        record_folder(&conn, "C:/子", "Sub").unwrap();
-        let map = load_folder_suggestions(&conn).unwrap();
-        assert_eq!(map.get("C:/主目录").map(String::as_str), Some("Main"));
-        assert!(map.contains_key("C:/主目录"));
-        assert_eq!(map.len(), 2);
-        record_folder(&conn, "C:/主目录", "MainV2").unwrap();
-        assert_eq!(
-            load_folder_suggestions(&conn).unwrap().get("C:/主目录").map(String::as_str),
-            Some("MainV2"),
-            "覆盖更新"
-        );
     }
 
     #[test]

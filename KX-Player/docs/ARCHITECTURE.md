@@ -475,55 +475,56 @@ tags(id, name UNIQUE, color, kind DEFAULT 'topic', use_count)
 
 ## 9. AI 子系统现状
 
-**结论：实现的不是规范 `04-ai-subsystem.md` 描述的东西。**
-
-规范 `05 §1` 第 17 步排的是「批量**重命名**」AI（`services/ai/rename/{decide,normalize}.rs` +
-`commands/rename.rs` + `rename_history.json` + 本地 Ollama Provider + 缓存 + 后置校验 +
-`ai.exportPrompts`/`ai.importTranslations`）。**这些都不存在**：
+**结论：规范 `04-ai-subsystem.md` 描述的能力现在基本都在代码里，但对不上规范给的路径名** ——
+规范写 `services/ai/…`，本仓库没有 `services/` 这一层（§2 的分层）：改名主干落在 `src-tauri/src/rename/`
+（16 个文件），字幕翻译链路落在 `src-tauri/src/ai_*.rs`（9 个文件）。
 
 | 规范要求的 AI 能力 | 现状 |
 |---|---|
-| `services/ai/rename/decide.rs`（判定分级） | ❌ 不存在 |
-| `services/ai/rename/normalize.rs`（前缀切分/规范化） | ❌ 不存在 |
-| `commands/rename.rs` + 冲突检测 + 回滚 + `rename_history.json` | ❌ 不存在（只有给分类改名的 `taxonomy_rename_category` 和重命名文件夹的 `rename_dir`） |
-| `infra/ai/{credentials,http}.rs` | ❌ 不存在（凭据**只存内存**，见下） |
-| `providers/{ollama,openai,anthropic,gemini}` | ❌ 不存在，只有**一个** OpenAI 兼容客户端 |
-| `services/ai/{job,cache,prompt}.rs` + 后置校验 | ❌ 不存在（无缓存、无 prompt 版本、无 SYSTEM 前缀哈希） |
-| `ai.exportPrompts` / `ai.importTranslations` | ❌ 不存在 |
-| 字幕/歌词翻译闭环 | ✅ **存在**，是 AI 域唯一落地的东西 |
+| `services/ai/rename/decide.rs`（判定分级） | ✅ 等价物 `rename/judge.rs`（十四级前置判定树）+ `rename/rules.rs`（词表） |
+| `services/ai/rename/normalize.rs`（前缀切分/规范化） | ✅ 等价物 `rename/norm.rs`（先把序号前缀切出来原样留着，再按符号表收敛） |
+| `commands/rename.rs` + 冲突检测 + 回滚 + `rename_history.json` | ✅ 七条命令（`rename_preview` / `apply` / `suggest_names` / `reject_suggestion` / `rollback` / `redo` / `batches`）；批次账 `rename/batch.rs`、原始名账 `rename/history.rs`、执行与撤销 `apply.rs` / `rollback.rs` |
+| `infra/ai/{credentials,http}.rs` | ❌ 不存在（凭据**只在内存**，见下） |
+| `providers/{ollama,openai,anthropic,gemini}` | ❌ 不存在，只有**一个** OpenAI 兼容客户端；Ollama 靠 `/v1/models` 与 `/api/tags` 两种列表形状兼容 |
+| `services/ai/{job,cache,prompt}.rs` + 后置校验 | ✅ `ai_job.rs`（任务与 `ai:progress`）/ `ai_cache.rs`（豁免账 + `blake3(提示词版本 + 原文)` 复用缓存，LRU 淘汰）/ `ai_prompt.rs`（`SUBTITLE_PROMPT_VERSION`）；后置九道校验 = `rename/postcheck.rs`，只管译名 |
+| `ai.exportPrompts` / `ai.importTranslations` | ✅ `ai_export_prompts` / `ai_import_translations`（`commands/system.rs`，实现在 `ai_export.rs` + `ai_wire.rs`）—— 没有 Provider 也能走完一批（AI-16） |
+| 字幕/歌词翻译闭环 | ✅ 扫描 `ai_scan.rs` → 切块与重试 `ai_chunk.rs` → 逐块请求 `ai_job.rs` → 回写同目录 `.zh` 文件 |
 
-**实际实现（三块）**：
+**实际实现的层次**：
 
-1. **Rust 侧传输层** `ai.rs`（222 行）：`POST {base}/v1/chat/completions`，
-   `reqwest::blocking`（不是 async）。三个命令：
-   - `ai_chat`（只要正文）
-   - `ai_ping`（连通性测试，回显 `model`/`latencyMs`/`totalTokens`；失败时这几个键整键缺席，
-     见 `model.rs` 的 `#[serde(skip_serializing_if)]`，前端 `AiPingResult` 里注明为可选）
-   - `ai_list_models`（解析 `/v1/models`，兼容 Ollama 的列表形状）
+1. **传输层** `ai.rs`（309 行）：`POST {base}/v1/chat/completions`，**async** `reqwest::Client`
+   （B3 之前是 `reqwest::blocking` + 同步命令，`client()` 上头的注释记了为什么换）。对外三个命令
+   `ai_chat` / `ai_ping` / `ai_list_models`。`normalize_base_url` 去尾斜杠、无版本段时补 `/v1`，
+   空值时默认 `http://127.0.0.1:11434`（**本地 Ollama 优先**）。`brief()` 按**字符**截断而非字节 ——
+   注释记录了原因：`&text[..n]` 落在多字节字符中间会 panic，而 panic 在命令线程上会把「HTTP 状态 +
+   厂商原文」全丢成一句「任务失败」。
 
-   `normalize_base_url` 去尾斜杠、无版本段时补 `/v1`（`ai.rs:9-22`），
-   空值时默认 `http://127.0.0.1:11434`（**本地 Ollama 优先**，符合规范第 ③ 步精神）。
-   `brief()`（`ai.rs:46-53`）按**字符**截断而非字节 —— 注释记录了原因：`&text[..n]` 落在多字节
-   字符中间会 panic，而 panic 在命令线程上会把「HTTP 状态 + 厂商原文」全丢成一句「任务失败」。
-   同批把 `ai_ping` 的 `&reply[..60]` 也统一过来。
+2. **字幕链路** `ai_scan.rs`（列目录）→ `ai_chunk.rs`（切块、重试、对半拆）→ `ai_job.rs`（任务与
+   `ai:progress`）；参数在 `ai_strategy.rs`（外接与本地两套档位：批量大小 / 并发 / 超时 / 重试 /
+   是否对半拆），提示词与「编号. 译文」解析在 `ai_prompt.rs`，账在 `ai_cache.rs`（豁免账 +
+   `blake3(提示词版本 + 原文)` 复用缓存，有容量上限、LRU 淘汰），无 Provider 的导出导入在
+   `ai_export.rs` + `ai_wire.rs`。译文回写**同目录 `{base}.zh.{ext}`**。前端只剩
+   `src/services/aiTranslate.ts`（147 行）：启动 + 收事件 + 取消 —— 逐块循环搬进 Rust 之后再留在
+   前端就是每块过一次 IPC，等于没搬；提示词与解析也**只有 Rust 那一份**。
 
-2. **前端编排层** `src/services/aiTranslate.ts`（264 行）：递归扫 `.lrc/.srt/.vtt`（深度 ≤4、
-   数量 ≤500）→ 解析出可翻译段 → 分块送 LLM → 回写**同目录 `{base}.zh.{ext}`**。
-   文件写入走 `tools_save_file`（base64，见 `dialog_fs.rs`）。
+3. **改名主干** `src-tauri/src/rename/`（16 个文件）：判定 → 本地规范化 → 预览（只读盘）→ 生成译名
+   （模型给的名字要过 `postcheck.rs` 九道校验才入账）→ 应用（**唯一会写盘的那一段**）→ 整批回滚 /
+   重做。
 
-3. **视图** `src/features/ai/AiTranslateView.vue`：工作台三区骨架（身份栏 / 左列 / 右区），
-   三个工种（字幕翻译 / 文件夹名翻译 / 规则改名）用 `v-show` 切换；
-   配套组件同目录（JobTable / FailureDetail / ActionRail / ProgressBand / queueStats）。
+4. **视图** `src/features/ai/AiTranslateView.vue`（546 行）：工作台三区骨架（身份栏 / 左列 / 右区），
+   三个工种（字幕翻译 / 文件夹名翻译 / 规则改名）用 `v-show` 切换；配套组件同目录
+   （AiRename* / JobTable / FailureDetail / ActionRail / ProgressBand / queueStats）。
 
-**凭据处理**：`src/stores/settings.ts:56` 的注释写明「**API Key 仅存内存，不落盘**」，
-落盘快照 `snapshot()` 里确实只含 `aiBaseURL` / `aiModel`（`settings.ts:79`），
-**没有 apiKey**。⚠️ 这意味着**重启后必须重填 Key**。规范要求 `infra/ai/credentials.rs`
-（Windows 凭据管理器），现状没有 —— 属于「更保守的实现」，不是漏洞，但与规范的持久化预期不同。
+**凭据处理**：API Key 只在 `src/features/ai/useAiAccess.ts:11` 的模块级 `ref` 里，刷新即失，
+**不进 settings JSON、不进 SQLite**（AI-4 的裁决，`04 §3`）。⚠️ 这意味着**重启后必须重填 Key**。
+规范要求 `infra/ai/credentials.rs`（Windows 凭据管理器），现状没有 —— 属于「更保守的实现」，
+不是漏洞，但与规范的持久化预期不同。
 
-**没有的东西**（AI 域）：无流式（`stream: false` 硬编码，`ai.rs:77`）、无并发/队列、无重试、
-无缓存（`blake3` 在依赖里但 AI 链路没用；规范要求的缓存键
-`blake3(model + prompt_version + fragment)` 未实现）、无 prompt 模板文件、
-无后置校验（数字多重集比对 / 括号数量比对 / 扩展名保护）、无回滚。
+**还没有的**（AI 域）：无流式（`stream: false` 写死在请求体里）、无多 Provider、无凭据持久化。
+缓存键刻意**不含 model**（`blake3(提示词版本 + 原文)`，`ai_cache.rs:32`）—— 换模型不会让已有译文作废，
+这是 `04 §7.6.2` 的口径而不是漏了参数。改名那侧另有两本账（核准译名 + 被拒译名，`rename/ai_ledger.rs`），
+提示词版本号独立（`rename/ai_name.rs` 的 `PROMPT_VERSION` vs `ai_prompt.rs` 的
+`SUBTITLE_PROMPT_VERSION`），两边互不作废。
 
 ---
 
@@ -632,12 +633,12 @@ Rust `emit("ns:event", payload)` + `src/contracts/events.ts` 加一行。
 | 11 | 媒体键 / 全局快捷键 | tauri-plugin-global-shortcut | 插件不存在 | 功能缺失 |
 | 12 | 结构化日志 | tracing + 1MB 轮转 | 自研 append_log + 原地截断 512KB | 实现差异 |
 | 13 | 搜索下沉 Rust | 前端禁 pinyin-pro/chinese-conv | 两个库都在用，搜索整体在前端 | 红线 |
-| 14 | AI 重命名全链路 | rename/decide/normalize + 缓存 + 后置校验 | 完全不存在，只有翻译 | 排期未到 |
+| 14 | AI 重命名全链路 | rename/decide/normalize + 缓存 + 后置校验 | ✅ 有，只是不叫这些路径：`src-tauri/src/rename/`（判定 / 规范化 / 预览 / 九道后置校验 / 两本译名账 / 批次与回滚） | 实现差异 |
 | 15 | 嵌入失败降级（P0-20） | 自动降级独立 mpv 窗口 | 只报 `MpvEmbedFailed`，无降级 | 功能缺失 |
 | 16 | 属性订阅清单 | 10 个属性 | 订阅 6 个 + 2 个视频尺寸，其余按需查询 | 实现差异 |
 | 17 | edition | 2024 | 2021 | 配置 |
 | 18 | devtools feature | 要求开 | 未开 | 配置 |
-| 19 | `npm run check` | tsc --noEmit + vue-tsc + check:ipc + clippy | vue-tsc + check:ipc + vitest + clippy（无独立 tsc、多了 vitest） | 脚本 |
+| 19 | `npm run check` | tsc --noEmit + vue-tsc + check:ipc + clippy | 六段：vue-tsc → check:ipc → check:columns → check:colors → vitest → clippy（无独立 tsc、多了后三段） | 脚本 |
 
 ---
 
@@ -646,6 +647,5 @@ Rust `emit("ns:event", payload)` + `src/contracts/events.ts` 加一行。
 代码是一个**能跑的 Tauri 2 单体**：IPC 契约（`contracts/` ↔ `lib.rs` 注册表 ↔ `bridge/ipc.ts`）
 做得扎实、有脚本强制对账；播放内核是真 libmpv2 + Win32 覆盖窗口；
 数据库用外置 SQL + `schema_migrations` 版本化。
-主要欠账是**分层**（domain/infra/services 三层目录都不存在，`player/mod.rs` 与 964 行的
-`scanner/mod.rs` 是最大的两块耦合）、**字幕链路**（无 `sub-add`、无双语、偏移不落库）、
-和**AI 重命名全链路**。
+主要欠账是**分层**（domain/infra/services 三层目录都不存在，`player/mod.rs` 与 `scanner/mod.rs`
+是最大的两块耦合，两者都远超 400 行红线）、**字幕链路**（无 `sub-add`、无双语、偏移不落库）。

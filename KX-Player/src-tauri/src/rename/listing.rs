@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::rename::preview::{preview_level, Counts, Entry, Item, Preview};
+use crate::rename::preview::{preview_level_with, Counts, Entry, Item, Preview, SkipProbe};
 
 /// 一次预览最多回多少条：一层的作品目录上千是常态，整包塞进 IPC 只为了让人看见前几条没意义。
 /// `counts` 永远是全量的，被截断时 `truncated=true`（`04 §7.2` 的分布判据不能是半份数据）。
@@ -14,6 +14,12 @@ pub const MAX_ITEMS: usize = 300;
 /// `roots` 是用户勾出来的目录，只往下看**一层** —— 根目录本身不动，它就是用户划下的边界
 /// （`04 §7.1` 第 5 条：其它根目录要显式勾选才纳入）。
 pub fn preview_roots(roots: &[String]) -> Preview {
+    preview_roots_with(roots, &|_| None)
+}
+
+/// 带状态探针的同一件事（`rename_preview` 用它接拒绝集）。**只读盘这一处**：探针回答的是
+/// 库里的事实，列目录仍然只有这里一份，落地重算时不用探针也走同一条路。
+pub fn preview_roots_with(roots: &[String], skip_of: SkipProbe<'_>) -> Preview {
     let mut out = Preview::default();
     for root in roots {
         let Some(entries) = list_one_level(root) else {
@@ -21,7 +27,7 @@ pub fn preview_roots(roots: &[String]) -> Preview {
             continue;
         };
         let folder_name = Path::new(root).file_name().map(|n| n.to_string_lossy().into_owned());
-        let (items, counts) = preview_level(root, folder_name.as_deref(), &entries);
+        let (items, counts) = preview_level_with(root, folder_name.as_deref(), &entries, skip_of);
         merge(&mut out, counts, items);
     }
     out

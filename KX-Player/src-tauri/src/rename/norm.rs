@@ -66,28 +66,36 @@ pub fn family(prefix: &str) -> Family {
 /// 前缀只做空白折叠，符号与截断都作用在「前缀 + 处理后的正文」上。整段就是编号的名字
 /// （`Track1.`）原样返回 —— 编号是它的全部内容，动它就等于把文件改成没名字。
 pub fn normalize(name: &str, max: usize) -> String {
-    let sp = split_prefix(name);
+    let nfc = crate::rename::rules::to_nfc(name);
+    let sp = split_prefix(&nfc);
     if sp.rest.trim().is_empty() {
-        return truncate(name.trim(), max);
+        return truncate(nfc.trim(), max);
     }
-    let mut out = String::with_capacity(name.len());
+    let mut out = String::with_capacity(nfc.len());
     out.push_str(&fold_ws(sp.prefix));
     out.push_str(&clean_text(sp.rest));
     truncate(&out, max)
 }
 
-/// 超长收敛（`04 §7.3.2` 最后一行）：仍在词边界截断并加 `…`，不切半个词出来。
+/// 超长收敛（`04 §7.3.2` 最后一行）：先省可省修饰语，仍在词边界截断并加 `…`，不切半个词出来。
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
+    let stripped = crate::rename::rules::strip_omissible_modifiers(s);
+    // 剥修饰语会把**它占过的位置**留在原地：`高音质 完全版 名称` 剥完是 `  名称`（首空格 + 连续空格），
+    // `名称 高音质` 剥完是 `名称 `（尾空格）。这些正是判定树第 4 条要修的形态，收不干净就等于
+    // 把一条「该重修」的名字写进盘，下一轮预览又判它一遍。收法与 [`clean_text`] 同出一处（[`tidy_ws`]）。
+    let tidy = tidy_ws(&stripped);
+    if !tidy.is_empty() && tidy.chars().count() <= max {
+        return tidy;
+    }
+    // 剥到什么都不剩（整名就是修饰语叠出来的）时不能采用这个空结果 —— 文件名不能被剥没了
+    let target = if tidy.is_empty() { s } else { tidy.as_str() };
     let keep = max - 1; // 留给省略号
-    let mut head: String = s.chars().take(keep).collect();
+    let mut head: String = target.chars().take(keep).collect();
     if let Some(at) = head.rfind([' ', '_', '・', '、']) {
-        // 只有回退后还剩一半以上才回退，否则宁可截长一点也别截出个位数字
-        if head[..at].chars().count() > keep / 2 {
-            head.truncate(at);
-        }
+        if head[..at].chars().count() > keep / 2 { head.truncate(at); }
     }
     head.push('…');
     head
@@ -107,10 +115,14 @@ pub fn map_char(c: char) -> char {
 
 fn clean_text(s: &str) -> String {
     let mapped: String = s.chars().map(map_char).collect();
-    let folded = fold_dots(&fix_times(&mapped));
-    let ws = fold_ws(&folded);
-    let ws = ws.trim_start_matches(' ').trim_end_matches([' ', '.', '_']);
-    ws.to_string()
+    tidy_ws(&fold_dots(&fix_times(&mapped)))
+}
+
+/// 空白与尾部符号的**唯一一份**收尾口径：去首尾空白 → 全角空格转半角、连续空格收成一个 →
+/// 去尾部 ` ` `.` `_`。本地规范化（[`clean_text`]、[`truncate`]）与后置第 8 条（`postcheck`）
+/// 用的都是这一份 —— 名字从哪条路走过来都得落到同一个结果，各写各的迟早会分叉。
+pub(crate) fn tidy_ws(s: &str) -> String {
+    fold_ws(s.trim()).trim_end_matches([' ', '.', '_']).to_string()
 }
 
 /// 时间表达（`04 §7.3.2`）：数字一个都不许变，只换单位字。`30分` 后面已经是「钟」时不能重复加。
@@ -310,7 +322,6 @@ mod tests {
     #[test]
     fn prefix_without_separator_splits_but_time_expressions_do_not() {
         assert_eq!(split_prefix("01第一回款待皇家。").prefix, "01");
-        // 数字后紧跟时间单位 → 是正文不是编号，切开会破坏「数字一个都不许变」
         for name in ["16小时", "2時間30分以上", "30分钟", "12月的记忆"] {
             assert_eq!(split_prefix(name).prefix, "", "{name} 不该被当前缀");
         }
@@ -381,16 +392,45 @@ mod tests {
         assert!(out.ends_with('…') && out.chars().count() == FOLDER_MAX);
     }
 
+    /// 剥修饰语会把**它占过的位置**留在原地：`高音质 完全版 名称` 剥完是 `  名称`、`名称 高音质`
+    /// 剥完尾巴上多个空格。那些正是判定树第 4 条要修的形态，收不干净就是把一条「该重修」的名字
+    /// 写进盘（尾空格更坏：Windows 会把它悄悄去掉，history 里那份映射就对不上盘上的名字）。
+    #[test]
+    fn truncate_leaves_no_dirty_whitespace_after_stripping() {
+        let tail = "夜".repeat(118); // 剥完刚好 120
+        let out = truncate(&format!("高音质 完全版 {tail}"), FOLDER_MAX);
+        assert_eq!(out, tail, "剥完的空档没收干净：{out}");
+
+        let out = truncate(&format!("{tail}名 高音质"), FOLDER_MAX);
+        assert_eq!(out, format!("{tail}名"), "修饰语在末尾时尾巴会多个空格：{out}");
+
+        // 收干净的标准是「再过一遍规范化不再变」：改完就定稿
+        for name in ["高音质 完全版 名称", "名称 高音质", "名称.高音质"] {
+            let long = format!("{name}{}", "夜".repeat(120));
+            let once = normalize(&long, FOLDER_MAX);
+            assert_eq!(normalize(&once, FOLDER_MAX), once, "{name} 改完还要再改一遍");
+        }
+    }
+
+    /// 整名就是修饰语叠出来的：剥到一个字不剩时不许把名字剥没（文件不能没有名字）
+    #[test]
+    fn stripping_everything_falls_back_to_a_truncated_name() {
+        let all_mod = "高音质".repeat(41);
+        assert!(all_mod.chars().count() > FOLDER_MAX, "夹具得先真的超长");
+        let out = truncate(&all_mod, FOLDER_MAX);
+        assert!(!out.is_empty(), "剥空了就得退回截断，而不是交一个空名字");
+        assert!(out.ends_with('…') && out.chars().count() == FOLDER_MAX);
+    }
+
     #[test]
     fn normalize_is_idempotent() {
         for name in [
-            "hi09_06_测试名称",
-            "01  名称~~",
-            "特典1　2時間30分以上",
-            "【01】快来!!",
+            "hi09_06_测试名称", "01  名称~~", "特典1　2時間30分以上", "【01】快来!!",
         ] {
             let once = normalize(name, FOLDER_MAX);
             assert_eq!(normalize(&once, FOLDER_MAX), once, "{name} 二次规范化又变了");
         }
+        // NFD: か (U+304B) + ゛ (U+3099)
+        assert!(normalize("\u{304B}\u{3099}音01", FOLDER_MAX).starts_with("が"));
     }
 }

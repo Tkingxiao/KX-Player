@@ -13,7 +13,7 @@ import { api } from '@/bridge/ipc'
 import { errText } from '@/contracts/result'
 import confirmHost from '@/services/confirmHost'
 import type { RenamePreview, RenameReport } from '@/contracts/api'
-import { base } from './renameLabels'
+import { base, isApplicable } from './renameLabels'
 import AiRenameCounts from './AiRenameCounts.vue'
 import AiRenameItems from './AiRenameItems.vue'
 import AiRenameNames from './AiRenameNames.vue'
@@ -38,13 +38,8 @@ const items = computed(() => result.value?.items ?? [])
 /** 还要花 token 的那几条：规则修不掉的，点了「生成译名」才会去问模型 */
 const aiCount = computed(() => items.value.filter((i) => i.needsAi).length)
 const conflictList = computed(() => items.value.filter((i) => i.conflict))
-/**
- * 应用真正会动的条数 —— 与后端 `queue()` 的筛选条件是同一条规则，别在这儿放宽：
- * 撞名的排除；要模型的那条只算**库里有核准译名**的（`suggested` 就是后端盖章的那一个）。
- */
-const applicable = computed(
-  () => items.value.filter((i) => !i.conflict && (i.needsAi ? !!i.suggested : i.changed)).length,
-)
+/** 应用真正会动的条数（`isApplicable` 与「文件夹名」那个工种共用同一条规则） */
+const applicable = computed(() => items.value.filter(isApplicable).length)
 /** 清单被截断时上面只是个下限：后端按全量计划，如实标成「N+」 */
 const more = computed(() => (result.value?.truncated ? '+' : ''))
 

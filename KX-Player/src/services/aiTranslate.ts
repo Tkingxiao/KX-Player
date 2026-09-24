@@ -12,12 +12,7 @@ import type { AiJobOptions, AiProgress, SubtitleScanItem } from '@/contracts/api
 
 /** 递归收集 .lrc/.srt/.vtt（深度 4、上限 500 —— 缺省值在 Rust 侧，与旧前端一致） */
 export function scanSubtitleFiles(dir: string): Promise<SubtitleScanItem[]> {
-  return api.subtitleScanDir(dir, 'subtitle')
-}
-
-/** 递归收集子目录（「文件夹名翻译」的队列，上限 300；根目录自身不算） */
-export function scanSubDirectories(dir: string): Promise<SubtitleScanItem[]> {
-  return api.subtitleScanDir(dir, 'dir')
+  return api.subtitleScanDir(dir)
 }
 
 export interface AiTranslateJob {

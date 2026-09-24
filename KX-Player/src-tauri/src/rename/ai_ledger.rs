@@ -9,8 +9,11 @@
 //!    一个没核准的名字发了通行证。
 //! 2. 键是**内容**键（`blake3(提示词版本 + 片段)`，`04 §7.6.2`）：换模型不作废，涨提示词版本
 //!    整体作废，所以同一批名字再生成一次一个 token 都不再花。
-//! 3. 「拒过」是**生效**的：[`suggestion`] 每取一次都复核一遍拒绝集，于是用户按了「不要这个
+//! 3. 「拒过」是**生效**的：[`ledger_state`] 每取一次都复核一遍拒绝集，于是用户按了「不要这个
 //!    译名」之后，预览（[`annotate`]）与落地（`apply`）同时不再提它。
+//! 4. 「拒过」是**名字级**的：`rejected_suggestions` 的主键带着 `suggestion`，拒掉的是那个候选名，
+//!    不是这个路径。所以判「这条会不会被卡住」必须问到它**当下那个候选名**上（[`blocked_by_refusal`]），
+//!    按路径一刀切会把「拒过一次」误算成「这条永久作废」—— 换个新译名本该照样能改。
 
 use std::collections::HashMap;
 
@@ -83,21 +86,58 @@ pub fn refused(conn: &Connection, path: &str) -> Result<Vec<String>, String> {
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
+/// 一个条目在译名账里的三种处境。`Missing` 与 `Blocked` 要分开：前者是「这个名字还没问过」，
+/// 点一次「生成译名」就可能有救；后者是「问到了，但这个名字被用户拒了」，再问多少遍都是同一行，
+/// 得先撤掉那条拒绝，或者手工改名（`04 §7.7` 第 9 条）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ledger {
+    /// 库里有一个可用的整名（已经过完九道校验、且没被这个条目拒过）
+    Ready { name: String, model: Option<String> },
+    /// 库里有名字，但那正是这个条目拒过的那个
+    Blocked,
+    /// 片段为空、或库里还没有这个名字
+    Missing,
+}
+
+/// 按条目**当下的片段**查一次账，再看这个名字在**这个条目**上被拒过没有 —— 第 9 条在这里
+/// 复核一遍：库里那行是生成当时核准的，用户可能后来才把它拒了。
+/// [`suggestion`]（落地要一个名字）与 [`blocked_by_refusal`]（预览要「是不是被拒卡住」）都从
+/// 这里出发 —— 两边问的是同一件事的两种问法，不该有各说各话的余地。
+pub fn ledger_state(conn: &Connection, item: &Item) -> Result<Ledger, String> {
+    let src = ai_name::fragment(item);
+    if src.is_empty() {
+        return Ok(Ledger::Missing);
+    }
+    let Some((dst, model)) = name_of(conn, &ai_name::cache_key(&src))? else {
+        return Ok(Ledger::Missing);
+    };
+    let full = ai_name::rebuild(item, &dst);
+    if refused(conn, &item.path)?.iter().any(|r| r == &full) {
+        return Ok(Ledger::Blocked);
+    }
+    Ok(Ledger::Ready { name: full, model })
+}
+
+/// 判定树那一侧（预览）用的判据：这一条会不会**只因为名字被拒**而卡住（`04 §7.2` 第 1 条）。
+/// 与 [`suggestion`] 是同一条判据：那边答「有没有名字可用」，这边答「没有是不是因为被拒」。
+///
+/// 只对 `needs_ai` 的条目成立 —— 本地规则能定下来的动作根本不看译名账，拒过的候选也拦不着它，
+/// 这与落地侧「`!needs_ai` 就直接用自己的目标名」是同一条分界。
+/// 读库出错时答「没被卡住」：那样预览显示成待生成（落地那时也确实不会动它），而不是把它错记成
+/// 跳过、让人以为这件事已经有人办过了。
+pub fn blocked_by_refusal(conn: &Connection, item: &Item) -> bool {
+    item.needs_ai && matches!(ledger_state(conn, item), Ok(Ledger::Blocked))
+}
+
 /// 落地侧唯一的入口：按片段查已核准的译名，回（整名，当初用过的模型名 —— 它是 `04 §7.8`
 /// 要的审计字段）。查不到就是没有：`apply` 因此把这条继续算进 `skipped`。
 pub fn suggestion(conn: &Connection, item: &Item) -> Option<(String, Option<String>)> {
-    let src = ai_name::fragment(item);
-    if src.is_empty() {
-        return None;
+    match ledger_state(conn, item) {
+        Ok(Ledger::Ready { name, model }) => Some((name, model)),
+        // `Missing` 本来就是没有；`Blocked` 是被拒；`Err` 是拒绝集读不出来 —— 读不出来也不猜，
+        // 宁可不改，也不要改出一个刚被拒掉的名字。
+        _ => None,
     }
-    let (dst, model) = name_of(conn, &ai_name::cache_key(&src)).ok()??;
-    let full = ai_name::rebuild(item, &dst);
-    // 第 9 条在这里**再**判一次：库里那行是生成当时核准的，用户可能后来把这个名字拒了；
-    // 而「拒绝集」读不出来时也不猜 —— 宁可不改，也不要改出一个刚被拒掉的名字。
-    if refused(conn, &item.path).ok()?.iter().any(|r| r == &full) {
-        return None;
-    }
-    Some((full, model))
 }
 
 /// 读库之后给预览**盖章**：每条 `needs_ai` 的条目带上「库里已核准的那个译名」。
@@ -163,7 +203,7 @@ pub fn record(conn: &Connection, model: &str, outcomes: &[Outcome]) -> Result<us
 
 #[cfg(test)]
 mod tests {
-    use super::{annotate, plan, record, reject, suggestion, Plan};
+    use super::{annotate, blocked_by_refusal, ledger_state, plan, record, reject, suggestion, Ledger, Plan};
     use crate::rename::ai_name::cache_key;
     use crate::rename::judge::Verdict;
     use crate::rename::preview::{Item, Kind, Preview};
@@ -190,6 +230,13 @@ mod tests {
             suggested: None,
             conflict: None,
         }
+    }
+
+    /// 同名的另一条（片段相同、路径不同）：验证「拒过」是挂在条目上而不是挂在片段上
+    fn item_at(path: &str) -> Item {
+        let mut it = item(path.rsplit('/').next().unwrap_or(path));
+        it.path = path.to_string();
+        it
     }
 
     fn outcome(src: &str, dst: Option<&str>) -> Outcome {
@@ -245,6 +292,45 @@ mod tests {
         annotate(&conn, &mut p);
         assert_eq!(p.items[0].suggested, None, "拒过的名字不许再出现在预览里");
         assert!(suggestion(&conn, &item("静夜")).is_none(), "落地侧也不同时再用它");
+    }
+
+    /// 拒绝是**名字级**的：拒掉「安宁」只让这一个条目上的这一个候选失效，同片段的另一个条目
+    /// 照样能用它；同一个条目换个新译名也不再被它卡住。
+    /// 这是「预览说的 == 落地做的」的根：判定树收到的 `rejected` 必须由 [blocked_by_refusal] 回答，
+    /// 而不是「这个路径进过拒绝表」。
+    #[test]
+    fn a_refusal_only_blocks_the_name_it_was_aimed_at_on_that_one_item() {
+        let conn = db();
+        let here = item("静夜");
+        let elsewhere = item_at("T:/y/静夜");
+        assert_eq!(ledger_state(&conn, &here).expect("查账"), Ledger::Missing, "还没问过 = 只是缺");
+        assert!(!blocked_by_refusal(&conn, &here), "缺名字不是被拒，点「生成译名」该有救");
+
+        record(&conn, "m", &[outcome("静夜", Some("安宁"))]).expect("写库");
+        reject(&conn, &here.path, "安宁").expect("记一条拒绝");
+        assert_eq!(ledger_state(&conn, &here).expect("查账"), Ledger::Blocked);
+        assert!(blocked_by_refusal(&conn, &here), "拒过的名字 = 预览该判跳过");
+        assert!(suggestion(&conn, &here).is_none(), "落地侧同一条判据，不然就是各说各话");
+        assert!(!blocked_by_refusal(&conn, &elsewhere), "另一个条目没拒过，不该跟着一起停");
+        assert!(suggestion(&conn, &elsewhere).is_some());
+
+        record(&conn, "m", &[outcome("静夜", Some("静谧"))]).expect("换个新译名");
+        assert!(!blocked_by_refusal(&conn, &here), "拒的是旧名字，新名字不该被连坐");
+        assert_eq!(
+            suggestion(&conn, &here).map(|(n, _)| n).as_deref(),
+            Some("静谧"),
+            "按路径一刀切的话，这条就永久停在跳过了"
+        );
+    }
+
+    /// 本地规则能定下来的条目不看译名账：落地那时用的是它自己的目标名，拒过的候选拦不着它
+    #[test]
+    fn a_settled_item_is_never_blocked_by_a_refusal() {
+        let conn = db();
+        let local = Item { needs_ai: false, ..item("静夜") };
+        record(&conn, "m", &[outcome("静夜", Some("安宁"))]).expect("写库");
+        reject(&conn, &local.path, "安宁").expect("记一条拒绝");
+        assert!(!blocked_by_refusal(&conn, &local));
     }
 
     /// 规划只把**没命中缓存**的片段交出去，并且算清哪几条本来就有现成的（`04 §7.6.2` 省 token 的根据）。

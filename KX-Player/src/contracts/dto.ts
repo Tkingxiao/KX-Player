@@ -261,12 +261,9 @@ export interface SubtitleScanItem {
   name: string
   /** 字幕文件才有（小写、无点） */
   ext?: string
-  /** 是否已翻译可豁免（源没变 + .zh 译文仍在）。kind=dir 时指「文件夹名已译」 */
+  /** 是否已翻译可豁免（源没变 + .zh 译文仍在） */
   translated?: boolean
 }
-
-/** `subtitle_scan_dir` 的 kind：字幕文件 / 子目录 */
-export type ScanKind = 'subtitle' | 'dir'
 
 // ── AI-16 半自动模式（导出 / 导入批次，无 Provider 也能走通）──
 

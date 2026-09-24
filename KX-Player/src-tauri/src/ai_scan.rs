@@ -13,7 +13,7 @@ pub struct ScannedItem {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<String>,
-    /// 是否已翻译可豁免（字幕：账/译文符合；目录：已生成过译名）。扫描命令回填，默认 false。
+    /// 是否已翻译可豁免（字幕：上级账命中且译文文件还在）。扫描命令回填，默认 false。
     #[serde(skip_serializing_if = "not_translated")]
     pub translated: bool,
 }
@@ -30,28 +30,22 @@ impl ScannedItem {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ScanKind {
-    /// 字幕文件（.lrc/.srt/.vtt），含根目录自身这一层
-    Subtitle,
-    /// 子目录（AI 页的「按目录名翻译」用它；根目录本身不算）
-    Dir,
-}
-
-/// 递归扫描。max_depth 是**相对根目录的深度**，根目录里的条目算第 0 层：
-/// Subtitle 收第 0..=max_depth 层的字幕文件（旧前端传 4、上限 500）；
-/// Dir 收第 1..=max_depth 层的子目录（旧前端从 dep=1 起步、上限 300）。
+/// 递归扫描字幕文件。max_depth 是**相对根目录的深度**，根目录里的条目算第 0 层：
+/// 收第 0..=max_depth 层的字幕文件（旧前端传 4、上限 500）。
 /// 同层条目**排序后**返回：readdir 的顺序两个平台都不保证，旧实现直接吃目录顺序，
 /// 同一批文件两次扫描能给出不同的队列。遍历是按名排序的深度优先，所以 limit 截断时
 /// 留下哪一批也由这个名字顺序决定 —— 两次扫描的队列一致，这才是要点。
-pub fn scan_dir(root: &str, kind: ScanKind, max_depth: usize, limit: usize) -> Vec<ScannedItem> {
+///
+/// 曾经还有一个 `ScanKind::Dir`（列子目录给「文件夹名翻译」排队用）。那条链第 21 批起
+/// 整体并进了改名主干（`rename/listing::preview_roots` 一层扫描 + `rename_name_cache`
+/// 内容键账），这里不留第二套：一个永远走不到的 kind 会让 `translated` 的注释开始撒谎。
+pub fn scan_dir(root: &str, max_depth: usize, limit: usize) -> Vec<ScannedItem> {
     let mut out: Vec<ScannedItem> = Vec::new();
-    walk(root, kind, 0, max_depth.min(32), limit.min(10_000), &mut out);
+    walk(root, 0, max_depth.min(32), limit.min(10_000), &mut out);
     out
 }
 
-fn walk(dir: &str, kind: ScanKind, depth: usize, max_depth: usize, limit: usize, out: &mut Vec<ScannedItem>) {
+fn walk(dir: &str, depth: usize, max_depth: usize, limit: usize, out: &mut Vec<ScannedItem>) {
     if out.len() >= limit || depth > max_depth {
         return;
     }
@@ -71,11 +65,8 @@ fn walk(dir: &str, kind: ScanKind, depth: usize, max_depth: usize, limit: usize,
         }
         let path = prompt::join_path(dir, &name);
         if is_dir {
-            if kind == ScanKind::Dir {
-                out.push(ScannedItem::new(path.clone(), name.clone(), None));
-            }
-            walk(&path, kind, depth + 1, max_depth, limit, out);
-        } else if kind == ScanKind::Subtitle {
+            walk(&path, depth + 1, max_depth, limit, out);
+        } else {
             let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
             if subs::SUBTITLE_EXTS.contains(&ext.as_str()) {
                 out.push(ScannedItem::new(path, name, Some(ext)));
@@ -103,21 +94,11 @@ mod tests {
         std::fs::write(root.join("b.SRT"), "1").unwrap();
         std::fs::write(root.join("c.txt"), "nope").unwrap();
         std::fs::write(root.join("sub").join("d.vtt"), "WEBVTT").unwrap();
-        let items = scan_dir(root.to_str().unwrap(), ScanKind::Subtitle, 4, 500);
+        let items = scan_dir(root.to_str().unwrap(), 4, 500);
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["a.lrc", "b.SRT", "d.vtt"], "非字幕扩展名不进队列");
         assert_eq!(items[1].ext.as_deref(), Some("srt"), "扩展名统一小写");
         assert!(items[2].path.ends_with("/sub/d.vtt"), "子目录递归：{}", items[2].path);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_dir_kind_lists_subdirectories_only() {
-        let root = tmpdir("dirs");
-        std::fs::create_dir_all(root.join("x").join("y")).unwrap();
-        let items = scan_dir(root.to_str().unwrap(), ScanKind::Dir, 3, 300);
-        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["x", "y"], "根目录自身不算，子目录按层收集");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -129,13 +110,13 @@ mod tests {
         std::fs::write(root.join("a").join("d1.lrc"), "[00:01.00]x").unwrap();
         std::fs::write(root.join("a").join("b").join("c").join("d2.lrc"), "[00:01.00]x").unwrap();
         let names = |items: Vec<ScannedItem>| items.into_iter().map(|i| i.name).collect::<Vec<_>>();
-        assert_eq!(names(scan_dir(root.to_str().unwrap(), ScanKind::Subtitle, 0, 500)), vec!["deep.lrc"]);
+        assert_eq!(names(scan_dir(root.to_str().unwrap(), 0, 500)), vec!["deep.lrc"]);
         assert_eq!(
-            names(scan_dir(root.to_str().unwrap(), ScanKind::Subtitle, 1, 500)),
+            names(scan_dir(root.to_str().unwrap(), 1, 500)),
             vec!["d1.lrc", "deep.lrc"],
             "按名排序的深度优先：a/ 排在 deep.lrc 前面，先递归进去"
         );
-        assert_eq!(scan_dir(root.to_str().unwrap(), ScanKind::Subtitle, 3, 1).len(), 1, "limit 先到就停");
+        assert_eq!(scan_dir(root.to_str().unwrap(), 3, 1).len(), 1, "limit 先到就停");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

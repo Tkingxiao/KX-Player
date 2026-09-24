@@ -28,7 +28,6 @@
 | `open_text_files` | — | `string[]` | src-tauri/src/commands/dialog_fs.rs |
 | `read_as_data_url` | `path: String` | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `read_text_file` | `path: String` | `string ∣ null` | src-tauri/src/commands/dialog_fs.rs |
-| `rename_dir` | `oldPath: String`, `newPath: String` | `null` | src-tauri/src/commands/dialog_fs.rs |
 | `select_bg_image` | — | `BgImageData ∣ null` | src-tauri/src/commands/dialog_fs.rs |
 | `show_item_in_folder` | `path: String` | `boolean` | src-tauri/src/commands/dialog_fs.rs |
 | `tools_save_file` | `path: String`, `base64Data: String` | `boolean` | src-tauri/src/commands/dialog_fs.rs |
@@ -104,8 +103,6 @@
 
 | 命令 | 参数（JS 键名 : Rust 类型） | resolve | 位置 |
 |---|---|---|---|
-| `ai_cache_folder_suggestions` | — | `Record<string, string>` | src-tauri/src/commands/system.rs |
-| `ai_cache_record_folder` | `path: String`, `suggestion: String` | `boolean` | src-tauri/src/commands/system.rs |
 | `ai_chat` | `payload: AiChatPayload` | `AiChatResult` | src-tauri/src/commands/system.rs |
 | `ai_export_prompts` | `paths: Vec<String>` | `ExportResult` | src-tauri/src/commands/system.rs |
 | `ai_import_translations` | `paths: Vec<String>`, `text: String`, `apply: bool` | `ImportResult` | src-tauri/src/commands/system.rs |
@@ -129,7 +126,7 @@
 | `save_bg_image` | `dataUrl: String` | `boolean` | src-tauri/src/commands/system.rs |
 | `save_settings` | `settings: Value` | `boolean` | src-tauri/src/commands/system.rs |
 | `startup_warnings` | — | `string[]` | src-tauri/src/commands/system.rs |
-| `subtitle_scan_dir` | `dir: String`, `kind: String`, `maxDepth: Option<usize>`, `limit: Option<usize>` | `ScannedItem[]` | src-tauri/src/commands/system.rs |
+| `subtitle_scan_dir` | `dir: String`, `maxDepth: Option<usize>`, `limit: Option<usize>` | `ScannedItem[]` | src-tauri/src/commands/system.rs |
 | `toggle_fullscreen` | — | `boolean` | src-tauri/src/commands/system.rs |
 
 ## taxonomy

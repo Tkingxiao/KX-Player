@@ -1,6 +1,5 @@
 //! AI 翻译服务：OpenAI 兼容 /chat/completions（网络只发生在 Rust 侧；API Key 不落盘）。
 
-use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::model::{AiChatPayload, AiModelsResult, AiPingResult};
 use std::time::Duration;
 
@@ -244,26 +243,6 @@ pub async fn list_models(base_url: &str, api_key: &str) -> AiModelsResult {
     AiModelsResult { ok: false, models: vec![], error: Some(errors.join("；")) }
 }
 
-/// 目录重命名（同父目录内；目标已存在则拒绝）
-pub fn rename_dir(old_path: &str, new_path: &str) -> IpcResult<()> {
-    if old_path.is_empty() || new_path.is_empty() {
-        return Err(IpcError::invalid_argument("参数错误"));
-    }
-    let old = std::path::Path::new(old_path);
-    let new = std::path::Path::new(new_path);
-    if !old.is_dir() {
-        return Err(IpcError::new(AppErrorCode::NotFound, "原目录不存在"));
-    }
-    if new.exists() {
-        return Err(IpcError::invalid_argument("目标目录已存在"));
-    }
-    let old_parent = old.parent().unwrap_or(old);
-    let new_parent = new.parent().unwrap_or(new);
-    if old_parent != new_parent {
-        return Err(IpcError::invalid_argument("只允许同父目录内重命名"));
-    }
-    std::fs::rename(old, new).map_err(IpcError::io)
-}
 #[cfg(test)]
 mod tests {
     use super::*;

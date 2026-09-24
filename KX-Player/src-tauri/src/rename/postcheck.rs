@@ -50,8 +50,9 @@ pub struct Ctx<'a> {
 }
 
 /// 括号一类：`04 §7.3.2` 明令本地规则不碰它们，§7.6.1 第 2 条又要求模型别写括号注释，
-/// 所以这里只核「种类与数量一个都不许变」。
-const BRACKETS: [char; 14] = ['(', ')', '（', '）', '【', '】', '「', '」', '『', '』', '《', '》', '〔', '〕'];
+/// 所以这里只核「种类与数量一个都不许变」。清单照抄规范那一行：`【】『』「」（）()[]`。
+const BRACKETS: [char; 16] =
+    ['【', '】', '『', '』', '「', '」', '（', '）', '(', ')', '[', ']', '《', '》', '〔', '〕'];
 /// Windows 真正不让出现在文件名里的字符。`／⧸` 是形近字、不算在这里 —— 它们写得进盘，
 /// 而 `04 §7.3.2` 要求保留现状。
 const FORBID: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
@@ -113,8 +114,9 @@ pub fn check(dst: &str, ctx: &Ctx<'_>) -> Checked {
         blocked.push("原文有假名而译文里没有中文".to_string());
     }
 
-    // 8 连续空格 / 首尾空白 / 尾部句点：一律本地清掉，不劳模型
-    let cleaned = norm::fold_ws(s.trim()).trim_end_matches([' ', '.', '_']).to_string();
+    // 8 连续空格 / 首尾空白 / 尾部句点：一律本地清掉，不劳模型。收法与本地规范化同一份
+    // （`norm::tidy_ws`）—— 同一条名字走本地规则与走后置校验必须得到同一个结果
+    let cleaned = norm::tidy_ws(&s);
     if cleaned != s {
         notes.push("空白与尾部符号已清理".to_string());
     }
@@ -227,6 +229,9 @@ mod tests {
         let second = check("回忆(日常)", &ctx("思い出（日常）", 100, &[], true));
         assert_eq!(second.action, super::Action::Review);
         assert!(second.blocked.iter().any(|b| b.contains("括号")), "{:?}", second.blocked);
+        // 清单照抄规范那一行，`[]` 也得算进去：模型把 `[ASMR]` 写成 `【ASMR】` 同样是换了种类
+        let squared = check("【立体声】掏耳", &plain("[立体声]掏耳"));
+        assert_eq!(squared.action, super::Action::Retry, "半角方括号被换成了全角");
     }
 
     /// ④ 数字多重集：换成汉字数字要退回去，`16時間`→`16小时` 这种保留数字的放行

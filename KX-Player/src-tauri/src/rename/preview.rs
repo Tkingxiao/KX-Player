@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::rename::judge::{judge, Ctx, Judgment, Reason, Verdict};
+use crate::rename::judge::{judge, Ctx, Judgment, Reason, Skipped, Verdict};
 use crate::rename::norm::{self, Family, FILE_MAX, FOLDER_MAX, PATH_MAX};
 
 /// 目录里的一条待判名条目
@@ -53,7 +53,7 @@ pub struct Item {
     /// 还需要模型接着做（`04 §7.6` 的入口判据）
     pub needs_ai: bool,
     /// **库里已核准的那个译名**（`rename_name_cache`，过了九道校验的才有）。
-    /// `preview_level` 是纯函数所以恒为 `None`；由 `ai_ledger::annotate` 在读库之后盖上 ——
+    /// 判定是纯函数所以这里恒为 `None`；由 `ai_ledger::annotate` 在读库之后盖上 ——
     /// 面板据此说「这一批能应用几条」，而不是让用户猜「生成译名」那一步做没做。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested: Option<String>,
@@ -94,14 +94,34 @@ struct Row {
     changed: bool,
 }
 
-/// 纯函数：同一层目录里的一批条目 → 每条的判定 + 规范化名 + 冲突。
+/// 「锁定 / 已拒绝」这类**库里的状态**（`04 §7.2` 第 1 条）：判定是纯函数，手里没有库，
+/// 由调用方按库里的事实回答；`None` = 照常判。探针拿到的是已经拼好的 [`Item`]，
+/// 于是它可以只认这一条**真会不会被卡住**（落地侧同一条判据），而不是「这个路径曾经出过事」。
+pub type SkipProbe<'a> = &'a dyn Fn(&Item) -> Option<Skipped>;
+
+/// 不带库状态的那半边（探针恒答「没有锁定/拒绝」）：**只有用例在用**，包里跑的是
+/// [`preview_level_with`]。留着是因为这批用例要的输入恰好就是「一层名字、不带库」，
+/// 签名本身把这件事说清楚了，不必每处都写一个空探针。
 ///
 /// `dir_path` 只用来拼全路径做长度检查；`folder_name` 是这一层目录自己的名字，
 /// 只给文件条目用（`duplicate_title` 说的是「文件名里重复了所属作品名」）。
+#[cfg(test)]
 pub fn preview_level(
     dir_path: &str,
     folder_name: Option<&str>,
     entries: &[Entry],
+) -> (Vec<Item>, Counts) {
+    preview_level_with(dir_path, folder_name, entries, &|_| None)
+}
+
+/// 带状态探针的同一件事（`rename_preview` 用它把拒绝集接进来）。判定只跑一遍：
+/// 先按「没有锁定/拒绝」判出原件，交给探针，探针说卡住了才带着那个原因**重判一次** ——
+/// 档位、原因、`needs_ai` 与账目条因此同出一处，不会一个说「需要翻译 3」一个只列出 2 条。
+pub fn preview_level_with(
+    dir_path: &str,
+    folder_name: Option<&str>,
+    entries: &[Entry],
+    skip_of: SkipProbe<'_>,
 ) -> (Vec<Item>, Counts) {
     // 同目录内前缀族 >1 种 → prefix_mixed（`04 §7.2` 第 8 条），要先扫完一层才知道
     let mut families: Vec<Family> = Vec::new();
@@ -117,26 +137,18 @@ pub fn preview_level(
     let mut counts = Counts::default();
     let mut items: Vec<Item> = Vec::new();
     for (i, e) in entries.iter().enumerate() {
-        let ctx = ctx_for(e, folder_name, mixed);
-        let j = judge(stem(e), max_for(e), &ctx);
         let row = &rows[i];
+        // 档位按 §7.2 对**原名**的第一命中定；要不要进模型看**规范化之后**还剩什么 ——
+        // 规则能修掉的不该花 token（§7.11），而 `名称~` 这种「符号＋假名」的条目，
+        // 原名第一命中是 wave，把波浪号收掉之后假名才露出来，不重判就会永久停在本地档。
+        let (j, after) = judge_pair(e, folder_name, mixed, None, row);
         // 没在动的条目不可能有冲突要报（它占着的那个名字是别人的冲突，不是它的）
         let conflict = if row.changed {
             find_conflict(dir_path, i, e, row, entries, &rows)
         } else {
             None
         };
-        counts.bump(&j, row.changed, conflict.is_some());
-        // COMPLIANT 且没变没冲突的（绝大多数）不打扰用户；其余都列出来，
-        // 包括「只报告不改」的 prefix_mixed —— 它要的就是让用户看见（`04 §7.2` 第 8 条）
-        if j.verdict == Verdict::Compliant && !row.changed && conflict.is_none() {
-            continue;
-        }
-        // 档位按 §7.2 对**原名**的第一命中定；要不要进模型看**规范化之后**还剩什么 ——
-        // 规则能修掉的不该花 token（§7.11），而 `名称~` 这种「符号＋假名」的条目，
-        // 原名第一命中是 wave，把波浪号收掉之后假名才露出来，不重判就会永久停在本地档。
-        let after = judge(&row.stem_target, max_for(e), &ctx_for(e, folder_name, mixed));
-        items.push(Item {
+        let mut item = Item {
             path: Path::new(dir_path).join(&e.name).to_string_lossy().into_owned(),
             name: e.name.clone(),
             target: row.target.clone(),
@@ -147,15 +159,40 @@ pub fn preview_level(
             reasons: j.reasons,
             changed: row.changed,
             conflict,
-        });
+        };
+        // 探针只看**落地会不会动它**，所以它在上面那份「不带锁定/拒绝」的 `needs_ai` 上回答；
+        // 说卡住了才重判 —— 拒过的名字要判成跳过，本地那一撇也不再算「这批会同意的动作」。
+        if let Some(s) = skip_of(&item) {
+            let (j, _) = judge_pair(e, folder_name, mixed, Some(s), row);
+            item.verdict = j.verdict;
+            item.reasons = j.reasons;
+            item.needs_ai = false;
+        }
+        counts.bump(item.verdict, row.changed, item.conflict.is_some());
+        // COMPLIANT 且没变没冲突的（绝大多数）不打扰用户；其余都列出来，
+        // 包括「只报告不改」的 prefix_mixed —— 它要的就是让用户看见（`04 §7.2` 第 8 条）
+        if item.verdict == Verdict::Compliant && !row.changed && item.conflict.is_none() {
+            continue;
+        }
+        items.push(item);
     }
     (items, counts)
 }
 
+/// 一个条目的两份判定：**原名**那份定档（§7.2 的第一命中）、**规范化之后**那份定要不要进模型。
+/// 两份用同一个 `ctx`，所以探针给的锁定/拒绝在两边一致 —— 档位说跳过时 `needs_ai` 也不会是 true。
+fn judge_pair(e: &Entry, folder_name: Option<&str>, mixed: bool, skipped: Option<Skipped>, row: &Row) -> (Judgment, Judgment) {
+    let ctx = ctx_for(e, folder_name, mixed, skipped);
+    (
+        judge(stem(e), max_for(e), &ctx),
+        judge(&row.stem_target, max_for(e), &ctx),
+    )
+}
+
 impl Counts {
-    fn bump(&mut self, j: &Judgment, changed: bool, conflict: bool) {
+    fn bump(&mut self, verdict: Verdict, changed: bool, conflict: bool) {
         self.scanned += 1;
-        match j.verdict {
+        match verdict {
             Verdict::Skip => self.skip += 1,
             Verdict::NormalizeOnly => self.normalize_only += 1,
             Verdict::NeedsRepair => self.needs_repair += 1,
@@ -179,10 +216,11 @@ fn normalize_entry(e: &Entry) -> Row {
     Row { changed: target != e.name, stem_target, target }
 }
 
-/// 单条判定的上下文。锁定/拒绝写在 `ai_rename_state.json`（`04 §7.1` 第 3 条），本批还没接，恒 None
-fn ctx_for<'a>(e: &Entry, folder_name: Option<&'a str>, mixed: bool) -> Ctx<'a> {
+/// 单条判定的上下文。`skipped` 由 [`SkipProbe`] 给（库里说这一条被锁/被拒才算），
+/// 其余三项都是这一层目录算得出来的事实。
+fn ctx_for<'a>(e: &Entry, folder_name: Option<&'a str>, mixed: bool, skipped: Option<Skipped>) -> Ctx<'a> {
     Ctx {
-        skipped: None,
+        skipped,
         folder: if e.is_dir { None } else { folder_name },
         prefix_mixed: mixed,
     }
@@ -360,5 +398,31 @@ mod tests {
             items.iter().map(|i| i.kind).collect::<Vec<_>>(),
             vec![Kind::File, Kind::Folder]
         );
+    }
+
+    /// 探针说卡住的一条：档位变 SKIP、原因排在最前、`needs_ai` 关掉，而且**账目条跟着挪桶** ——
+    /// 原档位里减去它、`skip` 加上它。不挪的话账目条还写着「需要翻译 1」，清单里那一条却挂着跳过。
+    #[test]
+    fn a_blocked_item_moves_to_the_skip_bucket() {
+        let probe = |it: &Item| (it.name == "精霊の魔力").then_some(Skipped::Rejected);
+        let entries = [dir("精霊の魔力"), dir("深夜掏耳")];
+        let (items, counts) = preview_level_with("L:/x", None, &entries, &probe);
+        assert_eq!(items.len(), 1, "另一条是合规的，不列出");
+        assert_eq!(items[0].verdict, Verdict::Skip);
+        assert_eq!(items[0].reasons.first(), Some(&Reason::Rejected));
+        assert!(!items[0].needs_ai, "跳过的一条不会再去问模型");
+        assert_eq!((counts.skip, counts.needs_translation), (1, 0));
+        // 没有探针时同一条照旧是「要翻译」：跳不跳过是库里的事实，不是名字自己的属性
+        let (_, counts) = preview_level("L:/x", None, &entries);
+        assert_eq!((counts.skip, counts.needs_translation), (0, 1));
+    }
+
+    /// 锁定与拒绝都走同一个探针，UI 上要能分清是哪回事
+    #[test]
+    fn the_probe_can_say_locked_as_well_as_rejected() {
+        let probe = |_: &Item| Some(Skipped::Locked);
+        let (items, _) = preview_level_with("L:/x", None, &[dir("精霊の魔力")], &probe);
+        assert_eq!(items[0].verdict, Verdict::Skip);
+        assert_eq!(items[0].reasons.first(), Some(&Reason::Locked));
     }
 }

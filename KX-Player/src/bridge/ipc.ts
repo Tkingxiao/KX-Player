@@ -2,7 +2,7 @@
 import { invoke as tauriInvoke, convertFileSrc } from '@tauri-apps/api/core'
 import type { AppApi, ScanResult, Track, FolderNode, Bookmark, BgImageData, PlayProgress, AudioDevice, DirEntry, Category, Tag, TagSuggestion, SubtitleTrack, FfmpegInfo, ConvertItem, MpvPlayerState } from '@/contracts/api'
 import type { CommandSpecs } from '@/contracts/commands'
-import { toAppError, errText } from '@/contracts/result'
+import { toAppError } from '@/contracts/result'
 
 /** 命令名 → 参数对象 / resolve 值，两者都以 `contracts/commands.ts` 为源。 */
 type ArgsOf<K extends keyof CommandSpecs> = CommandSpecs[K]['args']
@@ -172,8 +172,7 @@ export const api: AppApi = {
   // 导入的译文文本由前端读好再传（编码探测在 read_text_file 那份，不重复实现一遍）
   aiExportPrompts: (paths) => invoke('ai_export_prompts', { paths }),
   aiImportTranslations: (paths, text, apply) => invoke('ai_import_translations', { paths, text, apply }),
-  subtitleScanDir: (dir, kind, maxDepth, limit) =>
-    invoke('subtitle_scan_dir', { dir, kind, maxDepth, limit }),
+  subtitleScanDir: (dir, maxDepth, limit) => invoke('subtitle_scan_dir', { dir, maxDepth, limit }),
   // 改名主干：预览与落地是**分开的命令**，落地那三条的输入只有「用户勾的目录」或「库里的批次号」——
   // 前端手里永远只是一份预览，从不回传「要改哪些」（04 §7.7）。
   // 不入 settings、不进历史队列（04 §7.8 的「同一条流水线」是 S2 的事）
@@ -188,18 +187,6 @@ export const api: AppApi = {
   renameRollback: (batchId) => invoke('rename_rollback', { batchId }),
   renameRedo: (batchId) => invoke('rename_redo', { batchId }),
   renameBatches: (limit) => invoke('rename_batches', { limit }),
-  aiCacheFolderSuggestions: () =>
-    invoke('ai_cache_folder_suggestions').catch(() => ({})),
-  aiCacheRecordFolder: (path, suggestion) =>
-    invoke('ai_cache_record_folder', { path, suggestion }).catch(() => false),
-  renameDir: async (oldPath, newPath) => {
-    try {
-      await invoke('rename_dir', { oldPath, newPath })
-      return { ok: true }
-    } catch (e) {
-      return { ok: false, error: errText(e) }
-    }
-  },
   clipboardWriteText: (t) => invoke('clipboard_write_text', { text: t }),
   showItemInFolder: (p) => invoke('show_item_in_folder', { path: p }),
   getProgressAll: () => invoke('get_progress_all'),

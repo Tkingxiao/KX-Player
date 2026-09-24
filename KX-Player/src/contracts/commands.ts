@@ -54,7 +54,6 @@ export interface CommandSpecs {
   open_text_files: { args: {}, returns: string[] }
   read_as_data_url: { args: { path: string }, returns: string | null }
   read_text_file: { args: { path: string }, returns: string | null }
-  rename_dir: { args: { oldPath: string, newPath: string }, returns: void }
   select_bg_image: { args: {}, returns: BgImageData | null }
   show_item_in_folder: { args: { path: string }, returns: boolean }
   tools_save_file: { args: { path: string, base64Data: string }, returns: boolean }
@@ -136,10 +135,6 @@ export interface CommandSpecs {
   ai_task_cancel: { args: { taskId: number }, returns: boolean }
   ai_texts_start: { args: { spec: AiTextsSpec }, returns: number }
   ai_translate_start: { args: { spec: AiTranslateSpec }, returns: number }
-  /** AI 翻译豁免账：原目录名 / 文件名 → 译名建议（AI-15 缓存复用） */
-  ai_cache_folder_suggestions: { args: {}, returns: Record<string, string> }
-  /** 手动记一条文件夹名 / 文件名译名进豁免账，返回是否写入成功 */
-  ai_cache_record_folder: { args: { path: string, suggestion: string }, returns: boolean }
   close_window: { args: {}, returns: void }
   convert_cancel: { args: { taskId: number }, returns: boolean }
   convert_run: { args: { items: ConvertItem[] }, returns: number }
@@ -155,7 +150,7 @@ export interface CommandSpecs {
   save_bg_image: { args: { dataUrl: string }, returns: boolean }
   save_settings: { args: { settings: Record<string, unknown> }, returns: boolean }
   startup_warnings: { args: {}, returns: string[] }
-  subtitle_scan_dir: { args: { dir: string, kind: string, maxDepth?: number, limit?: number }, returns: SubtitleScanItem[] }
+  subtitle_scan_dir: { args: { dir: string, maxDepth?: number, limit?: number }, returns: SubtitleScanItem[] }
   toggle_fullscreen: { args: {}, returns: boolean }
 
   // ── 改名主干（commands/rename.rs）──

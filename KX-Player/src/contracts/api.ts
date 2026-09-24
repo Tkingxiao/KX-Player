@@ -27,7 +27,6 @@ import type {
   RenamePreview,
   RenameReport,
   RenameSuggestReport,
-  ScanKind,
   ScanResult,
   SubStyle,
   SubtitleScanItem,
@@ -112,9 +111,8 @@ export interface AppApi {
   aiExportPrompts: (paths: string[]) => Promise<AiExportResult>
   /** AI-16 导入：`apply = false` 只做校验与差异预览，一点不碰磁盘 */
   aiImportTranslations: (paths: string[], text: string, apply: boolean) => Promise<AiImportResult>
-  /** Rust 侧递归扫描：一次调用替代旧的 api.listDir 逐层递归 */
-  subtitleScanDir: (dir: string, kind: ScanKind, maxDepth?: number, limit?: number) => Promise<SubtitleScanItem[]>
-  renameDir: (oldPath: string, newPath: string) => Promise<{ ok: boolean; error?: string }>
+  /** Rust 侧递归扫描字幕：一次调用替代旧的 api.listDir 逐层递归 */
+  subtitleScanDir: (dir: string, maxDepth?: number, limit?: number) => Promise<SubtitleScanItem[]>
   /**
    * AI-6/7/10 改名预览（`04 §7.8` 只读的那一半）：一次列出每个根目录的下一层，
    * 给出档位分布 + 「当前名 → 规范化后」清单 + 冲突表。**不写盘、不改一个文件**。
@@ -143,10 +141,6 @@ export interface AppApi {
   renameRedo: (batchId: string) => Promise<RenameReport>
   /** 最近的改名批次（挑哪一批回滚/重做），按创建时间倒序 */
   renameBatches: (limit: number) => Promise<RenameBatch[]>
-  /** AI 翻译豁免账：原目录名 / 文件名 → 译名建议。翻译页据此复用已译的文件夹名，避免重复烧 token */
-  aiCacheFolderSuggestions: () => Promise<Record<string, string>>
-  /** 手动记一条文件夹名 / 文件名译名进豁免账（AI-15 缓存复用） */
-  aiCacheRecordFolder: (path: string, suggestion: string) => Promise<boolean>
   clipboardWriteText: (t: string) => Promise<boolean>
   showItemInFolder: (p: string) => Promise<boolean>
   getProgressAll: () => Promise<PlayProgress[]>

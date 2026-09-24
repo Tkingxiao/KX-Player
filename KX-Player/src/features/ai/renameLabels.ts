@@ -1,10 +1,10 @@
 /**
- * 改名面板的文案表：档位、命中原因、冲突类型 → 中文。
+ * 改名面板共用的词表与筛选：档位、命中原因、冲突类型 → 中文，外加「哪几条真的会被改」。
  *
  * 判定全在 Rust（`src-tauri/src/rename/`），这里只负责「说人话」。三份都是**穷举映射**：
  * Rust 侧新增一档 / 一个原因而这里没跟上，`vue-tsc` 会直接报缺键，而不是让人看到 `undefined`。
  */
-import type { RenameConflict, RenameReason, RenameVerdict } from '@/contracts/api'
+import type { RenameConflict, RenamePreviewItem, RenameReason, RenameVerdict } from '@/contracts/api'
 
 export const VERDICT_LABEL: Record<RenameVerdict, string> = {
   skip: '跳过',
@@ -38,3 +38,14 @@ export const CONFLICT_LABEL: Record<RenameConflict, string> = {
 
 /** 绝对路径 → 末段名字。库里的路径两种分隔符都可能出现过，两个都当切点 */
 export const base = (p: string): string => p.split(/[\\/]/).pop() ?? p
+
+/**
+ * 「应用改名」真正会动的条目 —— 与后端 `queue()` 的筛选条件是同一条规则，别在这儿放宽：
+ * 撞名的排除；要模型的那条只算**库里有核准译名**的（`suggested` 就是后端盖章的那一个）。
+ * 两个工种（整个目录树 / 只挑一个文件夹）共用这一条，按钮上的数才可比。
+ *
+ * `skip` 必须单独排掉：那一条（锁定 / 译名被拒）后端一个字都不会动它，但它**可能仍带着
+ * 本地那一撇**（`changed` 为真），不排的话确认框里那句「把 N 个名字改掉」就先骗了人。
+ */
+export const isApplicable = (i: RenamePreviewItem): boolean =>
+  i.verdict !== 'skip' && !i.conflict && (i.needsAi ? !!i.suggested : i.changed)

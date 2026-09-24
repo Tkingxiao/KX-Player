@@ -62,9 +62,10 @@ pub struct Judgment {
     pub reasons: Vec<Reason>,
 }
 
-/// 已被用户锁或拒。变体在本批**没有构造方** —— 锁定/排除是 S2 的用户操作，磁盘上没有对应事实：
-/// `Rejected` 的落点规范给了表（`04 §5:299` `rejected_suggestions`，按 `target_path` 记被拒的候选名），
-/// `Locked` 规范没给（要么落成 `rename_items` 的行状态、要么加一列，等 S2 定）。
+/// 已被用户锁或拒。**判定树自己查不到库**，所以这两个变体由调用方按库里的事实构造：
+/// `Rejected` 由 `ai_ledger::blocked_by_refusal` 回答（`04 §5:299` `rejected_suggestions`，
+/// 拒过的是**那个候选名**而不是那个路径，所以判据必须问到名字上）；`Locked` 还没有落点 ——
+/// 那是 S2 的用户操作，要么落成 `rename_items` 的行状态、要么加一列，等 S2 定。
 /// 判定树是 `04 §7.2` 的契约，未构造 ≠ 可删（同 `error.rs` 的码表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -167,8 +168,7 @@ impl Judgment {
 const ILLEGAL: [char; 13] = [
     '\\', '/', ':', '*', '?', '"', '<', '>', '|', '\u{FF0F}', '\u{29F8}', '〘', '〙',
 ];
-/// 需要翻译/修旧的痕迹词（`04 §7.5` ①：`癒し` 逐字直译、语气词硬译、助词未消解）
-const SMELL_WORDS: [&str; 4] = ["的癒", "癒的", "哟", "吗"];
+/// 机翻痕迹的**词表与启发式在 `rules.rs`**（`04 §7.5`），这里只留「句尾孤立助词」这一条模式
 const SMELL_TAIL: [char; 4] = ['的', '也', '和', '了'];
 const DASH_TAIL: [char; 4] = ['_', '-', '–', '—'];
 const WAVES: [char; 4] = ['〜', '~', '∼', '〰'];
@@ -239,10 +239,11 @@ fn roman(name: &str) -> bool {
         >= 2
 }
 
-/// 机翻痕迹（`04 §7.5`）。①词表 + ②里两条**不依赖原文**的启发式；
-/// 长度比那条要拿到「原文＋旧译」一对才有意义，等重修链路（`04 §7.7` 后置校验）一起接。
+/// 机翻痕迹（`04 §7.5`）。① 词表与 ② 的三条启发式全住在 `rules::has_mt_smell`（一张表一个数据源），
+/// 这里只剩两条**看名字形状**的：句尾孤立助词、尾部残留分隔符。② 的「译文与原文长度比」
+/// 在这里故意缺席 —— 改名侧盘上没有「原文＋旧译」那一对，理由写在 `04 §7.5` ② 行末。
 fn mt_smell(name: &str) -> bool {
-    if SMELL_WORDS.iter().any(|w| name.contains(w)) {
+    if crate::rename::rules::has_mt_smell(name) {
         return true;
     }
     if name.ends_with(SMELL_TAIL) {
@@ -256,8 +257,7 @@ fn mt_smell(name: &str) -> bool {
     {
         return true;
     }
-    let cs: Vec<char> = name.chars().collect();
-    cs.windows(2).any(|w| w[0] == w[1] && matches!(w[0], '的' | '了' | '是'))
+    false
 }
 
 #[cfg(test)]
@@ -293,6 +293,12 @@ mod tests {
             .verdict,
             Verdict::Skip
         );
+    }
+
+    #[test]
+    fn mt_smell_from_rules_module_marks_needs_repair() {
+        assert_eq!(v("缶風呂体验"), Verdict::NeedsRepair);
+        assert_eq!(v("04.理桜和卿卿我我了小姐话哟？"), Verdict::NeedsRepair);
     }
 
     #[test]
@@ -384,5 +390,6 @@ mod tests {
         for name in ["01_深夜掏耳", "【女仆ASMR】女仆治愈小队～悠闲时间～", "掏耳・吐息_副标题"] {
             assert_eq!(judge(name, FOLDER_MAX, &CTX), Judgment { verdict: Verdict::Compliant, reasons: vec![] }, "{name}");
         }
+        assert!(traditional("見送") && traditional("揺音") && traditional("縦"));
     }
 }

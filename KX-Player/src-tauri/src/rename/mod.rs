@@ -24,3 +24,4 @@ pub mod postcheck;
 pub mod preview;
 pub mod report;
 pub mod rollback;
+pub mod rules;

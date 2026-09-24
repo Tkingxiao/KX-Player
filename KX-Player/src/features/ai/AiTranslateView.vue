@@ -44,6 +44,18 @@ const stat = computed(() => queueStats(files.value))
 const finishedCount = computed(() => stat.value.finished)
 const failedCount = computed(() => stat.value.failed)
 
+/**
+ * 运行中快照统计：进度带与轨道进度只认本次运行的任务集合。
+ * 避免历史已完成、或免译（exempt）行使进度分母/分子在开局虚高。
+ */
+const runStat = computed(() => {
+  if (!runPaths.length) return { total: 0, done: 0, failed: 0, skipped: 0, finished: 0, pending: 0 }
+  const take = new Set(runPaths)
+  return queueStats(files.value.filter((r) => take.has(r.path)))
+})
+const runFinishedCount = computed(() => runStat.value.finished)
+const runFailedCount = computed(() => runStat.value.failed)
+
 const targetDir = computed(() => ui.aiFolder)
 
 // ── 工种切换（DESIGN.md「AI 工作台」§2）：分段控件，不重建页面 ──
@@ -87,7 +99,7 @@ const phases = computed(() => [
     key: 'translate',
     label: '翻译',
     state: running.value ? 'active' : stat.value.done > 0 || stat.value.failed > 0 ? 'done' : 'pending',
-    note: running.value ? `${finished.value}/${stat.value.total}` : '',
+    note: running.value ? `${runFinishedCount.value}/${runStat.value.total}` : '',
   },
   {
     key: 'review',
@@ -120,7 +132,7 @@ onBeforeUnmount(() => stopRunTimer())
 
 /** 汇总播报文案（aria-live=polite，DESIGN.md §7）：只报里程碑，不逐行刷屏 */
 const liveSummary = computed(() => {
-  if (running.value) return `已完成 ${finished.value} 项 / 共 ${stat.value.total} 项`
+  if (running.value) return `已完成 ${runFinishedCount.value} 项 / 共 ${runStat.value.total} 项`
   if (runSettled.value && stat.value.failed > 0) return `翻译结束，失败 ${stat.value.failed} 项`
   if (runSettled.value && stat.value.done > 0) return `翻译完成，成功 ${stat.value.done} 项`
   return ''
@@ -330,11 +342,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <ActionRail :phases="[...phases]" />
           <ProgressBand
             v-if="running"
-            :done="finishedCount"
-            :total="stat.total"
+            :done="runFinishedCount"
+            :total="runStat.total"
             :elapsed-sec="elapsedSec"
             :current-item="currentItem"
-            :failed="failedCount"
+            :failed="runFailedCount"
             @open-failures="openFailures"
           />
           <!-- 汇总播报：只报里程碑（DESIGN.md §7），视觉上隐藏 -->
@@ -342,7 +354,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <div class="ai-files-head">
             <h3 class="section-title">翻译队列 · {{ files.length }} 个文件</h3>
             <div class="ai-files-actions">
-              <span v-if="running" class="tnum ai-progress">{{ finishedCount }}/{{ stat.total }}</span>
+              <span v-if="running" class="tnum ai-progress">{{ runFinishedCount }}/{{ runStat.total }}</span>
               <span v-if="failedCount" class="tnum ai-failed-count">失败 {{ failedCount }}</span>
               <button v-if="failedCount && !running" class="btn-ghost" title="把失败文件重新排队，其余不动" @click="retryFailed">重试失败项</button>
               <button class="btn-ghost" :disabled="!files.length" @click="clearFinished">清除已完成</button>
