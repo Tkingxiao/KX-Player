@@ -24,20 +24,28 @@ const DEAD_LIMIT: usize = 3;
 /// 逐块 tick 的最小间隔
 const TICK_GAP: Duration = Duration::from_millis(500);
 
-/// 模型接入三件套（字段名与 `AiChatPayload` 对齐）
+/// 模型接入三件套（字段名与 `AiChatPayload` 对齐）。
+/// API Key 用 `Zeroizing` 装：`Hub` 是每个请求任务都被 `Arc::clone` 的长期持有者，
+/// 任务结束时必须把这份副本也擦掉（P0-3）。
 pub struct Creds {
     base_url: String,
-    api_key: String,
+    api_key: zeroize::Zeroizing<String>,
     model: String,
 }
 
 pub fn creds_of(base_url: &str, api_key: &str, model: &str) -> Creds {
-    Creds { base_url: base_url.to_string(), api_key: api_key.to_string(), model: model.to_string() }
+    Creds {
+        base_url: base_url.to_string(),
+        api_key: zeroize::Zeroizing::new(api_key.to_string()),
+        model: model.to_string(),
+    }
 }
 
 /// 一次任务运行期跨线程共享的部分：会被 `Arc::clone` 进每个请求任务。
 pub struct Hub {
     creds: Creds,
+    /// 端点地址校验的结果（P0-3）：地址不合规时一条都不该发，别等每块都撞一遍
+    ready: Result<(), String>,
     pub st: Strategy,
     pub cancel: Arc<AtomicBool>,
     /// 连续「端点连不上」的次数；任何一次成功都清零
@@ -59,8 +67,10 @@ impl Hub {
         merge_lines: Option<usize>,
         cancel: Arc<AtomicBool>,
     ) -> Arc<Self> {
+        let ready = crate::ai_url::check(&creds.base_url).map(|_| ());
         Arc::new(Self {
             creds,
+            ready,
             st: Strategy::resolve(kind, chunk_size, concurrency, merge_lines),
             cancel,
             dead: AtomicUsize::new(0),
@@ -68,6 +78,11 @@ impl Hub {
             dead_reason: Mutex::new(None),
             emit_err_logged: AtomicBool::new(false),
         })
+    }
+
+    /// 开跑前自检：地址不合规就一条别发（任务一开始就该看到原因，而不是跑出几条「已取消」）
+    pub fn check_ready(&self) -> Result<(), String> {
+        self.ready.clone()
     }
 
     fn emit(&self, app: &AppHandle, p: crate::ai_job::AiProgress) {
@@ -275,7 +290,7 @@ async fn translate_range(hub: &Arc<Hub>, texts: &[String]) -> Option<Vec<String>
 async fn attempt_batch(hub: &Arc<Hub>, texts: &[String]) -> Option<Vec<String>> {
     let payload = crate::model::AiChatPayload {
         base_url: hub.creds.base_url.clone(),
-        api_key: hub.creds.api_key.clone(),
+        api_key: hub.creds.api_key.to_string(),
         model: hub.creds.model.clone(),
         messages: vec![
             crate::model::ChatMessage { role: "system".into(), content: prompt::SYSTEM_PROMPT.into() },

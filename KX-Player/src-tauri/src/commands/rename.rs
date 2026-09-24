@@ -97,6 +97,11 @@ pub async fn rename_suggest_names(
         return Err(IpcError::invalid_argument("没有选中要生成译名的目录"));
     }
     guard_scope(&scope, &paths)?;
+    // 地址不合规就别起任务：这一条没有取消按钮，等它把 200 个名字逐个撞一遍
+    // 再报「全部失败」是最差的一种反馈（P0-3）
+    crate::ai_url::check(&base_url).map_err(IpcError::invalid_argument)?;
+    // Tauri 交过来的 String 用完就擦：这条链路里 Key 会活到整批问完为止（P0-3）
+    let api_key = zeroize::Zeroizing::new(api_key);
     let kind = model_kind.unwrap_or_default();
     let plan = join_task(
         "清点待生成译名",

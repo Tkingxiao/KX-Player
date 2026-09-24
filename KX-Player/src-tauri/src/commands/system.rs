@@ -145,7 +145,9 @@ pub async fn ai_ping(payload: AiChatPayload) -> AiPingResult {
 
 #[tauri::command]
 pub async fn ai_list_models(base_url: String, api_key: String) -> AiModelsResult {
-    crate::ai::list_models(&base_url, &api_key).await
+    // Key 从进来到用完只有这一份：Tauri 交过来的 String 用完就擦（P0-3）
+    let api_key = zeroize::Zeroizing::new(api_key);
+    crate::ai::list_models(&base_url, api_key.as_str()).await
 }
 
 /// 启动字幕翻译任务（返回 taskId；进度与结果走 ai:progress 事件，见 B3）

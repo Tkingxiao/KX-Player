@@ -1,30 +1,26 @@
 //! AI 翻译服务：OpenAI 兼容 /chat/completions（网络只发生在 Rust 侧；API Key 不落盘）。
 
+use crate::ai_url::Target;
 use crate::model::{AiChatPayload, AiModelsResult, AiPingResult};
 use std::time::Duration;
 
-/// 规范化 baseURL：去尾部斜杠，无 /v1 时自动补（Ollama 原生地址兼容）
-pub fn normalize_base_url(raw: &str) -> String {
-    let mut u = raw.trim().trim_end_matches('/').to_string();
-    if u.is_empty() {
-        u = "http://127.0.0.1:11434".into();
+/// 日志与调试输出里的秘密表示：只报有没有、多长，**永不回显内容**。
+pub fn redact(secret: &str) -> String {
+    if secret.is_empty() {
+        "未设置".to_string()
+    } else {
+        format!("已设置（{} 字符）", secret.chars().count())
     }
-    // 仅接受 http/https
-    if !u.starts_with("http://") && !u.starts_with("https://") {
-        u = format!("http://{u}");
-    }
-    if !has_version_segment(&u) {
-        u.push_str("/v1");
-    }
-    u
 }
 
-/// 等价 TS 正则 /\/v\d+(\/|$)/：末段或任一段为 v+数字
-fn has_version_segment(u: &str) -> bool {
-    u.split('/').any(|seg| {
-        seg.strip_prefix('v')
-            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
-    })
+/// 端点校验与规范化都在 [`crate::ai_url`]（P0-3）：scheme 白名单、默认 https、
+/// 明文只给本机与私网、公网只走 443。这里只负责把它归到错误分类上。
+fn resolve(raw: &str) -> Result<Target, AiError> {
+    crate::ai_url::check(raw).map_err(AiError::Config)
+}
+
+fn chat_url(base: &str) -> String {
+    format!("{base}/chat/completions")
 }
 
 /// 共享 **async** 客户端（连接池复用）。
@@ -33,13 +29,16 @@ fn has_version_segment(u: &str) -> bool {
 /// 主线程上，一次 120 s 超时的补全会让整个窗口冻住（用户在等，且无法取消）。
 /// 现在只留 async 客户端，`Cargo.toml` 里连 `blocking` feature 都删掉了：
 /// 谁再写回阻塞调用，编译直接失败。
+///
+/// 重定向改成逐跳复核的自定义策略（P0-3）：跨源一律拒，理由见 `ai_url::redirect_verdict`。
 fn client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
-}
-
-fn chat_url(base_url: &str) -> String {
-    format!("{}/chat/completions", normalize_base_url(base_url))
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(crate::ai_url::redirect_policy())
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 /// 按**字符**截断，绝不按字节。
@@ -73,18 +72,21 @@ pub enum AiError {
     Timeout(String),
     /// 非 2xx、响应结构不对、正文缺失：请求级
     Reply(String),
+    /// 接口地址本身就不合规（P0-3）：整批都不可能成功，与「连不上」同样归为端点没救
+    Config(String),
 }
 
 impl AiError {
     pub fn text(&self) -> String {
         match self {
-            Self::Transport(m) | Self::Timeout(m) | Self::Reply(m) => m.clone(),
+            Self::Transport(m) | Self::Timeout(m) | Self::Reply(m) | Self::Config(m) => m.clone(),
         }
     }
 
-    /// 只有「根本连不上」才够格判定端点已死
+    /// 「根本连不上」或「地址根本不合规」才够格判定端点已死：这两种情况接着往下跑
+    /// 只是把剩下的文件白烧一遍。
     pub fn is_dead_endpoint(&self) -> bool {
-        matches!(self, Self::Transport(_))
+        matches!(self, Self::Transport(_) | Self::Config(_))
     }
 
     fn from_reqwest(e: &reqwest::Error, text: String) -> Self {
@@ -124,14 +126,18 @@ fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: u64) -> Result<(), AiError>
 }
 
 async fn chat_completion_full(opts: &AiChatPayload, timeout_ms: u64) -> Result<ChatOutcome, AiError> {
-    let url = chat_url(&opts.base_url);
+    let target = resolve(&opts.base_url)?;
+    crate::ai_url::note_endpoint(&target, &opts.api_key);
+    let url = chat_url(&target.base);
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::CONTENT_TYPE,
         reqwest::header::HeaderValue::from_static("application/json"),
     );
     if !opts.api_key.is_empty() {
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", opts.api_key)) {
+        // 拼出来的 `Bearer …` 也是一份 Key：用完就清，别留在堆上等下一次分配
+        let bearer = zeroize::Zeroizing::new(format!("Bearer {}", opts.api_key));
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&bearer) {
             headers.insert("Authorization", v);
         }
     }
@@ -209,15 +215,14 @@ pub async fn ping(opts: &AiChatPayload) -> AiPingResult {
 }
 
 /// OpenAI 兼容的模型清单端点：`{base}/models`。
-fn models_url(base_url: &str) -> String {
-    format!("{}/models", normalize_base_url(base_url))
+fn models_url(base: &str) -> String {
+    format!("{base}/models")
 }
 
 /// Ollama **原生**端点：`/api/tags` 挂在站点根上，**不在 `/v1` 之下** ——
 /// 老版本 Ollama 没有 `/v1/models`，只打 `/models` 会取不到任何模型（AI-2）。
-fn ollama_tags_url(base_url: &str) -> String {
-    let base = normalize_base_url(base_url);
-    let origin = base.strip_suffix("/v1").unwrap_or(&base);
+fn ollama_tags_url(base: &str) -> String {
+    let origin = base.strip_suffix("/v1").unwrap_or(base);
     format!("{origin}/api/tags")
 }
 
@@ -243,7 +248,8 @@ fn parse_model_list(data: &serde_json::Value) -> Vec<String> {
 async fn fetch_models(url: &str, api_key: &str) -> Result<Vec<String>, String> {
     let mut req = client().get(url).timeout(Duration::from_secs(15));
     if !api_key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {api_key}"));
+        let bearer = zeroize::Zeroizing::new(format!("Bearer {api_key}"));
+        req = req.header("Authorization", bearer.as_str());
     }
     let resp = req.send().await.map_err(|e| format!("{e}"))?;
     let status = resp.status();
@@ -260,8 +266,13 @@ async fn fetch_models(url: &str, api_key: &str) -> Result<Vec<String>, String> {
 
 /// 先打 OpenAI 兼容端点，空手而归再退到 Ollama 原生端点；两条都失败时把两条原因一起回给用户。
 pub async fn list_models(base_url: &str, api_key: &str) -> AiModelsResult {
+    let target = match crate::ai_url::check(base_url) {
+        Ok(t) => t,
+        Err(e) => return AiModelsResult { ok: false, models: vec![], error: Some(e) },
+    };
+    crate::ai_url::note_endpoint(&target, api_key);
     let mut errors: Vec<String> = Vec::new();
-    for url in [models_url(base_url), ollama_tags_url(base_url)] {
+    for url in [models_url(&target.base), ollama_tags_url(&target.base)] {
         match fetch_models(&url, api_key).await {
             Ok(models) if !models.is_empty() => return AiModelsResult { ok: true, models, error: None },
             Ok(_) => errors.push(format!("{url} 没有返回任何模型")),
@@ -287,14 +298,23 @@ mod tests {
         assert_eq!(brief("", 0), "");
     }
 
-    /// 快速失败只认 Transport：本地模型首次加载权重动辄几分钟，一次 Timeout 就停整条队列
-    /// 会把「其实还能继续」的任务误杀。
+    /// 快速失败只认「不可恢复」：本地模型首次加载权重动辄几分钟，一次 Timeout 就停整条队列
+    /// 会把「其实还能继续」的任务误杀；地址不合规则反过来 —— 整批都跑不动，越早停越好。
     #[test]
-    fn only_transport_errors_mark_the_endpoint_dead() {
+    fn only_unrecoverable_errors_mark_the_endpoint_dead() {
         assert!(AiError::Transport("连接被拒绝".into()).is_dead_endpoint());
+        assert!(AiError::Config("公网主机必须用 https".into()).is_dead_endpoint());
         assert!(!AiError::Timeout("operation timed out".into()).is_dead_endpoint());
         assert!(!AiError::Reply("HTTP 401: unauthorized".into()).is_dead_endpoint());
         assert_eq!(AiError::Reply("HTTP 401: unauthorized".into()).text(), "HTTP 401: unauthorized");
+    }
+
+    #[test]
+    fn an_unusable_base_url_is_a_config_error() {
+        let e = resolve("http://api.deepseek.com/v1").expect_err("公网明文地址应当被拒");
+        assert!(e.is_dead_endpoint(), "地址不合规整批都跑不动");
+        assert!(e.text().contains("必须用 https"), "{}", e.text());
+        assert!(resolve("http://127.0.0.1:11434/v1").is_ok(), "本机 Ollama 不受影响");
     }
 
     /// 响应体上限到点就停，不是「先全收下再判断」—— 后者对坏端点毫无意义。
@@ -320,10 +340,11 @@ mod tests {
 
     #[test]
     fn ollama_endpoint_is_derived_from_the_origin() {
-        assert_eq!(ollama_tags_url("http://127.0.0.1:11434"), "http://127.0.0.1:11434/api/tags");
-        assert_eq!(ollama_tags_url("http://127.0.0.1:11434/v1/"), "http://127.0.0.1:11434/api/tags");
-        assert_eq!(ollama_tags_url("https://api.deepseek.com"), "https://api.deepseek.com/api/tags");
-        assert_eq!(models_url("http://127.0.0.1:11434"), "http://127.0.0.1:11434/v1/models");
+        let base = |raw: &str| resolve(raw).expect("测试地址应当通过").base;
+        assert_eq!(ollama_tags_url(&base("http://127.0.0.1:11434")), "http://127.0.0.1:11434/api/tags");
+        assert_eq!(ollama_tags_url(&base("http://127.0.0.1:11434/v1/")), "http://127.0.0.1:11434/api/tags");
+        assert_eq!(ollama_tags_url(&base("https://api.deepseek.com")), "https://api.deepseek.com/api/tags");
+        assert_eq!(models_url(&base("http://127.0.0.1:11434")), "http://127.0.0.1:11434/v1/models");
     }
 
     #[test]

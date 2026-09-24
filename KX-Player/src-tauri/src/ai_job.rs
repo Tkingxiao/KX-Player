@@ -33,7 +33,7 @@ impl<'a> Loc<'a> {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiTranslateSpec {
     pub base_url: String,
@@ -50,8 +50,7 @@ pub struct AiTranslateSpec {
     pub chunk_size: Option<usize>,
     pub concurrency: Option<usize>,
 }
-
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiTextsSpec {
     pub base_url: String,
@@ -64,6 +63,53 @@ pub struct AiTextsSpec {
     pub merge_lines: Option<usize>,
     pub chunk_size: Option<usize>,
     pub concurrency: Option<usize>,
+}
+
+/// 任务跑完就把 Key 从内存里擦掉（P0-3）。任务可能跑几十分钟，这两个 spec 会一直
+/// 活在线程栈上 —— 不擦的话，Key 会以明文形式留在堆里等下一个分配者。
+impl Drop for AiTranslateSpec {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.api_key.zeroize();
+    }
+}
+
+impl Drop for AiTextsSpec {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.api_key.zeroize();
+    }
+}
+
+/// 手写而非 derive：`{:?}` 一份 spec 就是一条带 Key 的日志，输出里只留长度。
+impl std::fmt::Debug for AiTranslateSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiTranslateSpec")
+            .field("base_url", &self.base_url)
+            .field("api_key", &crate::ai::redact(&self.api_key))
+            .field("model", &self.model)
+            .field("paths", &self.paths.len())
+            .field("model_kind", &self.model_kind)
+            .field("merge_lines", &self.merge_lines)
+            .field("chunk_size", &self.chunk_size)
+            .field("concurrency", &self.concurrency)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AiTextsSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiTextsSpec")
+            .field("base_url", &self.base_url)
+            .field("api_key", &crate::ai::redact(&self.api_key))
+            .field("model", &self.model)
+            .field("texts", &self.texts.len())
+            .field("model_kind", &self.model_kind)
+            .field("merge_lines", &self.merge_lines)
+            .field("chunk_size", &self.chunk_size)
+            .field("concurrency", &self.concurrency)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -169,6 +215,14 @@ async fn run_all(app: &AppHandle, spec: &AiTranslateSpec, task_id: u64, cancel: 
     );
     let run = Run::new(app, task_id, hub);
     let file_count = spec.paths.len();
+    // 端点地址不合规（P0-3）：一条都别发 —— 否则用户看到的是几条「已取消」，
+    // 真正的原因藏在收尾事件里
+    if let Err(e) = run.hub.check_ready() {
+        let mut p = progress(task_id, "queue-finished", Loc::new("", 0, file_count));
+        p.error = Some(e);
+        run.emit(p);
+        return;
+    }
     for (i, path) in spec.paths.iter().enumerate() {
         let loc = Loc::new(path, i, file_count);
         if run.hub.cancel.load(Ordering::SeqCst) {
@@ -206,6 +260,12 @@ async fn run_all_texts(app: &AppHandle, spec: &AiTextsSpec, task_id: u64, cancel
     );
     let run = Run::new(app, task_id, hub);
     let loc = Loc::new("", 0, spec.texts.len());
+    if let Err(e) = run.hub.check_ready() {
+        let mut p = progress(task_id, "queue-finished", loc);
+        p.error = Some(e);
+        run.emit(p);
+        return;
+    }
     let translated = translate_chunks(&run, loc, &spec.texts).await;
     match translated {
         Some(list) => {

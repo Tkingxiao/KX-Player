@@ -53,6 +53,7 @@ function clampMerge(): void {
       <label class="ai-field">
         <span>接口地址</span>
         <input v-model="settings.aiBaseURL" @change="settings.scheduleSave()" />
+        <span class="ai-field-hint">公网地址必须 https 且走 443；本机（127.0.0.1 / localhost）与局域网可 http 并自带端口</span>
       </label>
       <ModelPicker />
       <label class="ai-field">
@@ -127,6 +128,8 @@ function clampMerge(): void {
   font-size: 12px;
 }
 .ai-field input:focus { border-color: rgb(var(--accent-rgb)); }
+/* 地址规则写在输入框下面：Rust 侧会拒掉不合规的地址，先让人知道线画在哪 */
+.ai-field-hint { font-size: 10.5px; color: var(--text-sub); line-height: 1.5; }
 .ai-test-row {
   display: flex;
   align-items: center;

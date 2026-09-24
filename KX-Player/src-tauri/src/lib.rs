@@ -8,6 +8,7 @@ mod ai_job;
 mod ai_prompt;
 mod ai_scan;
 mod ai_strategy;
+mod ai_url;
 mod ai_wire;
 mod atomic;
 mod bgimage;

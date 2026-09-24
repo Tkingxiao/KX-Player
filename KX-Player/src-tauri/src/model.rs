@@ -128,7 +128,7 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiChatPayload {
     pub base_url: String,
@@ -143,6 +143,29 @@ pub struct AiChatPayload {
     /// `None` = 不由软件侧限制（字幕那条链路的既有行为，参数是第 11 批定的）。
     #[serde(default)]
     pub max_tokens: Option<u32>,
+}
+
+/// API Key 只该活在这条请求里。`String` 被丢弃不会擦掉堆上的字节 —— 那块内存会被
+/// 下一个分配者拿到（P0-3：任务线程里的秘密要有等价于 `SecretString` 的生命周期控制）。
+impl Drop for AiChatPayload {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.api_key.zeroize();
+    }
+}
+
+/// 手写而非 derive：`{:?}` 一份请求就是一条带 Key 的日志，**输出里永远只有长度**。
+impl std::fmt::Debug for AiChatPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiChatPayload")
+            .field("base_url", &self.base_url)
+            .field("api_key", &crate::ai::redact(&self.api_key))
+            .field("model", &self.model)
+            .field("messages", &self.messages.len())
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
