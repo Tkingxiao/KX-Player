@@ -133,7 +133,8 @@ pub async fn translate_one(run: &Run<'_>, loc: Loc<'_>, path: &str) -> Result<Op
         return Ok(Some(out_path));
     }
 
-    let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+    let content = crate::limits::read_text_capped(std::path::Path::new(path), crate::limits::MAX_TEXT_BYTES)
+        .map_err(|e| format!("读取失败: {e}"))?;
     let content_hash = crate::ai_cache::hash(prompt::SUBTITLE_PROMPT_VERSION, content.as_bytes());
 
     // 1) 内容命中复用缓存：译文直接来自缓存，跳过 AI。
@@ -142,7 +143,7 @@ pub async fn translate_one(run: &Run<'_>, loc: Loc<'_>, path: &str) -> Result<Op
             crate::db::with_db_text(&db, |c| crate::ai_cache::get_content(c, &content_hash).map_err(|e| e.to_string()))
                 .map_err(|e| format!("读复用缓存失败: {e}"))?;
         if let Some(rendered) = cached {
-            std::fs::write(&out_path, &rendered).map_err(|e| format!("写入失败: {e}"))?;
+            crate::atomic::write_str(std::path::Path::new(&out_path), &rendered).map_err(|e| format!("写入失败: {e}"))?;
             let _ = record_lookup(path, &out_path, &content_hash);
             return Ok(Some(out_path));
         }
@@ -157,7 +158,7 @@ pub async fn translate_one(run: &Run<'_>, loc: Loc<'_>, path: &str) -> Result<Op
         None => return Ok(None),
     };
     let rendered = doc.render(&translated);
-    std::fs::write(&out_path, &rendered).map_err(|e| format!("写入失败: {e}"))?;
+    crate::atomic::write_str(std::path::Path::new(&out_path), &rendered).map_err(|e| format!("写入失败: {e}"))?;
     // 记账 + 内容缓存：失败只回退到「少了一级缓存」，不把翻译主流程挡住。
     let _ = record_lookup(path, &out_path, &content_hash).and_then(|_| {
         crate::db::with_db_text(&db, |c| {

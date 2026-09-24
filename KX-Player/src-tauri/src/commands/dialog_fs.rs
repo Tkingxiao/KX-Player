@@ -130,7 +130,18 @@ pub fn read_as_data_url(scope: tauri::State<'_, PathScope>, path: String) -> Opt
             return None;
         }
     };
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = match crate::limits::read_capped(&path, crate::limits::MAX_IMAGE_BYTES) {
+        Ok(b) => b,
+        Err(why) => {
+            crate::paths::append_log(&format!("[limit] read_as_data_url 拒绝 {path:?}（{why}）"));
+            return None;
+        }
+    };
+    // 解码前先量像素：前端拿到 data URL 就会画，图片炸弹在这一步之前就得拦下
+    if let Err(why) = crate::limits::check_image_pixels(&bytes, crate::limits::MAX_IMAGE_PIXELS) {
+        crate::paths::append_log(&format!("[limit] read_as_data_url 拒绝 {path:?}（{why}）"));
+        return None;
+    }
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let mime = match ext.as_str() {
         "jpg" | "jpeg" => "jpeg",
@@ -152,7 +163,13 @@ pub fn read_text_file(scope: tauri::State<'_, PathScope>, path: String) -> Optio
             return None;
         }
     };
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = match crate::limits::read_capped(&path, crate::limits::MAX_TEXT_BYTES) {
+        Ok(b) => b,
+        Err(why) => {
+            crate::paths::append_log(&format!("[limit] read_text_file 拒绝 {path:?}（{why}）"));
+            return None;
+        }
+    };
     // BOM 处理
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Some(String::from_utf8_lossy(&bytes[3..]).into_owned());
@@ -219,10 +236,23 @@ pub fn list_dir(scope: tauri::State<'_, PathScope>, path: String) -> Vec<DirEntr
     match std::fs::read_dir(path) {
         Ok(entries) => entries
             .flatten()
-            .map(|e| DirEntryInfo {
-                name: e.file_name().to_string_lossy().into_owned(),
-                is_file: e.file_type().map(|t| t.is_file()).unwrap_or(false),
-                is_directory: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            .take(crate::limits::MAX_DIR_ENTRIES + 1)
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if i == crate::limits::MAX_DIR_ENTRIES {
+                    // 截断要说一声：歌词同名文件查找会在这份列表里找 `.lrc`，静默少一半
+                    // 会表现成「这首没有歌词」，比报一条日志难查得多。
+                    crate::paths::append_log(&format!(
+                        "[limit] list_dir 截断到 {} 条（目录条目更多）",
+                        crate::limits::MAX_DIR_ENTRIES
+                    ));
+                    return None;
+                }
+                Some(DirEntryInfo {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    is_file: e.file_type().map(|t| t.is_file()).unwrap_or(false),
+                    is_directory: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                })
             })
             .collect(),
         Err(_) => vec![],

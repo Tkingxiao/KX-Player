@@ -114,7 +114,7 @@ pub fn append_log(msg: &str) {
         if meta.len() > 1024 * 1024 {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let keep_from = tail_start(&content, 512 * 1024);
-                let _ = std::fs::write(&path, &content[keep_from..]);
+                let _ = crate::atomic::write(&path, &content.as_bytes()[keep_from..]);
             }
         }
     }

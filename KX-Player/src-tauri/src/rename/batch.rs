@@ -382,7 +382,10 @@ mod tests {
         assert_eq!(sync_history(roots, std::slice::from_ref(&p), false).unwrap().1, 0);
         assert_eq!(sync_history(roots, &[p], true).unwrap().1, 1);
         assert_eq!(read_doc(&hist), json!({}), "撤干净之后不留空壳");
-        assert!(!base.join(format!("{}.tmp", history::HISTORY_FILE)).exists());
+        assert!(
+            std::fs::read_dir(&base).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+            "临时件要被 rename 掉"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

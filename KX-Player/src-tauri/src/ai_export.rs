@@ -62,7 +62,7 @@ pub fn load(paths: &[String]) -> Loaded {
 }
 
 fn read_doc(path: &str) -> Result<subs::Doc, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+    let content = crate::limits::read_text_capped(std::path::Path::new(path), crate::limits::MAX_TEXT_BYTES)?;
     let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     let doc = subs::parse(&content, &ext).ok_or_else(|| format!("不支持的字幕格式: .{ext}"))?;
     if doc.segment_count() == 0 {
@@ -210,7 +210,7 @@ pub fn import(loaded: &Loaded, text: &str, apply: bool) -> ImportResult {
             let out = prompt::translated_path(&entry.path, entry.kind.as_str());
             stat.out_path = Some(out.clone());
             if apply {
-                match std::fs::write(&out, entry.doc.render(&translated)) {
+                match crate::atomic::write_str(std::path::Path::new(&out), &entry.doc.render(&translated)) {
                     Ok(_) => r.written.push(out),
                     Err(e) => r.errors.push(format!("{out}：写入失败 {e}")),
                 }

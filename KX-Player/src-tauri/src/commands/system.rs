@@ -194,7 +194,7 @@ pub async fn ai_export_prompts(app: AppHandle, paths: Vec<String>) -> IpcResult<
                 return Err(IpcError::new(AppErrorCode::Cancelled, "已取消导出"));
             };
             let path = picked.to_string();
-            if let Err(e) = std::fs::write(&path, &content) {
+            if let Err(e) = crate::atomic::write_str(std::path::Path::new(&path), &content) {
                 return Err(IpcError::with_detail(AppErrorCode::IoFailed, "写入批次文件失败", e));
             }
             Ok(crate::ai_export::export_meta(&loaded, &path))

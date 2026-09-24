@@ -98,6 +98,31 @@ impl AiError {
     }
 }
 
+/// 带上限地读响应体：`resp.text()` 是「对端给多少就吃多少」—— 一个坏掉的端点用一条
+/// 超大响应就能把进程内存顶穿。先看 `Content-Length`（有就早退），再按块读、过上限即停
+/// —— 流式响应没有长度，只靠前者等于没拦。
+async fn read_body_capped(resp: &mut reqwest::Response, cap: u64) -> Result<String, AiError> {
+    if let Some(n) = resp.content_length() {
+        if n > cap {
+            return Err(AiError::Reply(format!("响应体 {n} 字节，超过上限 {cap}")));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| AiError::Reply(format!("读取响应失败: {e}")))? {
+        push_capped(&mut buf, &chunk, cap)?;
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 单独一个函数是为了能测：不发真请求也能钉住「到上限就停」。
+fn push_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: u64) -> Result<(), AiError> {
+    if buf.len() as u64 + chunk.len() as u64 > cap {
+        return Err(AiError::Reply(format!("响应体超过上限 {cap} 字节")));
+    }
+    buf.extend_from_slice(chunk);
+    Ok(())
+}
+
 async fn chat_completion_full(opts: &AiChatPayload, timeout_ms: u64) -> Result<ChatOutcome, AiError> {
     let url = chat_url(&opts.base_url);
     let mut headers = reqwest::header::HeaderMap::new();
@@ -130,14 +155,14 @@ async fn chat_completion_full(opts: &AiChatPayload, timeout_ms: u64) -> Result<C
         .await
         .map_err(|e| AiError::from_reqwest(&e, brief(&format!("请求失败: {e}"), 300)))?;
     let status = resp.status();
+    let mut resp = resp;
     if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
+        let text = read_body_capped(&mut resp, crate::limits::MAX_AI_RESPONSE_BYTES).await.unwrap_or_default();
         return Err(AiError::Reply(format!("HTTP {status}: {}", brief(&text, 300))));
     }
-    let data: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| AiError::Reply(format!("解析失败: {e}")))?;
+    let text = read_body_capped(&mut resp, crate::limits::MAX_AI_RESPONSE_BYTES).await?;
+    let data: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| AiError::Reply(format!("解析失败: {e}")))?;
     let content = data
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
@@ -222,7 +247,10 @@ async fn fetch_models(url: &str, api_key: &str) -> Result<Vec<String>, String> {
     }
     let resp = req.send().await.map_err(|e| format!("{e}"))?;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
+    let mut resp = resp;
+    let text = read_body_capped(&mut resp, crate::limits::MAX_AI_RESPONSE_BYTES)
+        .await
+        .map_err(|e| e.text())?;
     if !status.is_success() {
         return Err(format!("HTTP {status}: {}", brief(&text, 200)));
     }
@@ -267,6 +295,27 @@ mod tests {
         assert!(!AiError::Timeout("operation timed out".into()).is_dead_endpoint());
         assert!(!AiError::Reply("HTTP 401: unauthorized".into()).is_dead_endpoint());
         assert_eq!(AiError::Reply("HTTP 401: unauthorized".into()).text(), "HTTP 401: unauthorized");
+    }
+
+    /// 响应体上限到点就停，不是「先全收下再判断」—— 后者对坏端点毫无意义。
+    #[test]
+    fn response_body_cap_stops_at_the_limit() {
+        let mut buf: Vec<u8> = Vec::new();
+        push_capped(&mut buf, b"1234", 8).expect("未超限");
+        push_capped(&mut buf, b"5678", 8).expect("正好到上限");
+        let e = push_capped(&mut buf, b"9", 8).expect_err("多一个字节就该拒");
+        assert!(e.text().contains("上限"), "{}", e.text());
+        assert_eq!(buf.len(), 8, "被拒的那一块不该进缓冲");
+    }
+
+    /// 流式响应没有 `Content-Length`，只查头等于没拦：分块累计到上限也得停下。
+    #[test]
+    fn response_body_cap_counts_chunk_by_chunk() {
+        let mut buf: Vec<u8> = Vec::new();
+        for i in 0..4 {
+            assert!(push_capped(&mut buf, &[b'x'; 100], 400).is_ok(), "第 {i} 块仍在限内");
+        }
+        assert!(push_capped(&mut buf, b"x", 400).is_err(), "第 401 个字节必须被拦");
     }
 
     #[test]

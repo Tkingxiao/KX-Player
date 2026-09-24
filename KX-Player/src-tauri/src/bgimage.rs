@@ -51,7 +51,9 @@ pub fn load() -> Option<BgImageData> {
     }
     let mtime = std::fs::metadata(&p).ok()?.modified().ok()?;
     let ms = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as f64;
-    let luma = std::fs::read(&p).ok().and_then(|bytes| sample_luma(&bytes));
+    // 自产文件的量级本该远小于图片上限；按上限读只是不让「外来/损坏的旧文件」整份进内存。
+    // 超了就当取不到亮度，背景图本身照常显示。
+    let luma = crate::limits::read_capped(&p, crate::limits::MAX_IMAGE_BYTES).ok().and_then(|bytes| sample_luma(&bytes));
     Some(BgImageData { path: p.to_string_lossy().into_owned(), mtime: Some(ms), luma })
 }
 
@@ -59,12 +61,27 @@ pub fn load() -> Option<BgImageData> {
 pub fn save_data_url(data_url: &str) -> bool {
     let Some(b64) = data_url.split(',').next_back() else { return false };
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else { return false };
+    // 先按 base64 解出来的长度拦一道：几百 MB 的串在前端拼得出来，解完才发现太大就晚了
+    if bytes.len() as u64 > crate::limits::MAX_IMAGE_BYTES {
+        crate::paths::append_log(&format!(
+            "[limit] 背景图拒绝（解码后 {} 字节，超过上限 {}）",
+            bytes.len(),
+            crate::limits::MAX_IMAGE_BYTES
+        ));
+        return false;
+    }
     write_bytes(&bytes)
 }
 
 /// 选择新背景图：压缩落盘，回读路径 + mtime + 感知亮度
 pub fn select_and_save(src: &str) -> Option<BgImageData> {
-    let bytes = std::fs::read(src).ok()?;
+    let bytes = match crate::limits::read_capped(Path::new(src), crate::limits::MAX_IMAGE_BYTES) {
+        Ok(b) => b,
+        Err(why) => {
+            crate::paths::append_log(&format!("[limit] 选择背景图拒绝 {src}（{why}）"));
+            return None;
+        }
+    };
     if write_bytes(&bytes) {
         load()
     } else {
@@ -73,21 +90,17 @@ pub fn select_and_save(src: &str) -> Option<BgImageData> {
 }
 
 fn write_bytes(bytes: &[u8]) -> bool {
+    // 压缩（`resize_to_jpeg` 会真解码）之前先把像素量出来：几十 KB 的 PNG 能解出上亿像素
+    if let Err(why) = crate::limits::check_image_pixels(bytes, crate::limits::MAX_IMAGE_PIXELS) {
+        crate::paths::append_log(&format!("[limit] 背景图拒绝（{why}）"));
+        return false;
+    }
     let p = bg_path();
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    match resize_to_jpeg(bytes) {
-        Some(out) => {
-            let tmp = p.with_extension("png.tmp");
-            if std::fs::write(&tmp, &out).is_ok() {
-                std::fs::rename(&tmp, &p).is_ok()
-            } else {
-                std::fs::write(&p, &out).is_ok()
-            }
-        }
-        None => std::fs::write(&p, bytes).is_ok(),
-    }
+    let out = match resize_to_jpeg(bytes) {
+        Some(out) => out,
+        None => bytes.to_vec(),
+    };
+    crate::atomic::write(&p, &out).is_ok()
 }
 
 pub fn remove() -> bool {
@@ -99,26 +112,34 @@ pub fn remove() -> bool {
     }
 }
 
+/// 迁移读取的上限：这条路径读的**正是**「旧版留下的超大壁纸」，不能按 `MAX_IMAGE_BYTES`
+/// 拦（那正是要处理的对象）；这里只防「意外的大文件」被整份读进来 —— 再大的图片也不是
+/// 壁纸，跳过迁移比读进内存强。
+const MIGRATE_MAX_READ: u64 = 256 * 1024 * 1024;
+
 /// 迁移：旧版超大壁纸压缩（启动时调用一次）
 pub fn migrate_oversized() {
     let p = bg_path();
     if !p.exists() {
         return;
     }
-    let Ok(bytes) = std::fs::read(&p) else { return };
+    let bytes = match crate::limits::read_capped(&p, MIGRATE_MAX_READ) {
+        Ok(b) => b,
+        Err(e) => {
+            // 跳过要说一声：否则「旧壁纸一直没被压小」看起来像迁移坏了
+            crate::paths::append_log(&format!("[limit] 跳过背景图迁移：{e}"));
+            return;
+        }
+    };
     let dim = image::load_from_memory(&bytes).ok().map(|i| (i.width(), i.height()));
     if let Some((w, h)) = dim {
         if w <= MAX_BG_DIM && h <= MAX_BG_DIM {
             return;
         }
         if let Some(out) = resize_to_jpeg(&bytes) {
-            let tmp = p.with_extension("png.tmp");
-            if std::fs::write(&tmp, &out).is_ok() {
-                let _ = std::fs::rename(&tmp, &p);
-            }
+            let _ = crate::atomic::write(&p, &out);
         }
     }
-    let _ = Path::new(&p).exists();
 }
 
 #[cfg(test)]

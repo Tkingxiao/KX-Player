@@ -165,15 +165,11 @@ pub fn load(path: &Path) -> Result<Value, String> {
     }
 }
 
-/// pretty + tmp/rename 原子替换。写坏用户的账本不在可接受的失败模式里。
+/// pretty + 原子替换（唯一临时名 / sync / rename，见 `crate::atomic`）。
+/// 写坏用户的账本不在可接受的失败模式里。
 pub fn store(path: &Path, doc: &Value) -> Result<(), String> {
     let pretty = serde_json::to_string_pretty(doc).map_err(|e| format!("序列化失败：{e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &pretty).map_err(|e| format!("写入临时文件失败：{e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("替换失败：{e}")
-    })
+    crate::atomic::write_str(path, &pretty).map_err(|e| format!("写入失败：{e}"))
 }
 
 #[cfg(test)]
@@ -184,6 +180,12 @@ mod tests {
 
     fn d(root: &str, group: &str, key: &str, to: &str) -> Delta {
         Delta { root: root.into(), group: group.into(), key: key.into(), to: to.into(), prev: None }
+    }
+
+    /// 目录里还有没有临时件。临时名带 pid/计数/纳秒（`crate::atomic`），
+    /// 不能再按固定名 `rename_history.json.tmp` 去找。
+    fn no_temp_left(dir: &std::path::Path) -> bool {
+        std::fs::read_dir(dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
     }
     fn dp(root: &str, group: &str, key: &str, to: &str, prev: Option<&str>) -> Delta {
         Delta {
@@ -321,7 +323,7 @@ mod tests {
         merge(&mut doc, &[d("nor", "旧甲", "_", "新甲")]).unwrap();
         store(&file, &doc).unwrap();
         assert_eq!(load(&file).unwrap(), doc);
-        assert!(!dir.join("rename_history.json.tmp").exists(), "临时文件要被 rename 掉");
+        assert!(no_temp_left(&dir), "临时文件要被 rename 掉");
         let mut again = load(&file).unwrap();
         merge(&mut again, &[d("unnor", "旧乙", "01_b~.mp3", "01_b.mp3")]).unwrap();
         store(&file, &again).unwrap();

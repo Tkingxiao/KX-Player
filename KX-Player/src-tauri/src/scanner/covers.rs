@@ -4,7 +4,6 @@
 
 use super::meta::{image_dimensions, ext_of};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -51,15 +50,16 @@ pub fn compress_to_jpeg(input: &[u8]) -> Option<Vec<u8>> {
 pub fn save_cover_bytes(name: &str, bytes: &[u8]) -> Option<String> {
     let compressed = compress_to_jpeg(bytes)?;
     let path = covers_dir().join(format!("{name}.jpg"));
-    let mut f = std::fs::File::create(&path).ok()?;
-    f.write_all(&compressed).ok()?;
+    // 封面会被 asset:// 直接读走：半截 JPEG 在界面上就是一块坏图，且缓存住不再重试
+    crate::atomic::write(&path, &compressed).ok()?;
     Some(path.to_string_lossy().into_owned())
 }
 
 /// 把封面文件压缩后写入 covers/{name}.jpg（外部图片文件 → 封面）
 pub fn save_cover_file(name: &str, src: &Path) -> Option<String> {
-    let bytes = std::fs::read(src).ok()?;
-    if bytes.is_empty() || bytes.len() > MAX_COVER_BYTES {
+    // 先量后读：先整份读进来再判大小，等于让「误把原盘当封面」的这次读先发生
+    let bytes = crate::limits::read_capped(src, MAX_COVER_BYTES as u64).ok()?;
+    if bytes.is_empty() {
         return None;
     }
     save_cover_bytes(name, &bytes)
@@ -288,7 +288,9 @@ pub fn load_folder_cover_map() {
 
 fn persist_folder_cover_map(map: &HashMap<String, String>) {
     if let Ok(json) = serde_json::to_string(map) {
-        let _ = std::fs::write(folder_map_path(), json);
+        // 这份映射丢了不会致命（封面会按目录重新找一遍），但写坏成半截 JSON 会让
+        // 下次启动整份映射读不出来 —— 一样走原子替换
+        let _ = crate::atomic::write_str(&folder_map_path(), &json);
     }
 }
 

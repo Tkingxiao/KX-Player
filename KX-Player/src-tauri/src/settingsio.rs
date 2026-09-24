@@ -10,14 +10,8 @@ pub fn load(settings_path: &Path) -> serde_json::Value {
 }
 
 pub fn save(settings_path: &Path, settings: &serde_json::Value) -> bool {
-    if let Some(dir) = settings_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let pretty = serde_json::to_string_pretty(settings).unwrap_or_default();
-    // tmp + rename 原子替换
-    let tmp = settings_path.with_extension("json.tmp");
-    if std::fs::write(&tmp, pretty).is_ok() {
-        return std::fs::rename(&tmp, settings_path).is_ok();
-    }
-    false
+    // 唯一临时名 + sync + 原子替换：设置写坏一次的代价是「所有偏好回到默认」，
+    // 而且用户不会知道是这一次退出时坏的
+    crate::atomic::write_str(settings_path, &pretty).is_ok()
 }
