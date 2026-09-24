@@ -1,7 +1,7 @@
 /** 曲库 store：快照加载 → 界面先出 → 后台增量同步 → 文件监听。 */
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed } from 'vue'
-import type { FolderNode, Track, ScanResult, PlayProgress } from '@/contracts/api'
+import type { FolderNode, Track, ScanResult, ScanStatus, PlayProgress } from '@/contracts/api'
 import { api, onEvent } from '@/bridge/ipc'
 import { buildFolderMeta, findNodeByPath, collectAllTracks, type FolderMeta } from '@/utils/folderTree'
 import { invalidateFolderCoverMisses } from '@/utils/covers'
@@ -27,6 +27,12 @@ export const useLibraryStore = defineStore('library', () => {
   const revision = ref(0) // 每次曲库数据变化自增，驱动封面等派生资源重新加载
   const scanning = ref<ScanState>({ active: false, completed: 0, total: 0, stage: '' })
   const scanningFolder = ref('')
+  /**
+   * 最近一次「没扫完」的原因（partial / failed）。曲库本身保持可用 —— Rust 只补不删，
+   * 回来的也是合并后的库，这里只负责把话说清楚，让用户知道盘上还有没读到的部分。
+   * `cancelled` 不进这里：被更新的扫描取代是正常收场，新扫描自己会给出结论。
+   */
+  const scanIssue = ref<ScanStatus | null>(null)
 
   // 防竞态：扫描代数
   let scanGeneration = 0
@@ -35,6 +41,10 @@ export const useLibraryStore = defineStore('library', () => {
 
   function applyScanResult(result: ScanResult | null): void {
     if (!result) return
+    const status = result.scan
+    // 被更新的扫描取代：这份结果是上一轮的半成品，一个字段都不许进
+    if (status && status.outcome === 'cancelled') return
+    scanIssue.value = status && status.outcome !== 'complete' ? status : null
     // payload 缺 folderPaths 时保留现值，避免重扫链路把曲库路径归零
     const nextPaths = result.folderPaths && result.folderPaths.length ? result.folderPaths : folderPaths.value
     folderPaths.value = [...nextPaths].map(normDir)
@@ -48,6 +58,10 @@ export const useLibraryStore = defineStore('library', () => {
     revision.value++
     // 曲库变化后清空「无封面」负缓存，让新增/新生成的封面能被重新发现
     invalidateFolderCoverMisses()
+  }
+
+  function dismissScanIssue(): void {
+    scanIssue.value = null
   }
 
   function setProgressInfo(list: PlayProgress[]): void {
@@ -284,8 +298,9 @@ export const useLibraryStore = defineStore('library', () => {
 
   return {
     folderPaths, folderTree, allTracks, trackIndex, folderMeta, progress,
-    loaded, revision, scanning, scanningFolder, scanningVisible,
+    loaded, revision, scanning, scanningFolder, scanningVisible, scanIssue,
     init, rescan, importFolder, removeFolder, onFsChanged, loadProgress, updateProgressLocal,
+    dismissScanIssue,
     rootFolders, nodeByPath, tracksOfFolder, libraryStats,
     loudnessScan, startLoudnessAnalysis, cancelLoudnessAnalysis,
   }

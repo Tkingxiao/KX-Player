@@ -2,10 +2,15 @@
 //! 与 Electron fileScanner.ts 的算法逐段对齐（含三层封面、祖先链文件夹树、增量判据）。
 
 pub mod covers;
+pub mod gate;
 pub mod meta;
 
 use crate::db;
-use crate::model::{normalize_path, Album, Artist, FolderNode, ScanResult, Track};
+use crate::model::{
+    normalize_path, Album, Artist, FolderNode, ScanResult, ScanStatus, Track, SCAN_CANCELLED,
+    SCAN_FAILED, SCAN_PARTIAL,
+};
+use crate::scanner::gate::Ticket;
 use crate::scanner::meta::*;
 use crate::scanner::meta::ScanMeta;
 use std::collections::{HashMap, HashSet};
@@ -36,24 +41,50 @@ fn is_media_file(name: &str) -> bool {
     is_media_ext(&ext_of(name))
 }
 
-fn discover_files(folder_paths: &[String]) -> Vec<String> {
+/// 目录遍历的收口：`reasons` 非空表示这份文件清单不完整，
+/// **绝不允许**据此把「本轮没见到」判成「已删除」（P0-4）。
+struct Discovered {
+    files: Vec<String>,
+    reasons: Vec<String>,
+}
+
+/// 目录遍历。`cancel` 是闸门给的取消旗子：被更新的扫描取代后就地收手。
+fn discover_files(folder_paths: &[String], cancel: Option<&AtomicBool>) -> Discovered {
     let mut results: Vec<String> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = folder_paths.iter().map(|p| normalize_path(p)).collect();
+    let mut reasons: Vec<String> = Vec::new();
+    let mut unreadable = 0usize;
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     let start = std::time::Instant::now();
-    while let Some(dir) = stack.pop() {
-        if visited.contains(&dir) || visited.len() >= MAX_DIR_COUNT {
+    'walk: while let Some(dir) = stack.pop() {
+        if cancelled() {
+            reasons.push("已被更新的扫描取代".into());
+            break;
+        }
+        if visited.contains(&dir) {
             continue;
+        }
+        // 目录数封顶：原先只是「跳过剩下的」，现在整轮收口 —— 反正清单已经不完整了
+        if visited.len() >= MAX_DIR_COUNT {
+            reasons.push(format!("目录数超过 {MAX_DIR_COUNT} 上限"));
+            break;
         }
         // 防止极深目录/软链接循环卡住：单目录遍历限时 30 秒
         if start.elapsed().as_secs() > 30 {
-            crate::paths::append_log("[scan] discover_files timed out (30s), returning partial results");
+            reasons.push("目录遍历超过 30 秒".into());
             break;
         }
         visited.insert(dir.clone());
         let entries = match std::fs::read_dir(Path::new(&long_path(&dir))) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                // 离线盘、权限变化、根目录被拔掉都落在这里：这些目录下的曲目本轮「见不到」，
+                // 但一条都不许删，所以整轮降级成 partial。
+                unreadable += 1;
+                crate::paths::append_log(&format!("[scan] 目录读不出来：{dir}（{e}）"));
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -67,15 +98,24 @@ fn discover_files(folder_paths: &[String]) -> Vec<String> {
             } else if is_media_file(&name) {
                 results.push(full);
                 if results.len() >= 100_000 {
-                    crate::paths::append_log("[scan] hit max 100000 media files limit");
-                    results.sort();
-                    return results;
+                    reasons.push("文件数超过 100000 上限".into());
+                    break 'walk;
                 }
             }
         }
     }
+    if unreadable > 0 {
+        reasons.push(format!("{unreadable} 个目录读不出来（离线或权限变化）"));
+    }
     results.sort();
-    results
+    if !reasons.is_empty() {
+        crate::paths::append_log(&format!(
+            "[scan] 遍历不完整（发现 {} 个文件）：{}",
+            results.len(),
+            reasons.join("；")
+        ));
+    }
+    Discovered { files: results, reasons }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,16 +220,18 @@ fn parse_one_guarded(
 /// 只有真正卡死的文件才会触发补位，因此不会退化成「每文件一线程」。
 ///
 /// `parse` 与 `report` 以 trait object 注入，便于单测；生产入口见 `parse_files_parallel`。
+/// `cancel` 是闸门的取消旗子：被取代后 worker 不再领新文件、主线程不再空等。
 fn parse_pool(
     files: &[String],
     timeout: Duration,
     report: Arc<dyn Fn(usize) + Send + Sync>,
     parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync>,
-) -> HashMap<String, FileMeta> {
+    cancel: Option<Arc<AtomicBool>>,
+) -> (HashMap<String, FileMeta>, ParseReport) {
     let total = files.len();
     if total == 0 {
         report(0);
-        return HashMap::new();
+        return (HashMap::new(), ParseReport::default());
     }
 
     // worker 数：min(cpu, 8)，下限 2（宪法：扫描解码并发 min(cpu, 8)）。
@@ -227,6 +269,7 @@ fn parse_pool(
         let next_chunk = Arc::clone(&next_chunk);
         let requeued = Arc::clone(&requeued);
         let parse = Arc::clone(&parse);
+        let cancel = cancel.clone();
         move || {
             let slot: WorkerSlot = Arc::new(Mutex::new(None));
             slots.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&slot));
@@ -239,9 +282,14 @@ fn parse_pool(
             let requeued = Arc::clone(&requeued);
             let parse = Arc::clone(&parse);
             let worker_active = Arc::clone(&active);
+            let worker_cancel = cancel.clone();
             let spawned = std::thread::Builder::new().name("scan-parse".into()).spawn(move || {
                 let _guard = ActiveWorkers(worker_active);
                 loop {
+                    // 已被更新的扫描取代：不再领新文件（正在解析的那个文件只能等它自己回来）
+                    if worker_cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        break;
+                    }
                     // 优先处理 watchdog 退回的单文件尾巴
                     let single = requeued.lock().unwrap_or_else(|e| e.into_inner()).pop();
                     match single {
@@ -296,6 +344,9 @@ fn parse_pool(
 
     // 主线程即 watchdog：巡检 worker 登记 + 按 120ms 节流上报进度
     loop {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            break;
+        }
         let observed: Vec<WorkerSlot> = slots.lock().unwrap_or_else(|e| e.into_inner()).clone();
         for slot in observed {
             // 原子地「取走」一个仍处于超时状态的登记：取走后该 worker 之后的新登记
@@ -366,16 +417,34 @@ fn parse_pool(
         "[scan] parsed {done}/{total} files ({worker_count} workers, chunk={chunk_size}, cpu={threads})"
     ));
     let out = results.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    out
+    let mut report = ParseReport::default();
+    if done < total {
+        // worker 提前收场（取消、线程创建失败、极端情况下退出）：
+        // 这些文件本轮「没见到」，谁都不许据此删库。
+        report.reasons.push(format!("解析未完成（{done}/{total}）"));
+    }
+    (out, report)
+}
+
+/// 并行解析的收口：`reasons` 非空表示有些文件没解析出来，本轮结果不完整。
+#[derive(Default)]
+struct ParseReport {
+    reasons: Vec<String>,
 }
 
 /// 扫描用并行解析入口：worker 池 + 逐文件 10s 硬超时，进度每 120ms 节流上报。
-fn parse_files_parallel(files: &[String], app: &AppHandle, total_hint: i64, done_offset: i64) -> HashMap<String, FileMeta> {
+fn parse_files_parallel(
+    files: &[String],
+    app: &AppHandle,
+    total_hint: i64,
+    done_offset: i64,
+    cancel: Option<Arc<AtomicBool>>,
+) -> (HashMap<String, FileMeta>, ParseReport) {
     let app = app.clone();
     let report: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |done: usize| {
         emit_progress(&app, done_offset + done as i64, total_hint);
     });
-    parse_pool(files, PARSE_TIMEOUT, report, Arc::new(parse_file))
+    parse_pool(files, PARSE_TIMEOUT, report, Arc::new(parse_file), cancel)
 }
 
 /// 超时兜底元数据（与旧版 parse_one 的超时分支完全一致）
@@ -781,16 +850,87 @@ fn to_dto_artists(artists: Vec<ScannedArtist>) -> Vec<Artist> {
         .collect()
 }
 
-/// 全量扫描（含保存快照 + 封面）
+/// 把各段的收口理由汇总成一个状态：一条理由都没有才算 `complete`。
+fn status_from(reasons: Vec<String>) -> ScanStatus {
+    if reasons.is_empty() {
+        ScanStatus::complete()
+    } else {
+        ScanStatus::new(SCAN_PARTIAL, reasons)
+    }
+}
+
+/// 中途被取代时的收口：不落库、不给新数据，把库里现有的快照原样交回（带 cancelled 状态）。
+/// 前端拿到 `cancelled` 会保留现有曲库，不去覆盖。
+fn cancelled_result(db_path: &Path, folder_paths: &[String], reason: &str) -> ScanResult {
+    let mut s = db::library::load_snapshot(db_path, false).unwrap_or_else(|| ScanResult {
+        folder_paths: folder_paths.iter().map(|p| normalize_path(p)).collect(),
+        ..Default::default()
+    });
+    s.scan = ScanStatus::new(SCAN_CANCELLED, vec![reason.to_string()]);
+    s
+}
+
+/// 落库收口（P0-4）：
+/// - `complete`：整份快照入库，允许把「本轮没见到」判成删除；
+/// - 其余：只补见到的不删任何旧条目，再把库里合并后的真相回读给前端 ——
+///   前端拿这份结果替换曲库时，旧条目一条都不会丢。
+fn settle_scan(db_path: &Path, computed: ScanResult, status: ScanStatus) -> ScanResult {
+    let written = if status.is_complete() {
+        db::library::save_snapshot(db_path, &computed)
+    } else {
+        crate::paths::append_log(&format!("[scan] 本轮不完整（{}），只补不删", status.reasons.join("；")));
+        db::library::save_snapshot_no_delete(db_path, &computed)
+    };
+    if let Err(e) = written {
+        crate::paths::append_log(&format!("[scan] saveLibrary failed: {e}"));
+        let mut failed = db::library::load_snapshot(db_path, false).unwrap_or(computed);
+        failed.scan = ScanStatus::new(SCAN_FAILED, vec![format!("曲库写入失败：{e}")]);
+        return failed;
+    }
+    db::progress::prune_progress_and_bookmarks(db_path);
+    if status.is_complete() {
+        return computed;
+    }
+    match db::library::load_snapshot(db_path, false) {
+        Some(mut merged) => {
+            merged.scan = status;
+            merged
+        }
+        None => {
+            let mut fallback = computed;
+            fallback.scan = status;
+            fallback
+        }
+    }
+}
+
+/// 全量扫描（含保存快照 + 封面）。闸门保证同一时刻只有最新一次扫描有权落库。
 pub fn scan_full(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> ScanResult {
+    let ticket = gate::GATE.begin();
+    let out = scan_full_inner(app, folder_paths, db_path, &ticket);
+    gate::GATE.finish(&ticket);
+    out
+}
+
+fn scan_full_inner(app: &AppHandle, folder_paths: &[String], db_path: &Path, ticket: &Ticket) -> ScanResult {
     crate::paths::append_log(&format!("[scan] full scan folders: {folder_paths:?}"));
     emit_stage(app, "发现文件...");
-    let files = discover_files(folder_paths);
+    let discovered = discover_files(folder_paths, Some(&ticket.cancel_flag()));
+    if ticket.superseded() {
+        return cancelled_result(db_path, folder_paths, "已被更新的扫描取代");
+    }
+    let files = discovered.files;
     let total = files.len() as i64;
     emit_progress(app, 0, total);
     emit_stage(app, &format!("解析元数据... ({total} 个文件)"));
 
-    let metas = parse_files_parallel(&files, app, total, 0);
+    let (metas, parse) = parse_files_parallel(&files, app, total, 0, Some(ticket.cancel_flag()));
+    if ticket.superseded() {
+        return cancelled_result(db_path, folder_paths, "已被更新的扫描取代");
+    }
+    let mut reasons = discovered.reasons;
+    reasons.extend(parse.reasons);
+    let status = status_from(reasons);
 
     emit_stage(app, "整理结构...");
     let mut artists = group_tracks(&files, &metas, folder_paths);
@@ -806,18 +946,33 @@ pub fn scan_full(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> Sc
         all_tracks: all_tracks.clone(),
         file_count: files.len() as i64,
         scanned_at: now_ms(),
+        scan: status.clone(),
     };
-    persist_snapshot(db_path, &result);
-    result
+    // 落库前再校验一次，并持着闸门锁写完 ——「谁是最新」与「谁有权写」必须是同一件事
+    match gate::GATE.if_current(ticket, || settle_scan(db_path, result, status)) {
+        Some(settled) => settled,
+        None => cancelled_result(db_path, folder_paths, "已被更新的扫描取代"),
+    }
 }
 
 /// 增量扫描：只解析新/变化文件。
 /// 返回 (结果, 是否有实际变更)；无变更时完全不发出 stage/progress 事件，
 /// 避免启动时在 UI 上闪出「构建音乐库…」与扫描转圈。
 pub fn scan_incremental_quiet(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> (ScanResult, bool) {
+    let ticket = gate::GATE.begin();
+    let out = scan_incremental_inner(app, folder_paths, db_path, &ticket);
+    gate::GATE.finish(&ticket);
+    out
+}
+
+fn scan_incremental_inner(app: &AppHandle, folder_paths: &[String], db_path: &Path, ticket: &Ticket) -> (ScanResult, bool) {
     crate::paths::append_log(&format!("[scan-incr] folders: {folder_paths:?}"));
     let full_meta = db::library::load_full_meta_index(db_path);
-    let files = discover_files(folder_paths);
+    let discovered = discover_files(folder_paths, Some(&ticket.cancel_flag()));
+    if ticket.superseded() {
+        return (cancelled_result(db_path, folder_paths, "已被更新的扫描取代"), false);
+    }
+    let files = discovered.files;
 
     let mut changed: Vec<String> = Vec::new();
     for f in &files {
@@ -841,8 +996,10 @@ pub fn scan_incremental_quiet(app: &AppHandle, folder_paths: &[String], db_path:
     crate::paths::append_log(&format!("[scan-incr] {}/{} new/changed", changed.len(), files.len()));
 
     if !has_changes {
-        // 无变化：直接返回快照，不发任何 UI 事件（启动路径静默）
-        if let Some(snapshot) = db::library::load_snapshot(db_path, true) {
+        // 无变化：直接返回快照，不发任何 UI 事件（启动路径静默）。
+        // 但遍历不完整时照样如实上报：盘上读不出来的那部分并没有被核对过，别谎报「已是最新」。
+        if let Some(mut snapshot) = db::library::load_snapshot(db_path, true) {
+            snapshot.scan = status_from(discovered.reasons);
             return (snapshot, false);
         }
     }
@@ -871,11 +1028,23 @@ pub fn scan_incremental_quiet(app: &AppHandle, folder_paths: &[String], db_path:
         }
     }
     let changed_set: HashSet<String> = changed.iter().map(|p| normalize_path(p)).collect();
+    let mut reasons = discovered.reasons;
     if !changed.is_empty() {
         emit_stage(app, "解析新文件元数据...");
-        let parsed = parse_files_parallel(&changed, app, total, total - changed.len() as i64);
+        let (parsed, parse) = parse_files_parallel(
+            &changed,
+            app,
+            total,
+            total - changed.len() as i64,
+            Some(ticket.cancel_flag()),
+        );
         metas.extend(parsed);
+        reasons.extend(parse.reasons);
     }
+    if ticket.superseded() {
+        return (cancelled_result(db_path, folder_paths, "已被更新的扫描取代"), false);
+    }
+    let status = status_from(reasons);
 
     emit_stage(app, "构建音乐库...");
     let mut artists = group_tracks(&files, &metas, folder_paths);
@@ -891,21 +1060,17 @@ pub fn scan_incremental_quiet(app: &AppHandle, folder_paths: &[String], db_path:
         all_tracks: all_tracks.clone(),
         file_count: files.len() as i64,
         scanned_at: now_ms(),
+        scan: status.clone(),
     };
-    persist_snapshot(db_path, &result);
-    (result, true)
+    match gate::GATE.if_current(ticket, || settle_scan(db_path, result, status)) {
+        Some(settled) => (settled, true),
+        None => (cancelled_result(db_path, folder_paths, "已被更新的扫描取代"), false),
+    }
 }
 
 /// 兼容入口：需要变更标志时用 scan_incremental_quiet。
 pub fn scan_incremental(app: &AppHandle, folder_paths: &[String], db_path: &Path) -> ScanResult {
     scan_incremental_quiet(app, folder_paths, db_path).0
-}
-
-fn persist_snapshot(db_path: &Path, result: &ScanResult) {
-    if let Err(e) = db::library::save_snapshot(db_path, result) {
-        crate::paths::append_log(&format!("[scan] saveLibrary failed: {e}"));
-    }
-    db::progress::prune_progress_and_bookmarks(db_path);
 }
 
 pub fn now_ms() -> i64 {
@@ -915,8 +1080,17 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// 移除扫描根目录：从既有快照重建（不触发全量重扫）
+/// 移除扫描根目录：从既有快照重建（不触发全量重扫）。
+/// 它也是一次「整库快照写入」，所以照样领一张票：正在飞的扫描会被它取代，
+/// 免得扫描算完拿一份还包含被移除目录的老清单回来覆盖。
 pub fn remove_folder(app: &AppHandle, folder_path: &str, remaining: &[String], db_path: &Path) -> ScanResult {
+    let ticket = gate::GATE.begin();
+    let out = remove_folder_inner(app, folder_path, remaining, db_path);
+    gate::GATE.finish(&ticket);
+    out
+}
+
+fn remove_folder_inner(app: &AppHandle, folder_path: &str, remaining: &[String], db_path: &Path) -> ScanResult {
     let snapshot = match db::library::load_snapshot(db_path, false) {
         Some(s) => s,
         None => {
@@ -977,14 +1151,20 @@ pub fn remove_folder(app: &AppHandle, folder_path: &str, remaining: &[String], d
         all_tracks: kept.clone(),
         file_count: kept.len() as i64,
         scanned_at: now_ms(),
+        scan: ScanStatus::complete(),
     };
-    persist_snapshot(db_path, &result);
+    // 用户主动摘目录：整份快照照写（把被摘掉的曲目删掉正是这次操作的目的）
+    if let Err(e) = db::library::save_snapshot(db_path, &result) {
+        crate::paths::append_log(&format!("[scan] saveLibrary failed: {e}"));
+    }
+    db::progress::prune_progress_and_bookmarks(db_path);
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SCAN_COMPLETE;
     use std::sync::atomic::AtomicUsize;
 
     fn paths(n: usize) -> Vec<String> {
@@ -999,6 +1179,166 @@ mod tests {
         ScanMeta { duration, title: Some(basename_no_ext(p)), ..Default::default() }
     }
 
+    /// 真盘上的小树：一个根、一个子目录、两首曲子。用完即删。
+    fn tree_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("kx-scan-tree-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Album")).expect("建测试目录");
+        std::fs::write(dir.join("a.mp3"), b"x").expect("写文件");
+        std::fs::write(dir.join("Album/b.flac"), b"y").expect("写文件");
+        // 旁挂文件必须被排除
+        std::fs::write(dir.join("cover.jpg"), b"z").expect("写文件");
+        dir
+    }
+
+    fn db_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("kx-scan-db-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建库目录");
+        dir.join("library.db")
+    }
+
+    fn track(id: &str, path: &str) -> Track {
+        Track { id: id.into(), name: id.into(), path: path.into(), ..Default::default() }
+    }
+
+    /// 一份「只含一首曲子」的完整快照形状（够用即可：落库关心的是曲目集合）。
+    fn snapshot_of(tracks: Vec<Track>) -> ScanResult {
+        let node = FolderNode {
+            name: "Music".into(),
+            path: "C:/Music".into(),
+            tracks: tracks.clone(),
+            track_count: tracks.len() as i64,
+            ..Default::default()
+        };
+        ScanResult {
+            folder_paths: vec!["C:/Music".into()],
+            artists: vec![Artist {
+                name: "A".into(),
+                path: "C:/Music".into(),
+                albums: vec![Album { name: "AL".into(), artist: "A".into(), tracks: tracks.clone(), ..Default::default() }],
+            }],
+            folder_tree: vec![node],
+            all_tracks: tracks.clone(),
+            file_count: tracks.len() as i64,
+            scanned_at: now_ms(),
+            ..Default::default()
+        }
+    }
+
+    fn db_track_count(p: &Path) -> i64 {
+        crate::db::with_db(p, |conn| {
+            conn.query_row("SELECT count(*) FROM tracks", [], |r| r.get(0))
+        })
+        .expect("读库")
+    }
+
+    #[test]
+    fn discovery_of_a_healthy_tree_is_complete() {
+        let dir = tree_dir("ok");
+        let root = dir.to_string_lossy().into_owned();
+        let d = discover_files(std::slice::from_ref(&root), None);
+        assert!(d.reasons.is_empty(), "正常目录不该被判成不完整：{:?}", d.reasons);
+        assert_eq!(d.files.len(), 2, "只收音频/视频，封面要滤掉：{:?}", d.files);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// P0-4 的核心场景：离线盘 / 拔掉的移动硬盘。根读不出来时清单不完整，
+    /// 谁都不许据此把库里那批曲目删掉。
+    #[test]
+    fn discovery_reports_an_unreadable_root_as_incomplete() {
+        let dir = tree_dir("offline");
+        let root = dir.to_string_lossy().into_owned();
+        let gone = dir.join("gone");
+        let missing = gone.to_string_lossy().into_owned();
+        let d = discover_files(&[root, missing], None);
+        assert!(!d.reasons.is_empty(), "有目录读不出来就不能算完整");
+        assert_eq!(d.files.len(), 2, "能读到的照样收");
+        assert!(d.reasons.iter().any(|r| r.contains("读不出来")), "理由要能给人看：{:?}", d.reasons);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discovery_stops_early_when_cancelled() {
+        let dir = tree_dir("cancel");
+        let root = dir.to_string_lossy().into_owned();
+        let flag = AtomicBool::new(true);
+        let d = discover_files(std::slice::from_ref(&root), Some(&flag));
+        assert!(!d.reasons.is_empty());
+        assert!(d.files.is_empty(), "被取代就别再往下列了");
+        assert!(d.reasons.iter().any(|r| r.contains("取代")), "{:?}", d.reasons);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cancelled_pool_never_reports_complete() {
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> = Arc::new(|p: &str| meta_for(p, 1.0));
+        let flag = Arc::new(AtomicBool::new(true));
+        let (_, report) = parse_pool(&paths(50), PARSE_TIMEOUT, noop_report(), parse, Some(flag));
+        assert!(!report.reasons.is_empty());
+        assert!(report.reasons.iter().any(|r| r.contains("解析未完成")), "{:?}", report.reasons);
+    }
+
+    #[test]
+    fn a_whole_run_reports_complete() {
+        let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> = Arc::new(|p: &str| meta_for(p, 1.0));
+        let (_, report) = parse_pool(&paths(8), PARSE_TIMEOUT, noop_report(), parse, None);
+        assert!(report.reasons.is_empty(), "{:?}", report.reasons);
+    }
+
+    /// 不完整的扫描落库：见到的照写，没见到的留着，交回前端的也是「库里的真相」。
+    #[test]
+    fn an_incomplete_scan_keeps_unseen_tracks_and_returns_the_merged_library() {
+        let db = db_path("partial");
+        crate::db::library::save_snapshot(&db, &snapshot_of(vec![track("t1", "C:/Music/a.mp3"), track("t2", "C:/Music/b.mp3")]))
+            .expect("播种两条");
+
+        let computed = snapshot_of(vec![track("t1", "C:/Music/a.mp3")]);
+        let status = ScanStatus::new(SCAN_PARTIAL, vec!["1 个目录读不出来（离线或权限变化）".into()]);
+        let out = settle_scan(&db, computed, status);
+
+        assert_eq!(out.scan.outcome, SCAN_PARTIAL);
+        assert_eq!(out.scan.reasons.len(), 1);
+        assert_eq!(out.all_tracks.len(), 2, "交回前端的必须是「旧 + 新」的合并视图");
+        assert_eq!(db_track_count(&db), 2, "库里第二条一条都不许少");
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[test]
+    fn a_complete_scan_still_deletes_what_it_did_not_see() {
+        let db = db_path("full");
+        crate::db::library::save_snapshot(&db, &snapshot_of(vec![track("t1", "C:/Music/a.mp3"), track("t2", "C:/Music/b.mp3")]))
+            .expect("播种两条");
+
+        let out = settle_scan(&db, snapshot_of(vec![track("t1", "C:/Music/a.mp3")]), ScanStatus::complete());
+        assert_eq!(out.scan.outcome, SCAN_COMPLETE);
+        assert_eq!(out.all_tracks.len(), 1);
+        assert_eq!(db_track_count(&db), 1, "完整扫描照旧有权删");
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// 落库失败时不许谎报成功：状态要翻成 failed，并把写失败的原因带出去。
+    #[test]
+    fn a_failed_write_reports_failed_and_keeps_the_library() {
+        let db = db_path("failed");
+        crate::db::library::save_snapshot(&db, &snapshot_of(vec![track("t1", "C:/Music/a.mp3")])).expect("播种");
+        // 用目录顶掉库文件：下次打开必定失败
+        let broken = db.clone();
+        std::fs::remove_file(&broken).expect("删库文件");
+        std::fs::create_dir(&broken).expect("拿目录占位");
+
+        let out = settle_scan(&broken, snapshot_of(vec![track("t2", "C:/Music/b.mp3")]), ScanStatus::complete());
+        assert_eq!(out.scan.outcome, SCAN_FAILED);
+        assert!(out.scan.reasons[0].contains("曲库写入失败"), "{:?}", out.scan.reasons);
+        std::fs::remove_dir_all(&broken).ok();
+    }
+
     #[test]
     fn pool_parses_every_file_exactly_once() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1008,7 +1348,7 @@ mod tests {
                 calls_in.fetch_add(1, Ordering::Relaxed);
                 meta_for(p, 1.5)
             });
-        let meta = parse_pool(&paths(500), PARSE_TIMEOUT, noop_report(), parse);
+        let meta = parse_pool(&paths(500), PARSE_TIMEOUT, noop_report(), parse, None).0;
         assert_eq!(meta.len(), 500);
         assert_eq!(calls.load(Ordering::Relaxed), 500, "each file parsed exactly once");
         assert!(meta.values().all(|m| m.duration == 1.5));
@@ -1017,7 +1357,7 @@ mod tests {
     #[test]
     fn pool_handles_empty_input() {
         let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> = Arc::new(|_| ScanMeta::default());
-        let meta = parse_pool(&[], PARSE_TIMEOUT, noop_report(), parse);
+        let meta = parse_pool(&[], PARSE_TIMEOUT, noop_report(), parse, None).0;
         assert!(meta.is_empty());
     }
 
@@ -1025,7 +1365,7 @@ mod tests {
     fn pool_small_library_still_completes() {
         let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> =
             Arc::new(|p: &str| meta_for(p, 2.0));
-        let meta = parse_pool(&paths(3), PARSE_TIMEOUT, noop_report(), parse);
+        let meta = parse_pool(&paths(3), PARSE_TIMEOUT, noop_report(), parse, None).0;
         assert_eq!(meta.len(), 3);
         assert_eq!(meta["C:/music/track0.mp3"].title.as_deref(), Some("track0"));
     }
@@ -1038,7 +1378,7 @@ mod tests {
             }
             meta_for(p, 9.0)
         });
-        let meta = parse_pool(&paths(20), PARSE_TIMEOUT, noop_report(), parse);
+        let meta = parse_pool(&paths(20), PARSE_TIMEOUT, noop_report(), parse, None).0;
         assert_eq!(meta.len(), 20, "panicking file still yields a fallback entry");
         let fallback = &meta["C:/music/track7.mp3"];
         assert_eq!(fallback.duration, 0.0);
@@ -1055,7 +1395,7 @@ mod tests {
             }
             meta_for(p, 3.0)
         });
-        let meta = parse_pool(&paths(4), Duration::from_millis(80), noop_report(), parse);
+        let meta = parse_pool(&paths(4), Duration::from_millis(80), noop_report(), parse, None).0;
         assert_eq!(meta.len(), 4, "all files counted despite one timeout");
         let timed_out = &meta["C:/music/track0.mp3"];
         assert_eq!(timed_out.duration, 0.0);
@@ -1071,7 +1411,7 @@ mod tests {
         });
         let parse: Arc<dyn Fn(&str) -> ScanMeta + Send + Sync> =
             Arc::new(|p: &str| meta_for(p, 1.0));
-        let meta = parse_pool(&paths(50), PARSE_TIMEOUT, report, parse);
+        let meta = parse_pool(&paths(50), PARSE_TIMEOUT, report, parse, None).0;
         let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(meta.len(), 50);
         assert_eq!(seen.first().copied(), Some(0), "progress starts at 0");

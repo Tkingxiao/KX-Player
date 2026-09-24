@@ -24,6 +24,16 @@ const taxonomy = useTaxonomyStore()
 const hasTaxonomy = computed(() => ui.categoryId !== null || ui.tagIds.size > 0)
 const showChips = computed(() => ui.view === 'smart' && (ui.smartKey !== 'all' || !!ui.durationKey || hasTaxonomy.value))
 
+/** 没扫完的那一轮要把原因说清楚：曲库还在（Rust 只补不删），盘上还有没读到的部分。 */
+const scanIssueText = computed(() => {
+  const s = library.scanIssue
+  if (!s) return ''
+  const why = s.reasons.length ? s.reasons.join('；') : '原因未知'
+  return s.outcome === 'failed'
+    ? `扫描失败：${why}。曲库保持原样，可稍后重试。`
+    : `扫描未完成：${why}。已扫到的照常更新，没扫到的条目继续保留。`
+})
+
 function clearFilters(): void {
   ui.smartKey = 'all'
   ui.durationKey = null
@@ -59,6 +69,12 @@ const chipLabels = computed(() => {
         <span v-if="library.scanning.total" class="tnum">{{ library.scanning.completed }}/{{ library.scanning.total }}</span>
       </div>
     </Transition>
+
+    <div v-if="library.scanIssue" class="scan-issue on-bg" role="status">
+      <span class="scan-issue-dot" aria-hidden="true">!</span>
+      <span class="scan-issue-text">{{ scanIssueText }}</span>
+      <button class="scan-issue-x" type="button" title="收起提示" aria-label="收起提示" @click="library.dismissScanIssue()">✕</button>
+    </div>
 
     <div v-if="showChips" class="filter-chips on-bg">
       <span v-for="c in chipLabels" :key="c.key" class="chip">
@@ -119,6 +135,41 @@ const chipLabels = computed(() => {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+.scan-issue {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 20px;
+  font-size: 11.5px;
+  color: var(--text-sub);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+  flex-shrink: 0;
+}
+.scan-issue-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--warning);
+  border: 1px solid color-mix(in srgb, var(--warning) 55%, transparent);
+  flex-shrink: 0;
+}
+.scan-issue-text { flex: 1 1 auto; min-width: 0; }
+.scan-issue-x {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.scan-issue-x:hover { color: var(--text); }
 .filter-chips {
   display: flex;
   align-items: center;

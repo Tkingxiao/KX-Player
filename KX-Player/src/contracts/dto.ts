@@ -46,7 +46,21 @@ export interface ScanResult {
   folderTree: FolderNode[]
   allTracks: Track[]
   fileCount: number
+  /** 本轮扫描的收口状态；从库里读出来的快照一律是 complete */
+  scan: ScanStatus
 }
+
+/**
+ * 扫描收口状态（Rust: `model::ScanStatus`）。
+ * `complete` 之外都表示这份结果不完整，前端不许拿它替换现有曲库：
+ * 条目由「库里读出来的合并视图」补齐（Rust 只补不删），界面另外把理由显示出来。
+ */
+export interface ScanStatus {
+  outcome: ScanOutcome
+  reasons: string[]
+}
+
+export type ScanOutcome = 'complete' | 'partial' | 'cancelled' | 'failed'
 
 /** Rust: `commands::dialog_fs::DirEntryInfo` */
 export interface DirEntry {

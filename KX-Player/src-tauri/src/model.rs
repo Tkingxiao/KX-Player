@@ -80,6 +80,44 @@ pub struct ScanResult {
     pub file_count: i64,
     #[serde(skip)]
     pub scanned_at: i64,
+    #[serde(default)]
+    pub scan: ScanStatus,
+}
+
+/// 本轮扫描的收口状态（P0-4）。只有 `complete` 才允许「本轮没见到就当删除」，
+/// 其余三种都必须保留旧条目 —— 前端也据此决定要不要用这份结果替换曲库。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanStatus {
+    /// `complete` / `partial` / `cancelled` / `failed`
+    pub outcome: String,
+    /// 给人看的原因（UI 直接显示），`complete` 时为空
+    pub reasons: Vec<String>,
+}
+
+pub const SCAN_COMPLETE: &str = "complete";
+pub const SCAN_PARTIAL: &str = "partial";
+pub const SCAN_CANCELLED: &str = "cancelled";
+pub const SCAN_FAILED: &str = "failed";
+
+impl ScanStatus {
+    pub fn complete() -> Self {
+        Self { outcome: SCAN_COMPLETE.into(), reasons: Vec::new() }
+    }
+
+    pub fn new(outcome: &str, reasons: Vec<String>) -> Self {
+        Self { outcome: outcome.into(), reasons }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.outcome == SCAN_COMPLETE
+    }
+}
+
+impl Default for ScanStatus {
+    fn default() -> Self {
+        Self::complete()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

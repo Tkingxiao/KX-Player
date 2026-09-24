@@ -229,6 +229,7 @@ pub fn load_snapshot(db_path: &Path, lean: bool) -> Option<ScanResult> {
             all_tracks,
             file_count,
             scanned_at: 0,
+            scan: crate::model::ScanStatus::complete(),
         })
     });
     loaded.ok()
@@ -251,14 +252,33 @@ fn folder_track_rows(conn: &Connection) -> Result<Vec<(String, String)>> {
 /// folder_nodes upsert → folder_tracks 先清失效再补缺口 → 删消失的 track 与 folder →
 /// 最后回收不再被任何曲目引用的 album/artist。
 pub fn save_snapshot(db_path: &Path, snapshot: &ScanResult) -> Result<()> {
+    save_snapshot_with(db_path, snapshot, WriteMode::Full)
+}
+
+/// 只补不删：部分扫描 / 被取代的扫描用它落库。
+/// 「本轮没见到」在这种模式下**不构成删除依据** —— 读不到的目录、超时截断的文件清单
+/// 都不该把库里的曲目带走（P0-4）。
+pub fn save_snapshot_no_delete(db_path: &Path, snapshot: &ScanResult) -> Result<()> {
+    save_snapshot_with(db_path, snapshot, WriteMode::NoDelete)
+}
+
+/// 落库模式：`Full` 允许「本轮没见到就删」，`NoDelete` 只写见到的。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    Full,
+    NoDelete,
+}
+
+fn save_snapshot_with(db_path: &Path, snapshot: &ScanResult, mode: WriteMode) -> Result<()> {
     with_db(db_path, |conn| {
         initialize_schema(conn)?;
         let tx = conn.unchecked_transaction()?;
-        let stats = write_diff(&tx, snapshot)?;
+        let stats = write_diff(&tx, snapshot, mode)?;
         tx.commit()?;
         if stats.touched() {
+            let label = if mode == WriteMode::Full { "完整" } else { "只补不删" };
             crate::paths::append_log(&format!(
-                "[scan] 差异写入：曲目 +{}/~{}/-{}，目录 +{}/-{}，归属 +{}/-{}",
+                "[scan] 差异写入（{label}）：曲目 +{}/~{}/-{}，目录 +{}/-{}，归属 +{}/-{}",
                 stats.track_ins, stats.track_upd, stats.track_del, stats.folder_ins, stats.folder_del, stats.pair_ins, stats.pair_del
             ));
         }
@@ -421,7 +441,7 @@ impl Stored {
     }
 }
 
-fn write_diff(conn: &Connection, snapshot: &ScanResult) -> Result<WriteStats> {
+fn write_diff(conn: &Connection, snapshot: &ScanResult, mode: WriteMode) -> Result<WriteStats> {
     let mut st = WriteStats::default();
     let mut stored = Stored::load(conn)?;
     let mut desired_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -549,11 +569,14 @@ fn write_diff(conn: &Connection, snapshot: &ScanResult) -> Result<WriteStats> {
                 st.folder_ins += 1;
             }
         }
-        // 失效映射必须先于 track / folder 删除，否则外键拦住后面两步。
-        for (path, id) in &stored.folder_tracks {
-            if !want_pairs.contains(&(path.clone(), id.clone())) {
-                del_pair.execute(rusqlite::params![path, id])?;
-                st.pair_del += 1;
+        // ── 删除：只有完整扫描才有权把「本轮没见到」判成「已删除」（P0-4）──
+        if mode == WriteMode::Full {
+            // 失效映射必须先于 track / folder 删除，否则外键拦住后面两步。
+            for (path, id) in &stored.folder_tracks {
+                if !want_pairs.contains(&(path.clone(), id.clone())) {
+                    del_pair.execute(rusqlite::params![path, id])?;
+                    st.pair_del += 1;
+                }
             }
         }
         for (path, id) in &want_pairs {
@@ -562,28 +585,37 @@ fn write_diff(conn: &Connection, snapshot: &ScanResult) -> Result<WriteStats> {
                 st.pair_ins += 1;
             }
         }
-        for id in stored.tracks.keys() {
-            if !desired_ids.contains(id.as_str()) {
-                del_track.execute(rusqlite::params![id])?;
-                st.track_del += 1;
+        if mode == WriteMode::Full {
+            for id in stored.tracks.keys() {
+                if !desired_ids.contains(id.as_str()) {
+                    del_track.execute(rusqlite::params![id])?;
+                    st.track_del += 1;
+                }
             }
-        }
-        for path in stored.folders.keys() {
-            if !want_folders.contains_key(path) {
-                del_folder.execute(rusqlite::params![path])?;
-                st.folder_del += 1;
+            for path in stored.folders.keys() {
+                if !want_folders.contains_key(path) {
+                    del_folder.execute(rusqlite::params![path])?;
+                    st.folder_del += 1;
+                }
             }
         }
     }
 
-    conn.execute("DELETE FROM albums WHERE album_id NOT IN (SELECT album_id FROM tracks)", [])?;
-    conn.execute("DELETE FROM artists WHERE artist_id NOT IN (SELECT artist_id FROM tracks)", [])?;
+    // 孤儿专辑/艺术家回收同上：只补不删时一张曲目都没少，不存在新的孤儿。
+    if mode == WriteMode::Full {
+        conn.execute("DELETE FROM albums WHERE album_id NOT IN (SELECT album_id FROM tracks)", [])?;
+        conn.execute("DELETE FROM artists WHERE artist_id NOT IN (SELECT artist_id FROM tracks)", [])?;
+    }
 
     {
         let mut ins_meta = conn.prepare("INSERT OR REPLACE INTO library_meta (key, value) VALUES (?1, ?2)")?;
+        // folderPaths 是用户配置，两种模式都写；fileCount/scannedAt 描述的是「最近一次
+        // **完整**扫描」，只补不删的一轮没有资格改写它们。
         ins_meta.execute(rusqlite::params!["folderPaths", serde_json::to_string(&snapshot.folder_paths).unwrap_or_default()])?;
-        ins_meta.execute(rusqlite::params!["fileCount", snapshot.file_count.to_string()])?;
-        ins_meta.execute(rusqlite::params!["scannedAt", snapshot.scanned_at.to_string()])?;
+        if mode == WriteMode::Full {
+            ins_meta.execute(rusqlite::params!["fileCount", snapshot.file_count.to_string()])?;
+            ins_meta.execute(rusqlite::params!["scannedAt", snapshot.scanned_at.to_string()])?;
+        }
     }
     Ok(st)
 }
@@ -655,7 +687,7 @@ pub fn load_full_meta_index(db_path: &Path) -> HashMap<String, FullMetaEntry> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_diff;
+    use super::{write_diff, WriteMode};
     use crate::db::initialize_schema;
     use crate::model::{Album, Artist, FolderNode, ScanResult, Track};
     use rusqlite::Connection;
@@ -721,13 +753,14 @@ mod tests {
             all_tracks: songs.clone(),
             file_count: songs.len() as i64,
             scanned_at: 1,
+            scan: crate::model::ScanStatus::complete(),
         }
     }
 
     #[test]
     fn first_write_inserts_every_row() {
         let conn = db();
-        let st = write_diff(&conn, &snapshot(vec![song("t1"), song("t2")])).expect("首次写入");
+        let st = write_diff(&conn, &snapshot(vec![song("t1"), song("t2")]), WriteMode::Full).expect("首次写入");
         assert_eq!((st.track_ins, st.track_upd, st.track_del), (2, 0, 0));
         assert_eq!(count(&conn, "artists"), 1);
         assert_eq!(count(&conn, "albums"), 1);
@@ -740,10 +773,10 @@ mod tests {
     #[test]
     fn rewriting_the_same_snapshot_writes_nothing() {
         let conn = db();
-        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")])).expect("播种");
+        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")]), WriteMode::Full).expect("播种");
         let before = (rowid(&conn, "t1"), rowid(&conn, "t2"));
 
-        let st = write_diff(&conn, &snapshot(vec![song("t1"), song("t2")])).expect("再写");
+        let st = write_diff(&conn, &snapshot(vec![song("t1"), song("t2")]), WriteMode::Full).expect("再写");
         assert_eq!(
             (
                 st.track_ins, st.track_upd, st.track_del, //
@@ -761,10 +794,10 @@ mod tests {
     #[test]
     fn sub_second_duration_noise_does_not_rewrite_rows() {
         let conn = db();
-        write_diff(&conn, &snapshot(vec![song("t1")])).expect("播种");
+        write_diff(&conn, &snapshot(vec![song("t1")]), WriteMode::Full).expect("播种");
         let mut drifted = song("t1");
         drifted.duration = 213.9;
-        let st = write_diff(&conn, &snapshot(vec![drifted])).expect("亚秒漂移");
+        let st = write_diff(&conn, &snapshot(vec![drifted]), WriteMode::Full).expect("亚秒漂移");
         assert_eq!((st.track_ins, st.track_upd, st.track_del), (0, 0, 0));
     }
 
@@ -772,7 +805,7 @@ mod tests {
     #[test]
     fn changed_metadata_updates_in_place_and_keeps_loudness() {
         let conn = db();
-        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")])).expect("播种");
+        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")]), WriteMode::Full).expect("播种");
         conn.execute("UPDATE tracks SET loudness_lufs = -16.5 WHERE id = 't1'", [])
             .expect("预置响度");
         let before = rowid(&conn, "t1");
@@ -780,7 +813,7 @@ mod tests {
         let mut moved = song("t1");
         moved.genre = Some("Rock".into());
         moved.bitrate = Some(320);
-        let st = write_diff(&conn, &snapshot(vec![moved, song("t2")])).expect("改元数据");
+        let st = write_diff(&conn, &snapshot(vec![moved, song("t2")]), WriteMode::Full).expect("改元数据");
         assert_eq!((st.track_ins, st.track_upd, st.track_del), (0, 1, 0));
         assert_eq!(rowid(&conn, "t1"), before, "UPDATE 不该换行");
 
@@ -798,21 +831,21 @@ mod tests {
     #[test]
     fn removed_tracks_are_deleted_and_orphan_groups_recycled() {
         let conn = db();
-        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")])).expect("播种");
+        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")]), WriteMode::Full).expect("播种");
 
-        let st = write_diff(&conn, &snapshot(vec![song("t1")])).expect("删一首");
+        let st = write_diff(&conn, &snapshot(vec![song("t1")]), WriteMode::Full).expect("删一首");
         assert_eq!((st.track_del, st.pair_del), (1, 1));
         assert_eq!(count(&conn, "folder_tracks"), 1);
         assert_eq!(count(&conn, "tracks"), 1);
         assert_eq!(count(&conn, "albums"), 1, "专辑仍有曲目，不该回收");
 
-        let st = write_diff(&conn, &snapshot(vec![])).expect("删干净");
+        let st = write_diff(&conn, &snapshot(vec![]), WriteMode::Full).expect("删干净");
         assert_eq!(st.track_del, 1);
         assert_eq!(count(&conn, "tracks"), 0);
         assert_eq!(count(&conn, "albums"), 0);
         assert_eq!(count(&conn, "artists"), 0);
 
-        let st = write_diff(&conn, &ScanResult::default()).expect("连目录树一起删");
+        let st = write_diff(&conn, &ScanResult::default(), WriteMode::Full).expect("连目录树一起删");
         assert_eq!(st.folder_del, 1);
         assert_eq!(count(&conn, "folder_nodes"), 0);
     }
@@ -821,7 +854,7 @@ mod tests {
     #[test]
     fn folder_moves_replace_nodes_without_touching_track_rows() {
         let conn = db();
-        write_diff(&conn, &snapshot(vec![song("t1")])).expect("播种");
+        write_diff(&conn, &snapshot(vec![song("t1")]), WriteMode::Full).expect("播种");
         let before = rowid(&conn, "t1");
 
         let mut moved = song("t1");
@@ -831,12 +864,58 @@ mod tests {
         snap.artists[0].path = "D:/KX".into();
         snap.folder_tree[0].path = "D:/KX".into();
 
-        let st = write_diff(&conn, &snap).expect("换根目录");
+        let st = write_diff(&conn, &snap, WriteMode::Full).expect("换根目录");
         assert_eq!((st.folder_ins, st.folder_del, st.pair_del), (1, 1, 1));
         assert_eq!(st.track_upd, 1, "path 变了要走 UPDATE");
         assert_eq!(st.track_del, 0, "同一首不能被判成删除");
         assert_eq!(rowid(&conn, "t1"), before);
         assert_eq!(count(&conn, "folder_nodes"), 1);
         assert_eq!(count(&conn, "folder_tracks"), 1);
+    }
+
+    /// P0-4 的红线：只补不删的一轮里，「本轮没见到」不构成删除依据。
+    /// 场景就是离线盘 —— 清单里少了整个目录，库里那些曲目一条都不许走。
+    #[test]
+    fn no_delete_mode_keeps_every_unseen_row() {
+        let conn = db();
+        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")]), WriteMode::Full).expect("播种");
+
+        let st = write_diff(&conn, &ScanResult::default(), WriteMode::NoDelete).expect("空清单只补不删");
+        assert_eq!((st.track_del, st.folder_del, st.pair_del), (0, 0, 0), "一条都不许删");
+        assert_eq!(count(&conn, "tracks"), 2);
+        assert_eq!(count(&conn, "folder_nodes"), 1);
+        assert_eq!(count(&conn, "folder_tracks"), 2);
+        assert_eq!(count(&conn, "albums"), 1, "孤儿回收也必须让路");
+        assert_eq!(count(&conn, "artists"), 1);
+    }
+
+    /// 只补不删时的另一半：见到的新曲目照样进库，变化过的照样更新。
+    #[test]
+    fn no_delete_mode_still_inserts_and_updates_what_it_saw() {
+        let conn = db();
+        write_diff(&conn, &snapshot(vec![song("t1")]), WriteMode::Full).expect("播种");
+
+        let mut renamed = song("t1");
+        renamed.name = "改过的名字".into();
+        let st = write_diff(&conn, &snapshot(vec![renamed, song("t2")]), WriteMode::NoDelete).expect("补一首");
+        assert_eq!((st.track_ins, st.track_upd, st.track_del), (1, 1, 0));
+        assert_eq!(count(&conn, "tracks"), 2);
+        assert_eq!(count(&conn, "folder_tracks"), 2);
+    }
+
+    /// 只补不删不许改写「最近一次完整扫描」的描述键：否则 UI 会把半个库当成全库。
+    #[test]
+    fn no_delete_mode_leaves_the_full_scan_meta_alone() {
+        let conn = db();
+        write_diff(&conn, &snapshot(vec![song("t1"), song("t2")]), WriteMode::Full).expect("完整扫描");
+        let meta = |k: &str| -> Option<String> {
+            conn.query_row("SELECT value FROM library_meta WHERE key = ?1", [k], |r| r.get(0)).ok()
+        };
+        let before = (meta("fileCount"), meta("scannedAt"));
+
+        let partial = ScanResult { file_count: 1, scanned_at: 9, ..snapshot(vec![song("t1")]) };
+        write_diff(&conn, &partial, WriteMode::NoDelete).expect("只补不删");
+        assert_eq!((meta("fileCount"), meta("scannedAt")), before, "完整扫描的计数不该被半轮改写");
+        assert_eq!(meta("folderPaths").as_deref(), Some("[\"C:/Music\"]"), "配置项照写");
     }
 }

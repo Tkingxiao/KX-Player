@@ -269,6 +269,7 @@ export const DTO_TABLES = {
 export const DTO_NO_TABLE = {
   // —— 由多表拼装的组装结果 ——
   ScanResult: '曲库快照的顶层容器：library_meta 的 KV + tracks 全量 + artists/albums 拼装（db/library.rs:57-222），没有单表对应。',
+  ScanStatus: '本轮扫描的收口状态（model::ScanStatus）：完整/部分/取消/失败 + 原因串，是这一次运行的判据不是库里的行，不落库。',
 
   // —— 不进库：文件系统与运行期探测 ——
   DirEntry: '文件系统条目（commands/dialog_fs.rs），不进库。',
