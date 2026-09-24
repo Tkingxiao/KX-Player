@@ -25,11 +25,9 @@
 
 #![cfg(windows)]
 
-use once_cell::sync::OnceCell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::time::Duration;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use std::time::Duration;use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, GetStockObject, BLACK_BRUSH, HBRUSH};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -54,6 +52,7 @@ pub struct StageRect {
     pub visible: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
 enum StageCmd {
     Rect(StageRect),
     Visible(bool),
@@ -63,11 +62,29 @@ enum StageCmd {
     Destroy,
 }
 
+/// 离散命令的排队上限。`Rect` 洪泛已被 [`push_cmd`] 合并挡在前面，这里是最后一道保险：
+/// 舞台线程真卡住时，队列不许无声涨到吃光内存。
+const MAX_PENDING_CMDS: usize = 64;
+
 static CMDS: Mutex<VecDeque<StageCmd>> = Mutex::new(VecDeque::new());
-static HOST: OnceCell<isize> = OnceCell::new();
-static MAIN_HWND: OnceCell<isize> = OnceCell::new();
+/// 当前一代舞台线程的宿主窗口（`enqueue` 靠它唤醒该线程）
+static HOST: Mutex<Option<isize>> = Mutex::new(None);
+static MAIN_HWND: Mutex<Option<isize>> = Mutex::new(None);
 /// 当前挂靠目标窗口（None=主窗口）。坐标换算（ClientToScreen）以目标窗口的客户区为基准。
 static TARGET: Mutex<Option<isize>> = Mutex::new(None);
+/// 上一代舞台线程的退出信号。舞台线程是一次性的：`destroy()` 之后它处理完 Destroy 就退出，
+/// 下一次初始化另起一代 —— 换代前必须先确认上一代真的不在了（见 [`start_stage_thread`]）。
+static EXIT_RX: Mutex<Option<std::sync::mpsc::Receiver<()>>> = Mutex::new(None);
+
+thread_local! {
+    /// 本线程创建的那扇宿主窗口。命令只应用到它，不读全局 `HOST` ——
+    /// 换代时全局会先被新的一代覆盖，而旧线程还在把队列抽干净。
+    static MY_HOST: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -127,9 +144,15 @@ fn create_host(main_hwnd: isize) -> Option<isize> {
 
 /// 启动舞台 UI 线程（创建窗口 + 消息循环），返回窗口句柄（mpv 的 wid）。
 /// 必须在 mpv 初始化前调用；窗口在线程内创建，后续窗口操作也只在该线程执行。
+///
+/// 一次初始化只对应一代线程：失败回滚（`destroy()`）之后可以重来，重来前先把上一代
+/// 等退干净 —— 两代同时活着就会有两扇覆盖窗口抢同一条命令队列，画面归谁说不清。
 pub fn start_stage_thread(main_hwnd: isize) -> Option<isize> {
-    let _ = MAIN_HWND.set(main_hwnd);
+    wait_prev_stage_exit();
+    *lock(&MAIN_HWND) = Some(main_hwnd);
     let (tx, rx) = std::sync::mpsc::channel::<isize>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    *lock(&EXIT_RX) = Some(done_rx);
     std::thread::Builder::new()
         .name("kx-stage".into())
         .spawn(move || {
@@ -137,12 +160,15 @@ pub fn start_stage_thread(main_hwnd: isize) -> Option<isize> {
                 Some(h) => h,
                 None => {
                     let _ = tx.send(0);
+                    let _ = done_tx.send(());
                     return;
                 }
             };
-            let _ = HOST.set(hwnd);
+            MY_HOST.with(|c| c.set(hwnd));
+            *lock(&HOST) = Some(hwnd);
             let _ = tx.send(hwnd);
-            message_loop(hwnd);
+            message_loop();
+            let _ = done_tx.send(());
         })
         .ok()?;
     match rx.recv_timeout(Duration::from_secs(5)) {
@@ -151,7 +177,19 @@ pub fn start_stage_thread(main_hwnd: isize) -> Option<isize> {
     }
 }
 
-fn message_loop(_host: isize) {
+/// 等上一代舞台线程退出。退出信号由线程自己在消息循环结束后发出（见 start_stage_thread）。
+/// 等不到只记日志、不无限等：卡在这里等于把「初始化失败」升级成「应用起不来」，
+/// 那比多留一个已作废的窗口更糟。
+fn wait_prev_stage_exit() {
+    let rx = lock(&EXIT_RX).take();
+    if let Some(rx) = rx {
+        if rx.recv_timeout(Duration::from_secs(3)).is_err() {
+            crate::paths::append_log("[stage] 上一代舞台线程未在预期内退出，仍按新的一代继续");
+        }
+    }
+}
+
+fn message_loop() {
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
         loop {
@@ -170,14 +208,11 @@ fn message_loop(_host: isize) {
 }
 
 fn drain_and_apply() {
-    let main = match MAIN_HWND.get() {
-        Some(m) => *m,
-        None => return,
-    };
-    let host = match HOST.get() {
-        Some(h) => *h,
-        None => return,
-    };
+    let host = MY_HOST.with(std::cell::Cell::get);
+    if host == 0 {
+        return;
+    }
+    let main = lock(&MAIN_HWND).unwrap_or(0);
     loop {
         let cmd = match CMDS.lock() {
             Ok(mut q) => q.pop_front(),
@@ -189,6 +224,8 @@ fn drain_and_apply() {
             Some(StageCmd::Attach(target)) => apply_attach(host, target),
             Some(StageCmd::Destroy) => {
                 unsafe { DestroyWindow(host as HWND) };
+                // 挂靠目标复位：重来的一代从「挂主窗口」这个初始状态开始
+                *lock(&TARGET) = None;
                 return;
             }
             None => return,
@@ -196,18 +233,32 @@ fn drain_and_apply() {
     }
 }
 
+/// 入队策略（纯函数，测试直接钉住）：
+/// - `Rect` 是绝对几何：排队中的旧矩形在执行前就已经过时。拖一次窗口能发几十条，
+///   全留着只会让画面追着历史位置跑（每条都要一次 SetWindowPos），故只留最后一条。
+/// - `Visible`/`Attach`/`Destroy` 有先后语义，一条都不合并。
+/// - 超过上限时丢**最旧**的一条并返回 true（丢历史、留最新意图，与 Rect 合并同一道理）。
+fn push_cmd(q: &mut VecDeque<StageCmd>, cmd: StageCmd) -> bool {
+    if matches!(cmd, StageCmd::Rect(_)) {
+        q.retain(|c| !matches!(c, StageCmd::Rect(_)));
+    }
+    let mut dropped = false;
+    while q.len() >= MAX_PENDING_CMDS {
+        q.pop_front();
+        dropped = true;
+    }
+    q.push_back(cmd);
+    dropped
+}
+
 fn enqueue(cmd: StageCmd) {
-    let ok = match CMDS.lock() {
-        Ok(mut q) => {
-            q.push_back(cmd);
-            true
-        }
-        Err(_) => false,
-    };
-    if ok {
-        if let Some(h) = HOST.get() {
-            unsafe { PostMessageW(*h as HWND, WM_APP_STAGE, 0, 0) };
-        }
+    let dropped = push_cmd(&mut lock(&CMDS), cmd);
+    if dropped {
+        // 锁外记日志：append_log 要动文件，不在持锁时做
+        crate::paths::append_log("[stage] 命令队列已满，丢弃最旧的一条");
+    }
+    if let Some(h) = *lock(&HOST) {
+        unsafe { PostMessageW(h as HWND, WM_APP_STAGE, 0, 0) };
     }
 }
 
@@ -215,10 +266,7 @@ fn apply_rect(main_hwnd: isize, host: isize, rect: &StageRect) {
     unsafe {
         if rect.visible && rect.w > 0 && rect.h > 0 {
             // 坐标相对「当前挂靠目标窗口」的客户区换算成屏幕坐标
-            let base = match TARGET.lock() {
-                Ok(t) => t.unwrap_or(main_hwnd),
-                Err(_) => main_hwnd,
-            };
+            let base = lock(&TARGET).unwrap_or(main_hwnd);
             let mut pt = POINT { x: rect.x, y: rect.y };
             ClientToScreen(base as HWND, &mut pt);
             SetWindowPos(
@@ -233,7 +281,7 @@ fn apply_rect(main_hwnd: isize, host: isize, rect: &StageRect) {
             set_os_visible(host, true);
             // 垫底模式下每帧重断言一次层序：期间可能有别的应用把 topmost 窗口提到最前，
             // 漏掉这一步会让浮窗被自己的视频层盖住（表现为小窗黑屏/只有声音）。
-            if let Some(pip) = TARGET.lock().ok().and_then(|t| *t) {
+            if let Some(pip) = *lock(&TARGET) {
                 raise_pip(pip);
             }
         } else {
@@ -255,8 +303,8 @@ fn apply_rect(main_hwnd: isize, host: isize, rect: &StageRect) {
 /// 注意 owner 恒为主窗口：owned 窗口恒在其 owner **之上**，若以 pip 为 owner 就无法垫底。
 fn apply_attach(host: isize, target: Option<isize>) {
     unsafe {
-        let main = MAIN_HWND.get().copied().unwrap_or(0);
-        let _ = TARGET.lock().map(|mut t| *t = target);
+        let main = lock(&MAIN_HWND).unwrap_or(0);
+        *lock(&TARGET) = target;
         if main != 0 {
             SetWindowLongPtrW(host as HWND, GWLP_HWNDPARENT, main);
         }
@@ -314,6 +362,69 @@ fn set_os_visible(host: isize, visible: bool) {
     }
 }
 
+/// 销毁覆盖窗口。只入队：窗口由它自己的线程销毁（跨线程 DestroyWindow 会死等），
+/// 那条命令跑完线程即退出。要重来的一代由 [`start_stage_thread`] 负责等它退干净。
 pub fn destroy() {
     enqueue(StageCmd::Destroy);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32) -> StageCmd {
+        StageCmd::Rect(StageRect { x, y: 0, w: 320, h: 180, visible: true })
+    }
+
+    /// 队列内容压成可比较的数字：矩形取 x，离散命令各给一个固定记号。
+    fn digest(q: &VecDeque<StageCmd>) -> Vec<i32> {
+        q.iter()
+            .map(|c| match c {
+                StageCmd::Rect(r) => r.x,
+                StageCmd::Visible(_) => -1,
+                StageCmd::Attach(_) => -2,
+                StageCmd::Destroy => -3,
+            })
+            .collect()
+    }
+
+    /// 拖窗口时前端一帧一条矩形，早投的几条在执行前就已经过时：
+    /// 全留着既拖慢追赶，又让画面先跳到历史位置再跳回来。
+    #[test]
+    fn queued_rects_coalesce_to_the_newest() {
+        let mut q = VecDeque::new();
+        for x in [10, 20, 30, 40] {
+            push_cmd(&mut q, rect(x));
+        }
+        assert_eq!(digest(&q), vec![40], "只留最后一条矩形");
+    }
+
+    /// 合并只碰矩形：可见性/挂靠/销毁是离散动作，改顺序就会做出用户没要求的事。
+    #[test]
+    fn coalescing_a_rect_keeps_the_discrete_commands_around_it() {
+        let mut q = VecDeque::new();
+        push_cmd(&mut q, rect(10));
+        push_cmd(&mut q, StageCmd::Visible(false));
+        push_cmd(&mut q, rect(20));
+        assert_eq!(digest(&q), vec![-1, 20], "老矩形被换掉，可见性命令原位保留");
+
+        push_cmd(&mut q, StageCmd::Attach(Some(77)));
+        push_cmd(&mut q, rect(30));
+        assert_eq!(digest(&q), vec![-1, -2, 30], "挂靠命令一条都不许被吃掉");
+    }
+
+    #[test]
+    fn the_queue_has_a_hard_cap_that_drops_the_oldest_first() {
+        let mut q = VecDeque::new();
+        for i in 0..MAX_PENDING_CMDS {
+            let dropped = push_cmd(&mut q, StageCmd::Attach(Some(i as isize)));
+            assert!(!dropped, "达到上限之前不该丢东西");
+        }
+        assert_eq!(q.len(), MAX_PENDING_CMDS);
+        let dropped = push_cmd(&mut q, StageCmd::Destroy);
+        assert!(dropped, "超限必须报告，交给调用方记日志");
+        assert_eq!(q.len(), MAX_PENDING_CMDS, "上限是硬的");
+        assert_eq!(digest(&q)[0], -2, "丢的是最旧的一条");
+        assert_eq!(digest(&q).last().copied(), Some(-3), "最新意图一定在队尾");
+    }
 }

@@ -1,27 +1,31 @@
 //! 播放内核：libmpv2 适配层。mpv 是播放状态的唯一事实源；
 //! Rust 只转发命令、订阅属性并归一化成 `player:state` / `player:ended` 等事件。
+//!
+//! 所有 mpv 访问（写属性、发命令、读属性）都经 [`queue::CommandQueue`] 投给**唯一一条**
+//! 命令线程按序执行（P1-2）：`libmpv` 的调用本身线程安全，但两个线程同时下发就没人保证
+//! 先后，而 mpv 只按收到的顺序执行。
 
 pub mod embed;
+pub mod queue;
 
 use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::model::PlayerState;
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{Format, Mpv};
-use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, WebviewWindow};
 
 pub struct PlayerCore {
     pub app: AppHandle,
-    mpv: OnceCell<Arc<Mpv>>,
-    host: OnceCell<isize>,
-    main_hwnd: OnceCell<isize>,
+    /// 唯一的 mpv 命令线程（`None` = 还没起来）。它同时是「mpv 是否就绪」的**唯一判据** ——
+    /// 队列持有那份 `Arc<Mpv>`，别处不再各存一份：初始化失败要能整份回滚，
+    /// 而「一半就绪」的内核最坏（命令发不出去，读属性却以为自己能读）。
+    cmd: Mutex<Option<Arc<queue::CommandQueue<Arc<Mpv>>>>>,
     start_lock: Mutex<()>,
     pub shared: Arc<Mutex<PlayerState>>,
-    last_emit_ms: AtomicU64,
+    last_emit_ms: Arc<AtomicU64>,
     /// 最后已知的舞台矩形（主窗口移动/缩放/聚焦时用于重放）
     last_rect: parking_lot::Mutex<Option<embed::StageRect>>,
     /// 覆盖窗口当前是否挂靠在独立悬浮窗（pip）上
@@ -111,39 +115,40 @@ impl PlayerCore {
     pub fn new(app: AppHandle) -> Self {
         Self {
             app,
-            mpv: OnceCell::new(),
-            host: OnceCell::new(),
-            main_hwnd: OnceCell::new(),
+            cmd: Mutex::new(None),
             start_lock: Mutex::new(()),
             shared: Arc::new(Mutex::new(PlayerState {
                 volume: 85.0,
                 ..Default::default()
             })),
-            last_emit_ms: AtomicU64::new(0),
+            last_emit_ms: Arc::new(AtomicU64::new(0)),
             last_rect: parking_lot::Mutex::new(None),
             pip_active: AtomicBool::new(false),
             pending_load: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    fn emit_state(&self, force: bool) {
-        let now = now_ms();
-        let last = self.last_emit_ms.load(Ordering::Relaxed);
-        if !force && now - last < 100 {
-            return;
-        }
-        self.last_emit_ms.store(now, Ordering::Relaxed);
-        let snap = self.shared.lock().clone();
-        let _ = self.app.emit("player:state", snap);
+    /// 命令队列句柄。没初始化（或初始化失败）时与「mpv 还没起来」是同一件事：
+    /// 命令线程是 mpv 的附属品，两者要么都在，要么都不在。
+    fn queue(&self) -> IpcResult<Arc<queue::CommandQueue<Arc<Mpv>>>> {
+        self.cmd.lock().clone().ok_or_else(IpcError::mpv_not_started)
     }
 
-    /// 首次播放时初始化 mpv 与嵌入窗口（幂等）
+    fn emit_state(&self, force: bool) {
+        emit_state(&self.app, &self.shared, &self.last_emit_ms, force);
+    }
+
+    /// 首次播放时初始化 mpv、宿主窗口与命令线程（幂等）。
+    ///
+    /// 三步都可能失败，而失败**必须可回滚**：宿主窗口线程先于 mpv 建起来，若 mpv 或命令线程
+    /// 起不来就把它留着，下次重试会再建一个 —— 两个覆盖窗口叠在同一个舞台上，谁也说不清
+    /// 画面归谁。所以每条失败路径都先把已经建好的那部分拆掉，再把「已就绪」判据留在未就绪。
     pub fn ensure_started(&self, window: &WebviewWindow) -> IpcResult<()> {
-        if self.mpv.get().is_some() {
+        if self.cmd.lock().is_some() {
             return Ok(());
         }
         let _g = self.start_lock.lock();
-        if self.mpv.get().is_some() {
+        if self.cmd.lock().is_some() {
             return Ok(());
         }
         let main_hwnd: isize = window
@@ -153,7 +158,7 @@ impl PlayerCore {
         // 舞台线程：创建覆盖窗口并跑消息循环（窗口操作只在该线程执行，避免跨线程 SendMessage 死锁）
         let host = embed::start_stage_thread(main_hwnd)
             .ok_or_else(|| IpcError::new(AppErrorCode::MpvEmbedFailed, "创建 mpv 宿主窗口失败"))?;
-        let mpv = Mpv::with_initializer(|init| {
+        let mpv = match Mpv::with_initializer(|init| {
             init.set_option("wid", host as i64)?;
             init.set_option("vo", "gpu-next".to_string())?;
             init.set_option("hwdec", "auto-safe".to_string())?;
@@ -165,35 +170,59 @@ impl PlayerCore {
             init.set_option("input-vo-keyboard", "no".to_string())?;
             init.set_option("audio-display", "no".to_string())?;
             Ok(())
-        })
-        .map_err(|e| IpcError::with_detail(AppErrorCode::MpvInitFailed, "mpv 初始化失败", e))?;
-        let mpv = Arc::new(mpv);
+        }) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                embed::destroy();
+                return Err(IpcError::with_detail(AppErrorCode::MpvInitFailed, "mpv 初始化失败", e));
+            }
+        };
+        let queue = match queue::CommandQueue::start(Arc::clone(&mpv)) {
+            Ok(q) => q,
+            Err(e) => {
+                embed::destroy();
+                return Err(e);
+            }
+        };
 
-        let _ = self.main_hwnd.set(main_hwnd);
-        let _ = self.host.set(host);
-        let _ = self.mpv.set(Arc::clone(&mpv));
         // 竞态补偿：前端可能在 mpv 初始化完成前就发来舞台矩形（那时 host 还是 None），
         // 此时补应用一次，否则画面窗口会一直停在初始化时的离屏位置（表现为黑屏）。
         self.reposition();
 
-        // 事件线程：属性观察 → 归一化 player:state
+        // 事件线程：属性观察 → 归一化 player:state。它自己不下发 mpv 命令，
+        // 需要改属性时（FileLoaded 复位 start）也投给命令线程排队。
+        //
+        // 顺序上必须先起它、再公开 `cmd`：观察属性/开事件都由它独占完成，
+        // 而「公开 cmd」= 允许用户命令进来。反过来的话，`observe_property` 可能落在
+        // 第一条 loadfile 之后，那一代的属性就整段漏收（进度条与画面尺寸永远不动）。
         let app = self.app.clone();
         let shared = Arc::clone(&self.shared);
         let pending = Arc::clone(&self.pending_load);
-        let last_emit = Arc::new(AtomicU64::new(0));
-        std::thread::Builder::new()
+        let last_emit = Arc::clone(&self.last_emit_ms);
+        let q = Arc::clone(&queue);
+        let spawned = std::thread::Builder::new()
             .name("mpv-events".into())
-            .spawn(move || event_loop(mpv, app, shared, pending, last_emit))
-            .map_err(|e| IpcError::with_detail(AppErrorCode::MpvInitFailed, "mpv 事件线程启动失败", e))?;
+            .spawn(move || event_loop(mpv, app, shared, pending, last_emit, q));
+        if let Err(e) = spawned {
+            // 事件线程起不来 = 没有任何属性会被归一化，这个内核等于哑的：整份初始化作废，
+            // 下次 play 从干净状态重来（mpv 随队列一起释放，宿主窗口一并拆掉）。
+            queue.shutdown();
+            embed::destroy();
+            return Err(IpcError::with_detail(AppErrorCode::MpvInitFailed, "mpv 事件线程启动失败", e));
+        }
+        *self.cmd.lock() = Some(queue);
         crate::paths::append_log("[mpv] initialized with embedded window");
         Ok(())
     }
 
     /// 起播一条曲目。`generation` 由前端每次加载自增（P0-5），随状态广播回传，
     /// 前端据此丢弃上一代的迟到状态。
+    ///
+    /// 立牌与乐观状态在**调用方**就地写，不等命令线程：事件线程此刻还在放上一首的属性，
+    /// 晚一步立牌就等于让它们漏进新代。碰 mpv 的那一段整段投给命令线程，失败回滚也留在作业里。
     #[allow(clippy::too_many_arguments)]
     pub fn play_file(&self, path: &str, resume_ms: f64, vol: f64, muted: bool, speed: f64, video_active: bool, generation: u64) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
+        let q = self.queue()?;
         // 先立牌再动状态：从这一刻到 mpv 送出 StartFile 之间收到的文件级属性都是上一首的。
         // 取 max 是为了让「更新的代际已经接手」时旧值不至于把牌子降回去。
         self.pending_load.fetch_max(generation, Ordering::SeqCst);
@@ -206,64 +235,66 @@ impl PlayerCore {
             s.track_path = Some(path.to_string());
             s.video_active = video_active;
         }
-        let result = (|| -> IpcResult<()> {
-            mpv.set_property("volume", vol * 100.0).map_err(mpv_err)?;
-            mpv.set_property("mute", muted).map_err(mpv_err)?;
-            mpv.set_property("speed", speed).map_err(mpv_err)?;
-            if resume_ms > 0.0 {
-                mpv.set_property("start", resume_ms / 1000.0).map_err(mpv_err)?;
-            } else {
-                let _ = mpv.set_property("start", 0.0_f64);
+        let shared = Arc::clone(&self.shared);
+        let pending = Arc::clone(&self.pending_load);
+        let file = path.to_string();
+        let result = q.submit(None, move |mpv| {
+            let result = (|| -> IpcResult<()> {
+                mpv.set_property("volume", vol * 100.0).map_err(mpv_err)?;
+                mpv.set_property("mute", muted).map_err(mpv_err)?;
+                mpv.set_property("speed", speed).map_err(mpv_err)?;
+                if resume_ms > 0.0 {
+                    mpv.set_property("start", resume_ms / 1000.0).map_err(mpv_err)?;
+                } else {
+                    // 显式清零：`start` 是上一次续播留下的，不覆盖就会拿旧起点开新曲。
+                    // 清零失败不值得让整首起播失败（本次本来就要从 0 开始）。
+                    let _ = mpv.set_property("start", 0.0_f64);
+                }
+                // keep-open=yes 让 mpv 播完后停在「已暂停」，而 pause 属性会跨 loadfile 保留：
+                // 不显式清掉，之后每次起播都冻在首帧（进度不动、画面静止，前端一直显示加载中）。
+                mpv.set_property("pause", false).map_err(mpv_err)?;
+                mpv.command("loadfile", &[file.as_str()]).map_err(mpv_err)
+            })();
+            if result.is_err() {
+                // 这一首根本没起播：把立牌和「正在播放」的假象一起收回。
+                // CAS 而不是直接清零——更新的代际若已接手，牌子是它的。
+                if pending.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    let mut s = shared.lock();
+                    s.playing = false;
+                    s.track_path = None;
+                    s.position = 0.0;
+                    s.duration = 0.0;
+                }
+                crate::paths::append_log(&format!("[mpv] 起播失败（generation {generation}）：{file}"));
             }
-            // keep-open=yes 让 mpv 播完后停在「已暂停」，而 pause 属性会跨 loadfile 保留：
-            // 不显式清掉，之后每次起播都冻在首帧（进度不动、画面静止，前端一直显示加载中）。
-            mpv.set_property("pause", false).map_err(mpv_err)?;
-            mpv.command("loadfile", &[path]).map_err(mpv_err)
-        })();
-        if result.is_err() {
-            // 这一首根本没起播：把立牌和「正在播放」的假象一起收回。
-            // CAS 而不是直接清零——更新的代际若已接手，牌子是它的。
-            if self.pending_load.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                let mut s = self.shared.lock();
-                s.playing = false;
-                s.track_path = None;
-                s.position = 0.0;
-                s.duration = 0.0;
-            }
-            crate::paths::append_log(&format!("[mpv] 起播失败（generation {generation}）：{path}"));
-        }
+            result
+        });
         self.emit_state(true);
         result
     }
 
     pub fn set_paused(&self, paused: bool) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("pause", paused).map_err(mpv_err)
+        self.queue()?.submit(Some("pause"), move |mpv| mpv.set_property("pause", paused).map_err(mpv_err))
     }
 
     pub fn seek(&self, sec: f64) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.command("seek", &[&format!("{sec:.3}"), "absolute"]).map_err(mpv_err)
+        self.queue()?.submit(None, move |mpv| mpv.command("seek", &[&format!("{sec:.3}"), "absolute"]).map_err(mpv_err))
     }
 
     pub fn set_volume(&self, v: f64) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("volume", v * 100.0).map_err(mpv_err)
+        self.queue()?.submit(Some("volume"), move |mpv| mpv.set_property("volume", v * 100.0).map_err(mpv_err))
     }
 
     pub fn set_muted(&self, m: bool) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("mute", m).map_err(mpv_err)
+        self.queue()?.submit(Some("mute"), move |mpv| mpv.set_property("mute", m).map_err(mpv_err))
     }
 
     pub fn set_speed(&self, s: f64) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("speed", s).map_err(mpv_err)
+        self.queue()?.submit(Some("speed"), move |mpv| mpv.set_property("speed", s).map_err(mpv_err))
     }
 
     pub fn stop(&self) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.command("stop", &[]).map_err(mpv_err)?;
+        self.queue()?.submit(None, |mpv| mpv.command("stop", &[]).map_err(mpv_err))?;
         {
             let mut s = self.shared.lock();
             s.playing = false;
@@ -280,112 +311,118 @@ impl PlayerCore {
 
     /// 字幕轨列表（id / 标题 / 语言），mpv 的 track-list 是字典数组
     pub fn subtitle_tracks(&self) -> Vec<crate::model::SubtitleTrack> {
-        let mpv = match self.mpv.get() {
-            Some(m) => m,
-            None => return Vec::new(),
+        // 读取也排进命令线程：一边 loadfile 一边读 track-list，拿到的是半截状态。
+        let q = match self.queue() {
+            Ok(q) => q,
+            Err(_) => return Vec::new(),
         };
         // track-list 是节点数组，字符串化后不易解析；改用 sid 探测 + 逐个取属性更稳，
         // 这里用 mpv 的 "track-list/count" + "/N/id|title|lang" 属性路径读取。
-        let count: i64 = mpv.get_property("track-list/count").unwrap_or(0);
-        let mut out = Vec::new();
-        for i in 0..count.max(0) {
-            let type_: String = match mpv.get_property(&format!("track-list/{i}/type")) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if type_ != "sub" {
-                continue;
+        q.query(|mpv| {
+            let count: i64 = mpv.get_property("track-list/count").unwrap_or(0);
+            let mut out = Vec::new();
+            for i in 0..count.max(0) {
+                let type_: String = match mpv.get_property(&format!("track-list/{i}/type")) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if type_ != "sub" {
+                    continue;
+                }
+                let id: i64 = mpv.get_property(&format!("track-list/{i}/id")).unwrap_or(0);
+                let title: String = mpv.get_property(&format!("track-list/{i}/title")).unwrap_or_default();
+                let lang: String = mpv.get_property(&format!("track-list/{i}/lang")).unwrap_or_default();
+                let selected: bool = mpv.get_property(&format!("track-list/{i}/selected")).unwrap_or(false);
+                out.push(crate::model::SubtitleTrack {
+                    id,
+                    title: if title.is_empty() { format!("字幕 {id}") } else { title },
+                    lang,
+                    selected,
+                });
             }
-            let id: i64 = mpv.get_property(&format!("track-list/{i}/id")).unwrap_or(0);
-            let title: String = mpv.get_property(&format!("track-list/{i}/title")).unwrap_or_default();
-            let lang: String = mpv.get_property(&format!("track-list/{i}/lang")).unwrap_or_default();
-            let selected: bool = mpv.get_property(&format!("track-list/{i}/selected")).unwrap_or(false);
-            out.push(crate::model::SubtitleTrack {
-                id,
-                title: if title.is_empty() { format!("字幕 {id}") } else { title },
-                lang,
-                selected,
-            });
-        }
-        out
+            out
+        })
+        .unwrap_or_default()
     }
 
     /// 选择字幕轨（id<=0 表示关闭字幕）
     pub fn set_subtitle_track(&self, id: i64) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        let v = if id > 0 { id.to_string() } else { "no".to_string() };
-        mpv.set_property("sid", v).map_err(mpv_err)?;
-        // 记住选择（mpv 会持久化 sub-visibility）
-        mpv.set_property("sub-visibility", id > 0).map_err(mpv_err)?;
-        Ok(())
+        // sid 与 sub-visibility 是一次选择的两个面，同一条作业里下发，不许交错
+        self.queue()?.submit(Some("sid"), move |mpv| {
+            let v = if id > 0 { id.to_string() } else { "no".to_string() };
+            mpv.set_property("sid", v).map_err(mpv_err)?;
+            // 记住选择（mpv 会持久化 sub-visibility）
+            mpv.set_property("sub-visibility", id > 0).map_err(mpv_err)?;
+            Ok(())
+        })
     }
 
     /// 字幕开关（不改变当前轨）
     pub fn set_subtitle_visible(&self, visible: bool) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("sub-visibility", visible).map_err(mpv_err)
+        self.queue()?.submit(Some("sub-visibility"), move |mpv| mpv.set_property("sub-visibility", visible).map_err(mpv_err))
     }
 
     /// 字幕时间偏移（秒，正=延后显示）
     pub fn set_subtitle_delay(&self, sec: f64) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("sub-delay", sec).map_err(mpv_err)
+        self.queue()?.submit(Some("sub-delay"), move |mpv| mpv.set_property("sub-delay", sec).map_err(mpv_err))
     }
 
     /// 字幕样式（mpv sub-* 属性遥控）
     pub fn set_sub_style(&self, style: crate::model::SubStyle) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        if let Some(v) = style.font {
-            mpv.set_property("sub-font", v).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.font_size {
-            mpv.set_property("sub-font-size", v).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.color {
-            mpv.set_property("sub-color", v).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.border_color {
-            mpv.set_property("sub-border-color", v).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.border_size {
-            mpv.set_property("sub-border-size", v).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.shadow_offset {
-            mpv.set_property("sub-shadow-offset", v).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.pos {
-            mpv.set_property("sub-pos", v).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.back_color {
-            // 0% 也要下发：用户把不透明度拖回 0 时得真的回到「无背景条」
-            let value = sub_back_color_value(&v, style.back_opacity.unwrap_or(0.0));
-            mpv.set_property("sub-back-color", value).map_err(mpv_err)?;
-        }
-        if let Some(v) = style.ass_override {
-            mpv.set_property("sub-ass-override", v).map_err(mpv_err)?;
-        }
-        Ok(())
+        // 整份样式一条作业：分开发会被「拖滑块」的中间态插进来，落到 mpv 上是一份混合样式
+        self.queue()?.submit(Some("sub-style"), move |mpv| {
+            if let Some(v) = style.font {
+                mpv.set_property("sub-font", v).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.font_size {
+                mpv.set_property("sub-font-size", v).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.color {
+                mpv.set_property("sub-color", v).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.border_color {
+                mpv.set_property("sub-border-color", v).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.border_size {
+                mpv.set_property("sub-border-size", v).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.shadow_offset {
+                mpv.set_property("sub-shadow-offset", v).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.pos {
+                mpv.set_property("sub-pos", v).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.back_color {
+                // 0% 也要下发：用户把不透明度拖回 0 时得真的回到「无背景条」
+                let value = sub_back_color_value(&v, style.back_opacity.unwrap_or(0.0));
+                mpv.set_property("sub-back-color", value).map_err(mpv_err)?;
+            }
+            if let Some(v) = style.ass_override {
+                mpv.set_property("sub-ass-override", v).map_err(mpv_err)?;
+            }
+            Ok(())
+        })
     }
 
     /// 响度均衡：volume-gain 叠加在用户音量之上；无分析值时必须清零上一首的增益。
     pub fn apply_loudness_gain(&self, track_lufs: Option<f64>, target_lufs: f64) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("volume-gain", loudness_gain_db(track_lufs, target_lufs))
-            .map_err(mpv_err)?;
-        Ok(())
+        self.queue()?.submit(Some("volume-gain"), move |mpv| {
+            mpv.set_property("volume-gain", loudness_gain_db(track_lufs, target_lufs))
+                .map_err(mpv_err)
+        })
     }
 
     /// 「仅音频」= vid=no（引擎始终是 mpv，播放位置不丢）
     pub fn set_video_enabled(&self, enabled: bool) -> IpcResult<()> {
-
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("vid", if enabled { "auto".to_string() } else { "no".to_string() })
-            .map_err(mpv_err)?;
-        {
-            self.shared.lock().video_active = enabled;
-        }
+        let shared = Arc::clone(&self.shared);
+        let r = self.queue()?.submit(Some("vid"), move |mpv| {
+            mpv.set_property("vid", if enabled { "auto".to_string() } else { "no".to_string() })
+                .map_err(mpv_err)?;
+            shared.lock().video_active = enabled;
+            Ok(())
+        });
         self.emit_state(true);
-        Ok(())
+        r
     }
 
     /// 前端下发舞台几何。同一时刻只有一个窗口有资格决定画面在哪：
@@ -470,8 +507,17 @@ impl PlayerCore {
         self.pip_active.load(Ordering::SeqCst)
     }
 
-    /// 销毁覆盖窗口（应用退出时）
+    /// 销毁覆盖窗口（应用退出时）。顺带关停命令队列：队列一死，退场过程中再来的
+    /// `player_*` 命令会当场拿到「命令线程已退出」，而不是排进一条即将消失的线程。
     pub fn destroy_host(&self) {
+        if let Some(q) = self.cmd.lock().clone() {
+            // 先让 mpv 收 quit：事件线程收到 Shutdown 后自己退出，不必等进程收尸
+            let _ = q.post(None, |mpv| {
+                let _ = mpv.command("quit", &[]);
+                Ok(())
+            });
+            q.shutdown();
+        }
         embed::destroy();
     }
 
@@ -487,32 +533,35 @@ impl PlayerCore {
     /// 因此改用 "audio-device-list/count" + "/N/name|description" 属性路径逐个读取，
     /// 与 subtitle_tracks() 读 track-list 的方式一致。
     pub fn refresh_devices(&self) -> Vec<crate::model::AudioDevice> {
-        let mpv = match self.mpv.get() {
-            Some(m) => m,
-            None => return vec![default_device()],
+        let q = match self.queue() {
+            Ok(q) => q,
+            Err(_) => return vec![default_device()],
         };
-        let count: i64 = mpv.get_property("audio-device-list/count").unwrap_or(0);
-        let mut devices: Vec<crate::model::AudioDevice> = Vec::new();
-        for i in 0..count.max(0) {
-            let name: String = mpv.get_property(&format!("audio-device-list/{i}/name")).unwrap_or_default();
-            let name = name.trim().to_string();
-            if name.is_empty() || devices.iter().any(|d| d.device_id == name) {
-                continue;
+        q.query(|mpv| {
+            let count: i64 = mpv.get_property("audio-device-list/count").unwrap_or(0);
+            let mut devices: Vec<crate::model::AudioDevice> = Vec::new();
+            for i in 0..count.max(0) {
+                let name: String = mpv.get_property(&format!("audio-device-list/{i}/name")).unwrap_or_default();
+                let name = name.trim().to_string();
+                if name.is_empty() || devices.iter().any(|d| d.device_id == name) {
+                    continue;
+                }
+                let desc: String = match mpv.get_property::<String>(&format!("audio-device-list/{i}/description")) {
+                    Ok(v) => v.trim().to_string(),
+                    Err(_) => String::new(),
+                };
+                let label = if desc.is_empty() { name.clone() } else { desc };
+                devices.push(crate::model::AudioDevice { device_id: name, label });
             }
-            let desc: String = match mpv.get_property::<String>(&format!("audio-device-list/{i}/description")) {
-                Ok(v) => v.trim().to_string(),
-                Err(_) => String::new(),
-            };
-            let label = if desc.is_empty() { name.clone() } else { desc };
-            devices.push(crate::model::AudioDevice { device_id: name, label });
-        }
-        // 始终保留一条「系统默认」入口；mpv 自身已返回 auto 条目不重复添加。
-        ensure_default_device(devices)
+            // 始终保留一条「系统默认」入口；mpv 自身已返回 auto 条目不重复添加。
+            ensure_default_device(devices)
+        })
+        .unwrap_or_else(|_| vec![default_device()])
     }
 
     pub fn set_device(&self, id: &str) -> IpcResult<()> {
-        let mpv = self.mpv.get().ok_or_else(IpcError::mpv_not_started)?;
-        mpv.set_property("audio-device", id.to_string()).map_err(mpv_err)
+        let id = id.to_string();
+        self.queue()?.submit(Some("audio-device"), move |mpv| mpv.set_property("audio-device", id).map_err(mpv_err))
     }
 
     pub fn snapshot(&self) -> PlayerState {
@@ -557,7 +606,14 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, pending: Arc<AtomicU64>, _last_emit: Arc<AtomicU64>) {
+fn event_loop(
+    mpv: Arc<Mpv>,
+    app: AppHandle,
+    shared: Arc<Mutex<PlayerState>>,
+    pending: Arc<AtomicU64>,
+    last_emit: Arc<AtomicU64>,
+    q: Arc<queue::CommandQueue<Arc<Mpv>>>,
+) {
     let _ = mpv.disable_deprecated_events();
     let _ = mpv.observe_property("time-pos", Format::Double, 1);
     let _ = mpv.observe_property("duration", Format::Double, 2);
@@ -581,7 +637,7 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, pe
                     let mut s = shared.lock();
                     apply_property(&mut s, name, &change, is_pending)
                 };
-                emit_state_shared(&app, &shared, force, &mut None, Duration::from_millis(100));
+                emit_state(&app, &shared, &last_emit, force);
             }
             Some(Ok(Event::StartFile)) => {
                 // 新文件已开始：这一代从「加载中」变成「在播」，牌子收回，
@@ -597,11 +653,15 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, pe
                     s.generation
                 };
                 let _ = app.emit("player:loading", serde_json::json!({ "generation": generation }));
-                emit_state_shared(&app, &shared, true, &mut None, Duration::from_millis(0));
+                emit_state(&app, &shared, &last_emit, true);
             }
             Some(Ok(Event::FileLoaded)) => {
-                // 用 start 属性实现的续播已生效；复位以免影响下一次加载
-                let _ = mpv.set_property("start", 0.0_f64);
+                // 用 start 属性实现的续播已生效；复位以免影响下一次加载。
+                // 但此刻若又有起播在途（连点两首），这条复位会插到那一首的 loadfile 之前，
+                // 把它的续播起点抹掉——有牌子在就先不复位，交给它自己的 FileLoaded。
+                if pending.load(Ordering::SeqCst) == 0 {
+                    let _ = q.post(Some("start"), |mpv| mpv.set_property("start", 0.0_f64).map_err(mpv_err));
+                }
             }
             Some(Ok(Event::EndFile(reason))) => {
                 let code = reason as i32;
@@ -631,36 +691,25 @@ fn event_loop(mpv: Arc<Mpv>, app: AppHandle, shared: Arc<Mutex<PlayerState>>, pe
             }
             None => {
                 // 超时：刷新一次状态（保持进度条前进）
-                emit_state_shared(&app, &shared, false, &mut None, Duration::from_millis(250));
+                emit_state(&app, &shared, &last_emit, false);
             }
         }
     }
 }
 
-/// 共享状态的节流广播（事件线程用；与 PlayerCore::emit_state 同语义但免借用冲突）
-fn emit_state_shared(
-    app: &AppHandle,
-    shared: &Arc<Mutex<PlayerState>>,
-    force: bool,
-    last: &mut Option<Instant>,
-    min_interval: Duration,
-) {
-    let _ = last;
-    let now = Instant::now();
-    // 简单节流：距上次广播 < min_interval 且非 force 则跳过
-    thread_local! {
-        static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+/// 共享状态的节流广播（命令线程与事件线程共用）。
+///
+/// 节流时钟是**进程级**的（`last_ms`）：两条线程都往同一条 `player:state` 上写，
+/// 各记各的时钟等于没节流 —— 一边刚推完，另一边立刻又推一份同样的快照。
+/// `force` 表示「值确实变了」，必须立刻推，不等节流窗口。
+fn emit_state(app: &AppHandle, shared: &Arc<Mutex<PlayerState>>, last_ms: &AtomicU64, force: bool) {
+    let now = now_ms();
+    if !force && now.saturating_sub(last_ms.load(Ordering::SeqCst)) < 100 {
+        return;
     }
-    LAST.with(|cell| {
-        if let Some(t) = cell.get() {
-            if !force && now.duration_since(t) < min_interval {
-                return;
-            }
-        }
-        cell.set(Some(now));
-        let snap = shared.lock().clone();
-        let _ = app.emit("player:state", snap);
-    });
+    last_ms.store(now, Ordering::SeqCst);
+    let snap = shared.lock().clone();
+    let _ = app.emit("player:state", snap);
 }
 
 #[cfg(test)]
