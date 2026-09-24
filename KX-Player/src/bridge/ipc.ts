@@ -118,6 +118,7 @@ export const api: AppApi = {
   maximizeWindow: () => invoke('maximize_window'),
   closeWindow: () => invoke('close_window'),
   forceCloseWindow: () => invoke('force_close_window'),
+  shutdownReady: (ok) => invoke('shutdown_ready', { ok }),
   isMaximized: () => invoke('is_maximized'),
   maximize: () => invoke('maximize_window'),
   minimize: () => invoke('minimize_window'),

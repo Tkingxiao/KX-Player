@@ -104,6 +104,27 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
 
+/// 退出收尾的「停止接收」（P1-3 第一步）：关上闸门但**不杀**在飞进程 ——
+/// 杀在流水线的下一步（`kill_all`），中间留出「让任务自己收手」的窗口。
+/// 置位后 `register` 一律失败，不会再出生新的 ffmpeg/ffprobe。
+pub fn close_gate() {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// 取消所有转换队列（返回条数）：循环跑完当前文件后不再起下一个。
+pub fn cancel_all_convert() -> usize {
+    let flags: Vec<Arc<AtomicBool>> = CONVERT_FLAGS.lock().values().map(Arc::clone).collect();
+    for flag in &flags {
+        flag.store(true, Ordering::SeqCst);
+    }
+    flags.len()
+}
+
+/// 在飞转换队列条数（退出收尾等它归零的判据）。
+pub fn convert_tasks() -> usize {
+    CONVERT_FLAGS.lock().len()
+}
+
 /// 在飞条数（只给用例看）
 #[cfg(test)]
 fn live_count_for_test() -> usize {
@@ -257,8 +278,9 @@ pub fn exec_capture(exe: PathBuf, args: &[String], timeout: Duration, oc: OutCap
     }
 }
 
-/// 应用退出时回收全部子进程。**必须等它们真的退出再返回**：调用方随后就 `app.exit(0)`，
-/// 只通知不等回收，父进程先没了，ffmpeg 就成了孤儿 —— 还在写盘，谁也看不见。
+/// 应用退出时回收全部子进程（收尾流水线的第五步）。**必须等它们真的退出再返回**：
+/// 它之后还有「等前端落盘」「收线程」两步，然后才 `app.exit(0)`；只通知不等回收，
+/// 父进程先没了，ffmpeg 就成了孤儿 —— 还在写盘，谁也看不见。
 pub fn kill_all() {
     // 1) 先关闸门并取快照：这一步之后不会再有新的子进程出生（与 spawn 的定序见 register）
     let live: Vec<Live> = {
@@ -267,9 +289,7 @@ pub fn kill_all() {
         table.values().map(|l| Live { kill: Arc::clone(&l.kill), done: Arc::clone(&l.done) }).collect()
     };
     // 2) 队列也要停：否则杀掉当前这个之后，循环会接着起下一个
-    for flag in CONVERT_FLAGS.lock().values() {
-        flag.store(true, Ordering::SeqCst);
-    }
+    cancel_all_convert();
     if live.is_empty() {
         return;
     }
@@ -899,8 +919,10 @@ mod tests {
 
     // ── 子进程通道：超时 / 输出上限 / 退出回收（P1-4）──────────────
 
-    use super::{exec_capture, kill_all, live_count_for_test, reopen_after_test, shutdown_requested, OutCap};
+    use super::{cancel_all_convert, close_gate, convert_tasks, exec_capture, kill_all, live_count_for_test, reopen_after_test, shutdown_requested, OutCap, CONVERT_FLAGS};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// 这些用例会真的起子进程、还会动全局的退出闸门，串行跑以免互相踩
@@ -994,7 +1016,7 @@ mod tests {
     }
 
     /// 退出路径：`kill_all` 通知在飞子进程自己 kill+wait，**等回收完才返回**
-    /// （调用方随后就 app.exit(0)，只通知不等＝留下还在写盘的孤儿）
+    /// （只通知不等＝留下还在写盘的孤儿）
     #[test]
     fn kill_all_stops_and_reaps_an_in_flight_child() {
         let _serial = serial();
@@ -1038,5 +1060,49 @@ mod tests {
         assert!(c.stdout.is_empty());
         assert_eq!(live_count_for_test(), 0);
         reopen_after_test();
+    }
+
+    /// 「停止接收」与「杀子进程」是两步（P1-3）：第一步只关闸门 —— 已经在跑的那个照跑
+    /// （它是用户交代的活，由下一步统一收），但新的再也生不出来。
+    #[test]
+    fn close_gate_stops_new_children_without_killing_the_live_one() {
+        let _serial = serial();
+        let (exe, args) = sleeper(30);
+        let handle = std::thread::spawn(move || {
+            exec_capture(exe, &args, Duration::from_secs(120), tail(64), tail(64))
+        });
+        let t0 = Instant::now();
+        while live_count_for_test() == 0 {
+            assert!(t0.elapsed() < Duration::from_secs(10), "子进程没有登记上，用例前提不成立");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        close_gate();
+        assert!(shutdown_requested(), "第一步就要关上闸门");
+        assert!(!handle.is_finished(), "第一步不杀在飞子进程");
+        assert_eq!(live_count_for_test(), 1, "在飞的留在表里，等下一步收");
+        let (exe2, args2) = echo("hi");
+        let born = exec_capture(exe2, &args2, Duration::from_secs(10), tail(64), tail(64));
+        assert!(born.error.as_deref().unwrap_or("").contains("正在退出"), "闸门关上后不许再出生子进程：{:?}", born.error);
+        kill_all(); // 真正的杀在这一步
+        let c = handle.join().expect("执行线程应结束");
+        assert!(c.error.is_some(), "被杀的子进程不该报成功：{c:?}");
+        assert_eq!(live_count_for_test(), 0);
+        reopen_after_test();
+    }
+
+    /// 转换队列的取消位与条数：退出收尾的第二步（取消）与第四步（等任务）各要一样
+    #[test]
+    fn cancel_all_convert_marks_every_queue_and_convert_tasks_counts_them() {
+        let _serial = serial();
+        let a = Arc::new(AtomicBool::new(false));
+        let b = Arc::new(AtomicBool::new(false));
+        CONVERT_FLAGS.lock().insert(9_000_001, Arc::clone(&a));
+        CONVERT_FLAGS.lock().insert(9_000_002, Arc::clone(&b));
+        assert_eq!(convert_tasks(), 2);
+        assert_eq!(cancel_all_convert(), 2);
+        assert!(a.load(Ordering::SeqCst) && b.load(Ordering::SeqCst), "每条队列都要置取消位");
+        CONVERT_FLAGS.lock().remove(&9_000_001);
+        CONVERT_FLAGS.lock().remove(&9_000_002);
+        assert_eq!(convert_tasks(), 0, "用例收尾要把表还原");
     }
 }

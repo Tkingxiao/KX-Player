@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -55,6 +56,8 @@ pub struct CommandQueue<C> {
     work: Condvar,
     /// 有空位了
     space: Condvar,
+    /// 命令线程是否已经退场（退出收尾等它 join 的判据，见 `wait_stopped`）
+    stopped: Arc<AtomicBool>,
     cap: usize,
     push_timeout: Duration,
     reply_timeout: Duration,
@@ -72,6 +75,7 @@ impl<C: Send + Sync + 'static> CommandQueue<C> {
             state: Mutex::new(State { jobs: VecDeque::new(), dead: false }),
             work: Condvar::new(),
             space: Condvar::new(),
+            stopped: Arc::new(AtomicBool::new(false)),
             cap: cap.max(1),
             push_timeout,
             reply_timeout,
@@ -142,6 +146,19 @@ impl<C: Send + Sync + 'static> CommandQueue<C> {
         }
         st.dead = true;
         self.work.notify_all();
+    }
+
+    /// 等命令线程真的退场（P1-3 的「收线程」一步）。关停后排队中的作业会先跑完再退，
+    /// 所以这里等的是「活干完 + 线程退出」；到点没退只回 `false`，绝不无限等。
+    pub fn wait_stopped(&self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while !self.stopped.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State<C>> {
@@ -240,7 +257,11 @@ fn worker_loop<C: Send + Sync + 'static>(q: Arc<CommandQueue<C>>, ctx: C) {
                     crate::paths::append_log("[mpv] 命令执行 panic：已接住，命令线程继续");
                 }
             }
-            None => return,
+            None => {
+                // 记账：等「线程退了吗」的一方（退出收尾）等的就是这一行
+                q.stopped.store(true, Ordering::SeqCst);
+                return;
+            }
         }
     }
 }
@@ -458,5 +479,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(h.lines(), vec!["blocker", "vol=70"]);
+    }
+
+    /// 退出收尾（P1-3）等的就是「线程真的退场了」这个事实：没关停时它不是退场，
+    /// 排队中的作业没跑完时也不该算退场（命令线程关停后要先把手里的活干完）。
+    #[test]
+    fn wait_stopped_only_reports_true_after_the_worker_drained_and_left() {
+        let h = Harness::new();
+        assert!(!h.q.wait_stopped(Duration::from_millis(30)), "还没关停：谈不上退场");
+
+        let gate = h.blocker();
+        h.keyed("volume", "vol=70").expect("投递");
+        h.q.shutdown();
+        assert!(!h.q.wait_stopped(Duration::from_millis(50)), "排队中的作业还没跑完：不许算退场");
+
+        gate.send(()).expect("放行");
+        assert!(h.q.wait_stopped(Duration::from_secs(2)), "活干完、线程走人，才叫退场");
+        assert_eq!(h.lines(), vec!["blocker", "vol=70"], "退场前要把排队中的作业跑完");
+    }
+
+    /// 空队列关停后立刻退场：退出路径上没播过歌（没起过 mpv）时不该白等。
+    #[test]
+    fn an_idle_worker_retires_right_after_shutdown() {
+        let h = Harness::new();
+        h.q.shutdown();
+        assert!(h.q.wait_stopped(Duration::from_secs(2)));
     }
 }

@@ -26,6 +26,7 @@ mod rename;
 mod scanner;
 mod scope;
 mod settingsio;
+mod shutdown;
 mod state;
 mod subtitles;
 mod taxonomy;
@@ -221,6 +222,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::system::close_window,
             commands::system::is_maximized,
             commands::system::force_close_window,
+            commands::system::shutdown_ready,
             commands::system::toggle_fullscreen,
             commands::system::ffmpeg_probe,
             commands::system::convert_run,
@@ -285,11 +287,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::taxonomy::taxonomy_all_track_tags,
             commands::taxonomy::taxonomy_all_category_items,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .map_err(|e| {
-            crate::paths::append_log(&format!("fatal: run exited: {e}"));
+            crate::paths::append_log(&format!("fatal: build failed: {e}"));
             Box::new(e) as Box<dyn std::error::Error>
-        })
+        })?
+        .run(|app, event| {
+            // 退出的唯一入口（P1-3）：窗口全关、系统会话结束、程序化 exit 都会走到这里，
+            // 先拦下来交给 supervisor；它跑完自己调 `app.exit(0)` —— 那时 `exiting()`
+            // 已是 true，这一次请求放行，进程才真的结束。
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if !shutdown::exiting() {
+                    api.prevent_exit();
+                    shutdown::request_exit(app, "系统请求退出");
+                }
+            }
+        });
+    Ok(())
 }
 
 fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -311,18 +325,9 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "quit" => {
-            // 与 app_force_quit 同语义：先置 force_close（否则主窗口 CloseRequested
-            // 会被 prevent 成“隐藏到托盘”），再广播 beforeClose 给前端落盘设置，
-            // 300ms 后退出；原实现先调 app.exit(0) 再 sleep，保存与退出互相竞态。
-            let state: tauri::State<AppWindowsState> = app.state();
-            state.force_close.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = app.emit("window:beforeClose", ());
-            let app2 = app.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                crate::fftools::kill_all();
-                app2.exit(0);
-            });
+            // 退出只有一条路（P1-3）：收尾的次序、预算与记账都在 `shutdown.rs`
+            // （停止接收 → 取消 → 停 watcher → 等任务 → kill+wait → 等落盘回执 → 收线程 → exit）。
+            shutdown::request_exit(app, "托盘退出");
         }
         _ => {}
     })

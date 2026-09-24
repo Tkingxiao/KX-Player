@@ -521,6 +521,17 @@ impl PlayerCore {
         embed::destroy();
     }
 
+    /// 退出收尾（P1-3 的「收线程」一步）：关 mpv、**等命令队列线程真的退场**、销毁舞台窗口。
+    /// 返回「命令线程是否在预算内退场」—— 没退场也只记日志继续退出，绝不无限等；
+    /// 从没播过（没起过 mpv）时没有线程要等，直接算退场。
+    pub fn shutdown(&self, budget: std::time::Duration) -> bool {
+        self.destroy_host();
+        match self.cmd.lock().clone() {
+            Some(q) => q.wait_stopped(budget),
+            None => true,
+        }
+    }
+
     /// 输出设备列表访问器（commands/player.rs 的 player_list_devices 调用）。
     /// 每次调用都重新读取 mpv：mpv 是首次播放时才懒加载的（见 ensure_started），
     /// 启动期缓存只会拿到单条兜底项，因此这里不做缓存。

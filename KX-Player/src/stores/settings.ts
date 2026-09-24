@@ -1,4 +1,4 @@
-/** 设置 store：单一数据源 + 防抖落盘（退出时同步 flush）。 */
+/** 设置 store：单一数据源 + 防抖落盘（退出时 flush 并回报是否真的写进盘）。 */
 import { defineStore } from 'pinia'
 import { ref, reactive } from 'vue'
 import { api } from '@/bridge/ipc'
@@ -167,10 +167,21 @@ export const useSettingsStore = defineStore('settings', () => {
     inspectorWidth.value = isFinite(iw) ? Math.max(260, Math.min(480, iw)) : 320
   }
 
-  /** 退出前 flush（onBeforeClose 调用；同步写保证落盘） */
-  function flushOnExit(): void {
+  /**
+   * 立刻落盘并**等结果**：退出收尾（`onBeforeClose`）与「背景图改完马上写」两处都用它。
+   * 退出那条路要把 `ok` 回报给 Rust 侧的收尾流水线（P1-3 第六步），所以返回值就是
+   * `save_settings` 的结果 —— 收尾据此区分「已确认落盘」与「没写成功」，不再靠睡一会儿。
+   */
+  async function flushOnExit(): Promise<boolean> {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
-    persistNow()
+    try {
+      // 先深拷贝为普通对象：Vue 响应式 Proxy 无法被 IPC structured-clone
+      const s = JSON.parse(JSON.stringify(snapshot())) as Record<string, unknown>
+      return await api.saveSettings(s)
+    } catch (e) {
+      console.error('[settings] flush failed:', e)
+      return false
+    }
   }
 
   const reactiveSnapshot = reactive({})

@@ -65,6 +65,22 @@ impl ScanGate {
         }
         Some(f())
     }
+
+    /// 退出用（P1-3）：把在飞的票全部标记为作废 —— 与「被新的扫描取代」同一效果，
+    /// 但**票留在表里**，由各自的主人 `finish()` 交还。[`live_count`] 因此能一直观察到
+    /// 「真的没人跑了」，而不是「我标记完了就当它停了」。
+    pub fn cancel_all(&self) -> usize {
+        let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        for flag in live.iter() {
+            flag.store(true, Ordering::Release);
+        }
+        live.len()
+    }
+
+    /// 在飞的扫描条数（退出收尾等它归零的判据）。
+    pub fn live_count(&self) -> usize {
+        self.live.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
 }
 
 /// 进程级闸门：曲库只有一份，扫描的落库权也就只有一张票。
@@ -142,5 +158,24 @@ mod tests {
         assert!(!flag.load(Ordering::Relaxed));
         let _new = gate.begin();
         assert!(flag.load(Ordering::Relaxed), "取消旗子要能让 worker 看见");
+    }
+
+    /// 退出收尾（P1-3）靠这两个方法判断「扫描真的停了」：`cancel_all` 只作废、
+    /// 不摘表 —— 摘表就等于宣布「它停了」，而任务可能还在解析。
+    #[test]
+    fn cancel_all_invalidates_every_live_ticket_and_live_count_tracks_them() {
+        let gate = ScanGate::default();
+        assert_eq!(gate.live_count(), 0, "闲时没有在飞票据");
+
+        let old = gate.begin();
+        let current = gate.begin();
+        assert!(!current.superseded());
+        assert_eq!(gate.cancel_all(), 1, "begin 已经收回了旧票，表里只剩最新的那张");
+        assert!(old.superseded());
+        assert!(current.superseded(), "在飞的那张也要作废");
+        assert_eq!(gate.live_count(), 1, "票还留在表里：要等主人自己交还才算停");
+
+        gate.finish(&current);
+        assert_eq!(gate.live_count(), 0);
     }
 }

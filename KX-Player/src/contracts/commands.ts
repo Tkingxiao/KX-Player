@@ -146,6 +146,8 @@ export interface CommandSpecs {
   remove_bg_image: { args: {}, returns: boolean }
   save_bg_image: { args: { dataUrl: string }, returns: boolean }
   save_settings: { args: { settings: Record<string, unknown> }, returns: boolean }
+  /** 退出收尾的落盘回执（P1-3）：`save_settings` 真的返回之后才报，`ok` 就是它的结果 */
+  shutdown_ready: { args: { ok: boolean }, returns: void }
   startup_warnings: { args: {}, returns: string[] }
   subtitle_scan_dir: { args: { dir: string, maxDepth?: number, limit?: number }, returns: SubtitleScanItem[] }
   toggle_fullscreen: { args: {}, returns: boolean }

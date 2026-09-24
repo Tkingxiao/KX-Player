@@ -123,6 +123,7 @@
 | `remove_bg_image` | — | `boolean` | src-tauri/src/commands/system.rs |
 | `save_bg_image` | `dataUrl: String` | `boolean` | src-tauri/src/commands/system.rs |
 | `save_settings` | `settings: Value` | `boolean` | src-tauri/src/commands/system.rs |
+| `shutdown_ready` | `ok: bool` | `null` | src-tauri/src/commands/system.rs |
 | `startup_warnings` | — | `string[]` | src-tauri/src/commands/system.rs |
 | `subtitle_scan_dir` | `dir: String`, `maxDepth: Option<usize>`, `limit: Option<usize>` | `ScannedItem[]` | src-tauri/src/commands/system.rs |
 | `toggle_fullscreen` | — | `boolean` | src-tauri/src/commands/system.rs |
@@ -171,5 +172,5 @@
 | `scanner:fsChanged` | `string[]` | src-tauri/src/watcher.rs | src/bridge/ipc.ts |
 | `scanner:progress` | `{ completed: number; total: number }` | src-tauri/src/scanner/mod.rs | src/bridge/ipc.ts |
 | `scanner:stage` | `string` | src-tauri/src/scanner/mod.rs | src/bridge/ipc.ts |
-| `window:beforeClose` | `null` | src-tauri/src/commands/player.rs<br>src-tauri/src/commands/system.rs<br>src-tauri/src/lib.rs | src/bridge/ipc.ts |
+| `window:beforeClose` | `null` | src-tauri/src/shutdown.rs | src/bridge/ipc.ts |
 | `window:maximizeChange` | `boolean` | src-tauri/src/lib.rs | src/bridge/ipc.ts |

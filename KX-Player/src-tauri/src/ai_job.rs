@@ -156,6 +156,13 @@ pub fn run_texts(app: AppHandle, spec: AiTextsSpec) -> u64 {
 
 fn spawn_job(app: AppHandle, units: usize, job: Job) -> u64 {
     let task_id = AI_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    // 退出途中不再起新任务（P1-3 第一步「停止接收」）：与「启动被拒」同一口径 ——
+    // 没有东西在跑，也就不登记任务表，只把原因送出去。否则这个任务会赶在收尾线程
+    // 后面开始写盘，而收尾的「等任务」已经数不到它。
+    if !crate::shutdown::accepting() {
+        emit_reject(&app, task_id, units, "应用正在退出，未启动任务".to_string());
+        return task_id;
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     AI_FLAGS.lock().insert(task_id, Arc::clone(&cancel));
     std::thread::spawn(move || {
@@ -188,15 +195,34 @@ pub fn cancel(task_id: u64) -> bool {
     }
 }
 
+/// 退出用（P1-3）：取消所有在飞任务（返回条数）。与 `cancel` 同一粒度 ——
+/// 正在飞的那一块跑完、后续不再开始，任务自己走到收尾。
+pub fn cancel_all() -> usize {
+    let flags: Vec<Arc<AtomicBool>> = AI_FLAGS.lock().values().map(Arc::clone).collect();
+    for flag in &flags {
+        flag.store(true, Ordering::SeqCst);
+    }
+    flags.len()
+}
+
+/// 在飞任务条数（退出收尾等它归零的判据）。
+pub fn running() -> usize {
+    AI_FLAGS.lock().len()
+}
+
 /// 命令层在开跑前就拦下的启动（路径越界等）：**不登记任务表**（没有东西在跑，
 /// `cancel` 也不该认它），只把原因用与正常收尾同构的一条事件送达 ——
 /// `ai_translate_start` 的返回类型是 taskId、回不了错误信封，前端也就少一个分支。
 pub fn reject(app: AppHandle, units: usize, error: String) -> u64 {
     let task_id = AI_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    emit_reject(&app, task_id, units, error);
+    task_id
+}
+
+fn emit_reject(app: &AppHandle, task_id: u64, units: usize, error: String) {
     if let Err(e) = app.emit("ai:progress", rejected_event(task_id, units, error)) {
         crate::paths::append_log(&format!("[ai] 启动被拒且事件也投不出去: {e}"));
     }
-    task_id
 }
 
 /// 拒绝事件的口径与 `run_all` 的提前退出完全一致：`queue-finished` 带 error，
@@ -350,5 +376,23 @@ mod tests {
         assert_eq!((p.task_id, p.state.as_str(), p.file_index, p.file_count), (11, "queue-finished", 0, 3));
         assert_eq!(p.error.as_deref(), Some("路径不在已授权的范围内：x.lrc（不在任何已授权目录里）"));
         assert!(p.translated.is_none(), "被拒的启动不带译文");
+    }
+
+    /// 退出收尾（P1-3）靠这两个方法判断「AI 真的停了」——口径与 `cancel` 一致：
+    /// 只认登记过的任务，没登记过的 id 不认（它本来就没在跑）。
+    #[test]
+    fn cancel_all_marks_every_registered_job_and_running_counts_them() {
+        let before = running();
+        let a = Arc::new(AtomicBool::new(false));
+        let b = Arc::new(AtomicBool::new(false));
+        AI_FLAGS.lock().insert(9_000_001, Arc::clone(&a));
+        AI_FLAGS.lock().insert(9_000_002, Arc::clone(&b));
+        assert_eq!(running(), before + 2, "在飞条数就是任务表的大小");
+        assert_eq!(cancel_all(), before + 2);
+        assert!(a.load(Ordering::SeqCst) && b.load(Ordering::SeqCst), "登记过的都要置取消位");
+        assert!(!cancel(9_000_003), "没登记过的 id 不认");
+        AI_FLAGS.lock().remove(&9_000_001);
+        AI_FLAGS.lock().remove(&9_000_002);
+        assert_eq!(running(), before, "用例收尾要把表还原");
     }
 }

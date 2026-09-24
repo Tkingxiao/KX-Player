@@ -182,7 +182,7 @@ async function pickBg(): Promise<void> {
     settings.bgLuma = picked.luma ?? null
     settings.imgEditState = null
     settings.scheduleSave()
-    settings.flushOnExit()
+    void settings.flushOnExit()
   }
 }
 
@@ -196,7 +196,7 @@ async function removeBg(): Promise<void> {
   ui.bgEditorOpen = false
   settings.scheduleSave()
   // 立刻同步落盘，避免「重启后背景图还在」
-  settings.flushOnExit()
+  void settings.flushOnExit()
 }
 
 // ── 明度自适应当前态（判据与实际写属性用的是同一个函数，见 useThemeEffect）──

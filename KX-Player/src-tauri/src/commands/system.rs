@@ -3,12 +3,11 @@
 use crate::error::{AppErrorCode, IpcError, IpcResult};
 use crate::model::{AiChatPayload, AiChatResult, AiModelsResult, AiPingResult, BgImageData};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use super::join_task;
 use crate::scope::PathScope;
-use crate::state::AppWindowsState;
 
 // ── 设置 ────────────────────────────────────────────────────────
 
@@ -78,13 +77,17 @@ pub fn is_maximized(window: WebviewWindow) -> bool {
 }
 
 #[tauri::command]
-pub fn force_close_window(app: AppHandle, window: WebviewWindow, state: State<'_, AppWindowsState>) {
-    state.force_close.store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = app.emit("window:beforeClose", ());
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let _ = window.close();
-    });
+pub fn force_close_window(app: AppHandle) {
+    // 与托盘「退出」同一条路（P1-3）：不再「置位 → 睡 250ms → 关窗」——
+    // 关窗之后还有 watcher/AI/子进程/写盘要收，那些都是收尾流水线的事。
+    crate::shutdown::request_exit(&app, "force_close_window");
+}
+
+/// 前端落盘回执（P1-3 第六步）：`App.vue` 在 `save_settings` 真的返回之后调用，
+/// 退出流程据此确认「设置已经写进盘」而不是睡一会儿再假设它写完了。
+#[tauri::command]
+pub fn shutdown_ready(ok: bool) {
+    crate::shutdown::mark_ready(ok);
 }
 
 #[tauri::command]
@@ -108,6 +111,11 @@ pub fn ffmpeg_probe() -> crate::fftools::FfmpegInfo {
 /// 校验不过整批拒，不会把一个任意 argv 交给 ffmpeg。
 #[tauri::command]
 pub fn convert_run(app: AppHandle, scope: State<'_, crate::scope::PathScope>, items: Vec<crate::fftools::ConvertItem>) -> IpcResult<u64> {
+    // 退出途中不再开转换队列（P1-3 第一步「停止接收」）：队列一起来就会赶在收尾的
+    // 「等任务」之后，而那时已经没人等它了
+    if !crate::shutdown::accepting() {
+        return Err(IpcError::new(AppErrorCode::Busy, "应用正在退出，未开始转换"));
+    }
     match crate::fftools::validate_items(&scope, &items) {
         Ok(()) => Ok(crate::fftools::run_convert_queue(app, items)),
         Err(crate::fftools::Reject::Outside(p)) => {

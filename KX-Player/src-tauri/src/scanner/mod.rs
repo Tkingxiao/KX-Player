@@ -870,6 +870,12 @@ fn cancelled_result(db_path: &Path, folder_paths: &[String], reason: &str) -> Sc
     s
 }
 
+/// 退出途中被拒的扫描（P1-3 第一步「停止接收」）：与「被新扫描取代」同一种收口 ——
+/// 回一份库里现有的快照并带上 `cancelled` 与原因，前端据此保留曲库、不做覆盖。
+pub(crate) fn cancelled_for_exit(db_path: &Path, folder_paths: &[String]) -> ScanResult {
+    cancelled_result(db_path, folder_paths, "应用正在退出，未开始扫描")
+}
+
 /// 落库收口（P0-4）：
 /// - `complete`：整份快照入库，允许把「本轮没见到」判成删除；
 /// - 其余：只补见到的不删任何旧条目，再把库里合并后的真相回读给前端 ——

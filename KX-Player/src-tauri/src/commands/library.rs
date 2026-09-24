@@ -25,10 +25,23 @@ fn guard_roots(app: &AppHandle, paths: &[String], cmd: &str) -> bool {
     }
 }
 
+/// 退出途中不再开扫描（P1-3 第一步「停止接收」）：回一份 `cancelled` 的现有快照，
+/// 前端据此保留曲库 —— 而不是等一个注定被退出打断的结果。
+fn refuse_scan_while_exiting(paths: &[String]) -> Option<ScanResult> {
+    if crate::shutdown::accepting() {
+        return None;
+    }
+    crate::paths::append_log("[shutdown] 已在收尾，拒绝开始新的扫描");
+    Some(crate::scanner::cancelled_for_exit(&db_path(), paths))
+}
+
 #[tauri::command]
 pub async fn scan_folders(app: AppHandle, paths: Vec<String>) -> Option<ScanResult> {
     if paths.is_empty() || !guard_roots(&app, &paths, "scan_folders") {
         return None;
+    }
+    if let Some(refused) = refuse_scan_while_exiting(&paths) {
+        return Some(refused);
     }
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -43,6 +56,9 @@ pub async fn scan_folders_incremental(app: AppHandle, paths: Vec<String>) -> Opt
     if paths.is_empty() || !guard_roots(&app, &paths, "scan_folders_incremental") {
         return None;
     }
+    if let Some(refused) = refuse_scan_while_exiting(&paths) {
+        return Some(refused);
+    }
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         Some(crate::scanner::scan_incremental(&app2, &paths, &db_path()))
@@ -56,6 +72,9 @@ pub async fn scan_folders_incremental(app: AppHandle, paths: Vec<String>) -> Opt
 pub async fn startup_sync(app: AppHandle, paths: Vec<String>) -> Option<ScanResult> {
     if paths.is_empty() || !guard_roots(&app, &paths, "startup_sync") {
         return None;
+    }
+    if let Some(refused) = refuse_scan_while_exiting(&paths) {
+        return Some(refused);
     }
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -173,6 +192,19 @@ pub async fn set_progress(track_id: String, position_ms: i64, completed: Option<
 /// 旧线程通过对比代际知道自己已被取代（替代全局互斥，逻辑简单无死锁）。
 static LOUDNESS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LOUDNESS_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 响度任务是否在跑（退出收尾等它归零的判据）：线程起来就置位，走到最后一行才清。
+static LOUDNESS_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 在跑吗（`shutdown.rs` 的「等任务收尾」用）。
+pub(crate) fn loudness_running() -> bool {
+    LOUDNESS_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 请求取消（退出收尾与 `cancel_loudness` 命令共用一处实现）；返回「此刻是否真的有任务在跑」。
+pub(crate) fn request_cancel_loudness() -> bool {
+    LOUDNESS_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    loudness_running()
+}
 
 /// 后台响度分析：逐文件 ffmpeg ebur128，进度走事件，结果写回 DB。
 /// 任务 + 事件模式（红线条款：长任务不得同步阻塞 IPC）。
@@ -181,6 +213,10 @@ static LOUDNESS_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec<(String, String)>) -> bool {
     use std::sync::atomic::Ordering;
     use tauri::Emitter;
+    // 退出途中不再开新队列（P1-3 第一步「停止接收」）
+    if !crate::shutdown::accepting() {
+        return false;
+    }
     // 逐条筛（P0-1）：这条链路会拿参数里的路径去喂 ffmpeg 读文件。离线盘上的条目会被
     // `resolve` 判不可解析 —— 与「路径本来就读不到」是同一个结局，不该因此拖垮整批
     let tracks: Vec<(String, String)> = tracks
@@ -201,6 +237,7 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
     let app2 = app.clone();
     let total = tracks.len();
     std::thread::spawn(move || {
+        LOUDNESS_RUNNING.store(true, Ordering::SeqCst);
         let mut completed = 0usize;
         let mut done = 0usize;
         let mut failed = 0usize;
@@ -258,6 +295,7 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
                 }),
             );
         }
+        LOUDNESS_RUNNING.store(false, Ordering::SeqCst);
     });
     true
 }
@@ -265,9 +303,7 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
 /// 取消正在进行的响度分析（幂等）
 #[tauri::command]
 pub fn cancel_loudness() -> bool {
-    use std::sync::atomic::Ordering;
-    LOUDNESS_CANCEL.store(true, Ordering::SeqCst);
-    true
+    request_cancel_loudness()
 }
 
 #[tauri::command]
@@ -340,6 +376,10 @@ pub async fn remove_bookmark(id: String) -> bool {
 
 #[tauri::command]
 pub fn start_watching(paths: Vec<String>, scope: State<'_, PathScope>, state: State<'_, AppWindowsState>) -> IpcResult<bool> {
+    // 退出途中不再挂监听（P1-3 第一步「停止接收」）：挂上也会被收尾的下一步停掉
+    if !crate::shutdown::accepting() {
+        return Err(crate::error::IpcError::new(crate::error::AppErrorCode::Busy, "应用正在退出，未开始监听"));
+    }
     // 逐条筛（P0-1）：监听器只该挂在授权根上；离线盘的根解析不出来，本来也盯不住
     let paths: Vec<String> = paths
         .into_iter()

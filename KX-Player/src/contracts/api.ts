@@ -65,6 +65,12 @@ export interface AppApi {
   maximizeWindow: () => Promise<void>
   closeWindow: () => Promise<void>
   forceCloseWindow: () => Promise<void>
+  /**
+   * 退出收尾的落盘回执（P1-3 第六步）：`saveSettings` 真的返回之后调用，把「设置是否写进盘」
+   * 报给退出流水线 —— 它据此结束等待，而不是等满一个固定时长再假设已经写完。
+   * 回执到不了（典型是真关闭窗口时的 `beforeunload`）由 Rust 侧预算兜底，照常退出。
+   */
+  shutdownReady: (ok: boolean) => Promise<void>
   isMaximized: () => Promise<boolean>
   /** 短别名（TitleBar 用） */
   maximize: () => Promise<void>

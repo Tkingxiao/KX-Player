@@ -169,13 +169,14 @@ onMounted(async () => {
   })
   api.onFsChanged?.(() => library.onFsChanged())
 
-  // 退出前保存
+  // 退出前保存。回执（P1-3 第六步）：把「设置是否真的写进盘」报给 Rust 侧收尾流水线，
+  // 它据此结束等待；回执在 `beforeunload` 那条路多半来不及送到，那边由预算兜底。
   let saved = false
   const saveOnce = () => {
     if (saved) return
     saved = true
     settings.folderStack = []
-    settings.flushOnExit()
+    void settings.flushOnExit().then((ok) => { void api.shutdownReady(ok) })
   }
   api.onBeforeClose?.(saveOnce)
   window.addEventListener('beforeunload', saveOnce)

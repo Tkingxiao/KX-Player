@@ -6,7 +6,6 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, Webvi
 
 use super::join_task;
 use crate::player::PlayerCore;
-use crate::state::AppWindowsState;
 
 /// 参数表就是 IPC 契约本身（`contracts/commands.ts` 的 `player_play.args` 一一对应），
 /// 收进结构体要同时改前端调用点与 `docs/IPC.md`，随 S3 一起做，这里先不凑数。
@@ -190,14 +189,10 @@ pub async fn player_set_device(app: AppHandle, device_id: String) -> bool {
 }
 
 #[tauri::command]
-pub fn app_force_quit(app: tauri::AppHandle, state: State<'_, AppWindowsState>) {
-    state.force_close.store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = app.emit("window:beforeClose", ());
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        crate::fftools::kill_all();
-        app.exit(0);
-    });
+pub fn app_force_quit(app: tauri::AppHandle) {
+    // 退出只有一条路（P1-3）：托盘「退出」、这个命令与「窗口全关」都汇进
+    // `shutdown::request_exit` —— 收尾的次序、预算与记账都在那里，重复的请求只跑一遍。
+    crate::shutdown::request_exit(&app, "app_force_quit");
 }
 
 // ── 独立悬浮窗（画中画）──────────────────────────────────────

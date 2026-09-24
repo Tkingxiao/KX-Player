@@ -271,7 +271,7 @@ db::* / scanner::* / player::PlayerCore / fftools::* / taxonomy::* / ai::*
 | `scanner:stage` | `string` | scanner/mod.rs:91 | App.vue:155 |
 | `scanner:fsChanged` | `string[]`（这一批的脏路径，去重、最多 1024 条） | watcher.rs（单 debounce worker） | App.vue:170 |
 | `convert:progress` | `{...}`（7 处发） | fftools.rs:285-336 | convert 视图 |
-| `window:beforeClose` | `null` | lib.rs:262、system.rs:80、player.rs:184 | App.vue:169（落盘设置） |
+| `window:beforeClose` | `null` | shutdown.rs（退出收尾第一步之后广播） | App.vue（落盘设置并回执 `shutdown_ready`） |
 | `window:maximizeChange` | `boolean` | lib.rs:108 | TitleBar |
 | `pip:shown` / `pip:closed` / `pip:restored` / `pip:pinned` | — | player.rs:247-306、lib.rs:73-78 | ui store、PipRoot |
 
