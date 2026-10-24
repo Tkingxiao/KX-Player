@@ -2,6 +2,7 @@
 import { defineStore } from 'pinia'
 import { ref, reactive } from 'vue'
 import { api } from '@/bridge/ipc'
+import type { AiApiStyle } from '@/contracts/dto'
 
 export interface BgEditState {
   zoomPct: number
@@ -58,10 +59,14 @@ export const useSettingsStore = defineStore('settings', () => {
   // ── AI 翻译（API Key 仅存内存，不落盘）──
   const aiBaseURL = ref('')
   const aiModel = ref('')
+  /** 接口协议：OpenAI Chat Completions（历史缺省）/ OpenAI Responses / Anthropic Messages */
+  const aiApiStyle = ref<AiApiStyle>('openai-chat')
   /** 翻译策略档位：本地模型走小批量 / 单并发 / 长超时（见 Rust `ai_strategy.rs`） */
   const aiModelKind = ref<'remote' | 'local'>('remote')
   /** 本地模型一次合并几条（2–10） */
   const aiMergeLines = ref(4)
+  /** 分块并发：同时发几个分块请求（2–10）。null = 不勾选，跟随档位缺省（外接 2 / 本地 1） */
+  const aiConcurrency = ref<number | null>(null)
 
   // ── 布局尺寸（P0-1 拖拽分隔条）──
   const sidebarWidth = ref(232)
@@ -83,7 +88,9 @@ export const useSettingsStore = defineStore('settings', () => {
       trackSort: trackSort.value, trackSortDir: trackSortDir.value,
       loudnessEnabled: loudnessEnabled.value, loudnessTarget: loudnessTarget.value,
       aiBaseURL: aiBaseURL.value, aiModel: aiModel.value,
+      aiApiStyle: aiApiStyle.value,
       aiModelKind: aiModelKind.value, aiMergeLines: aiMergeLines.value,
+      aiConcurrency: aiConcurrency.value,
       sidebarWidth: sidebarWidth.value, inspectorWidth: inspectorWidth.value,
       _v: 2,
     }
@@ -158,9 +165,15 @@ export const useSettingsStore = defineStore('settings', () => {
     gridSize.value = (rawGrid === 132 || rawGrid === 220 ? rawGrid : 176) as 132 | 176 | 220
     aiBaseURL.value = String(s.aiBaseURL ?? '')
     aiModel.value = String(s.aiModel ?? '')
+    const rawStyle = String(s.aiApiStyle ?? '')
+    aiApiStyle.value = (['openai-chat', 'openai-responses', 'anthropic'] as readonly string[]).includes(rawStyle)
+      ? (rawStyle as AiApiStyle)
+      : 'openai-chat'
     aiModelKind.value = String(s.aiModelKind) === 'local' ? 'local' : 'remote'
     const rawMerge = Number(s.aiMergeLines ?? 4)
     aiMergeLines.value = isFinite(rawMerge) ? Math.max(2, Math.min(10, Math.round(rawMerge))) : 4
+    const rawConc = s.aiConcurrency
+    aiConcurrency.value = rawConc == null ? null : Math.max(2, Math.min(12, Math.round(Number(rawConc)) || 4))
     const sw = Number(s.sidebarWidth ?? 232)
     sidebarWidth.value = isFinite(sw) ? Math.max(180, Math.min(360, sw)) : 232
     const iw = Number(s.inspectorWidth ?? 320)
@@ -195,7 +208,7 @@ export const useSettingsStore = defineStore('settings', () => {
     folderView, folderSort, folderSortDir, folderStack, gridSize, sidebarCollapsed,
     trackSort, trackSortDir,
     loudnessEnabled, loudnessTarget,
-    aiBaseURL, aiModel, aiModelKind, aiMergeLines,
+    aiBaseURL, aiModel, aiApiStyle, aiModelKind, aiMergeLines, aiConcurrency,
     sidebarWidth, inspectorWidth,
     load, scheduleSave, flushOnExit,
   }

@@ -21,7 +21,11 @@ export function jobOpts() {
     baseURL: settings.aiBaseURL,
     apiKey: apiKey.value,
     model: settings.aiModel,
+    // 接口协议跟着设置走：三种线形状的差别由 Rust 侧分派，前端只传名字
+    apiStyle: settings.aiApiStyle,
     modelKind: settings.aiModelKind,
     mergeLines: settings.aiMergeLines,
+    // 多路并发：显式指定优先于档位缺省（ai_strategy::resolve 的口径），没勾选就不传 —— 两档各用各的
+    ...(settings.aiConcurrency != null ? { concurrency: settings.aiConcurrency } : {}),
   }
 }

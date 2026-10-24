@@ -150,17 +150,34 @@ export const api: AppApi = {
         model: payload.model,
         messages: payload.messages,
         temperature: payload.temperature,
+        apiStyle: payload.apiStyle,
       },
     }),
   aiPing: (payload) =>
     invoke('ai_ping', {
-      payload: { baseUrl: payload.baseURL, apiKey: payload.apiKey, model: payload.model },
+      payload: {
+        baseUrl: payload.baseURL,
+        apiKey: payload.apiKey,
+        model: payload.model,
+        modelKind: payload.modelKind,
+        apiStyle: payload.apiStyle,
+      },
     }),
   aiListModels: (payload) =>
     invoke('ai_list_models', {
       baseUrl: payload.baseURL,
       apiKey: payload.apiKey,
+      apiStyle: payload.apiStyle,
     }),
+  // 显式放行（P0-3 的唯一例外）：公网明文/非 443 端点由用户逐条确认，名单落 SQLite
+  aiEndpointCheck: (baseURL: string) => invoke('ai_endpoint_check', { baseUrl: baseURL }),
+  aiPlaintextSet: (endpoint: string, allow: boolean) => invoke('ai_plaintext_set', { endpoint, allow }),
+  // 译文管理：账 + 文件系统现状（Rust 阻塞读库，spawn_blocking 包住）
+  aiTranslatedList: () => invoke('ai_translated_list', {}),
+  aiTranslatedCleanup: () => invoke('ai_translated_cleanup', {}),
+  aiTranslatedRemove: (paths: string[], removeFile: boolean) =>
+    invoke('ai_translated_remove', { paths, removeFile }),
+  aiTranslatedRemoveSource: (paths: string[]) => invoke('ai_translated_remove_source', { paths }),
   // ── AI 批量任务（B3）──
   // 与 aiChat 的区别：这里只「启动」任务，逐块翻译在 Rust 里跑，进度走 ai:progress 事件。
   // 前端不再拿 await 串起整条链路，所以关页面不影响任务、也才有地方能取消它。
@@ -181,8 +198,8 @@ export const api: AppApi = {
   renameApply: (paths) => invoke('rename_apply', { paths }),
   // 生成译名：只写库不改盘，所以它排在 apply 前面 —— 用户先按这一条拿到名字，再按 apply 落地。
   // 接入参数前端叫 baseURL（`AiJobOptions` 的口径），线形状是 baseUrl，映射收在边界这一层。
-  renameSuggestNames: (paths, baseURL, apiKey, model, modelKind) =>
-    invoke('rename_suggest_names', { paths, baseUrl: baseURL, apiKey, model, modelKind }),
+  renameSuggestNames: (paths, baseURL, apiKey, model, modelKind, apiStyle, onlyPaths) =>
+    invoke('rename_suggest_names', { paths, baseUrl: baseURL, apiKey, model, modelKind, apiStyle, onlyPaths }),
   // 拒绝一个译名 = 只往拒绝表写一行；生效的地方在后端每次查库时复核，不在这里记账
   renameRejectSuggestion: (path, suggestion) => invoke('rename_reject_suggestion', { path, suggestion }),
   renameRollback: (batchId) => invoke('rename_rollback', { batchId }),

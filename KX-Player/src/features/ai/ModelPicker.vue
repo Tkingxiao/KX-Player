@@ -39,7 +39,7 @@ async function fetchModels(): Promise<void> {
   fetching.value = true
   error.value = ''
   try {
-    const r = await api.aiListModels({ baseURL: settings.aiBaseURL, apiKey: apiKey.value })
+    const r = await api.aiListModels({ baseURL: settings.aiBaseURL, apiKey: apiKey.value, apiStyle: settings.aiApiStyle })
     if (r.ok && r.models.length) {
       modelList.value = r.models
       if (!settings.aiModel || !r.models.includes(settings.aiModel)) {

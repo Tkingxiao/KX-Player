@@ -1,7 +1,7 @@
 //! 命令层：设置/背景图/窗口/ffmpeg/AI。
 
 use crate::error::{AppErrorCode, IpcError, IpcResult};
-use crate::model::{AiChatPayload, AiChatResult, AiModelsResult, AiPingResult, BgImageData};
+use crate::model::{AiChatPayload, AiChatResult, AiModelsResult, AiPingResult, ApiStyle, BgImageData};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -153,10 +153,86 @@ pub async fn ai_ping(payload: AiChatPayload) -> AiPingResult {
 }
 
 #[tauri::command]
-pub async fn ai_list_models(base_url: String, api_key: String) -> AiModelsResult {
+pub async fn ai_list_models(base_url: String, api_key: String, api_style: Option<ApiStyle>) -> AiModelsResult {
     // Key 从进来到用完只有这一份：Tauri 交过来的 String 用完就擦（P0-3）
     let api_key = zeroize::Zeroizing::new(api_key);
-    crate::ai::list_models(&base_url, api_key.as_str()).await
+    crate::ai::list_models(&base_url, api_key.as_str(), api_style.unwrap_or_default()).await
+}
+
+/// 端点策略体检：能不能直接用？被拦的原因？放行哪个端点能救？
+/// 界面的「显式放行」按钮以此为准 —— 公网/私网与端口规则只活在 Rust 一处。
+/// 只有「补一条放行真的能过」时才给出 `endpoint`，其余被拦（地址本身不合规等）不给按钮。
+#[tauri::command]
+pub async fn ai_endpoint_check(base_url: String) -> crate::model::AiEndpointPolicy {
+    let allowlist = crate::ai_cache::plaintext_allowlist();
+    match crate::ai_url::check_with(&base_url, &allowlist) {
+        Ok(_) => crate::model::AiEndpointPolicy { ok: true, reason: None, endpoint: None, allowlist },
+        Err(reason) => {
+            let endpoint = crate::ai_url::parse_target(&base_url)
+                .ok()
+                .filter(|t| !t.local)
+                .map(|t| crate::ai_url::endpoint_key(&t.host, t.port))
+                .filter(|ep| crate::ai_url::check_with(&base_url, std::slice::from_ref(ep)).is_ok());
+            crate::model::AiEndpointPolicy { ok: false, reason: Some(reason), endpoint, allowlist }
+        }
+    }
+}
+
+/// 登记 / 撤销一条明文放行，返回刷新后的名单。放行是显式动作：入库（007 表）+ 刷进程内缓存。
+#[tauri::command]
+pub async fn ai_plaintext_set(endpoint: String, allow: bool) -> IpcResult<Vec<String>> {
+    crate::ai_cache::set_plaintext_allow(&endpoint, allow).map_err(IpcError::invalid_argument)
+}
+
+// ── 译文管理（AI 工作台第四个工种页）────────────────────────────
+
+/// 全部已翻译条目 + 文件系统现状分类。读库核对都是阻塞 IO，走 spawn_blocking。
+#[tauri::command]
+pub async fn ai_translated_list() -> Vec<crate::ai_translated::TranslatedEntry> {
+    let db = crate::paths::library_db_path();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::db::with_db_text(&db, |c| Ok(crate::ai_translated::list(c))).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// 一键清理失效账（源、译文都不在的纯垃圾行），返回清掉的条数。
+#[tauri::command]
+pub async fn ai_translated_cleanup() -> usize {
+    let db = crate::paths::library_db_path();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::db::with_db_text(&db, |c| Ok(crate::ai_translated::cleanup_gone(c))).unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
+}
+
+/// 删译文（连账）或只清账，`remove_file` 区分。译文路径以账里记录的为准，
+/// 命令只收源路径 —— 不给「按任意路径删文件」的口子。
+#[tauri::command]
+pub async fn ai_translated_remove(paths: Vec<String>, remove_file: bool) -> crate::ai_translated::RemoveReport {
+    let db = crate::paths::library_db_path();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::db::with_db_text(&db, |c| Ok(crate::ai_translated::remove(c, &paths, remove_file)))
+            .unwrap_or(crate::ai_translated::RemoveReport { removed: 0, errors: vec!["读库失败".into()] })
+    })
+    .await
+    .unwrap_or(crate::ai_translated::RemoveReport { removed: 0, errors: vec!["任务调度失败".into()] })
+}
+
+/// 删除选中条目的**原文**文件：路径必须精确命中翻译账（与 `ai_translated_remove` 同一条口子），
+/// 译文与账都保留 —— 条目转为「源已删」，译文的去留另有按钮管。前端有二次确认与
+/// 「有选中才解锁」，这里守的是最后一道：账外的路径一个都不删。
+#[tauri::command]
+pub async fn ai_translated_remove_source(paths: Vec<String>) -> crate::ai_translated::RemoveReport {
+    let db = crate::paths::library_db_path();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::db::with_db_text(&db, |c| Ok(crate::ai_translated::remove_source(c, &paths)))
+            .unwrap_or(crate::ai_translated::RemoveReport { removed: 0, errors: vec!["读库失败".into()] })
+    })
+    .await
+    .unwrap_or(crate::ai_translated::RemoveReport { removed: 0, errors: vec!["任务调度失败".into()] })
 }
 
 /// AI 命令的路径闸门（P0-1 的 AI 侧）：与 `rename` / `convert` 同口径 —— 任一条不在授权范围内
@@ -299,9 +375,9 @@ pub async fn subtitle_scan_dir(
     if denied {
         return vec![];
     }
-    // 深度与数量的缺省值来自旧前端那次递归：字幕 4/500
+    // 深度缺省 4（旧前端口径，硬上限 32）；数量**不限**——用户裁决「扫到多少载入多少」，
+    // 显式传 limit 才生效（测试/程序化截断用）
     let max_depth = max_depth.unwrap_or(4);
-    let limit = limit.unwrap_or(500);
     let db = crate::paths::library_db_path();
     match tauri::async_runtime::spawn_blocking(move || {
         let mut items = crate::ai_scan::scan_dir(&dir, max_depth, limit);

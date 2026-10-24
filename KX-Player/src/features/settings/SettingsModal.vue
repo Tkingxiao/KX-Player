@@ -14,11 +14,20 @@ const player = usePlayerStore()
 const library = useLibraryStore()
 const ui = useUiStore()
 
-// ── 响度分析（后台 ffmpeg ebur128）──
+// ── 响度分析（ffmpeg 解码 + Rust 侧 EBU R128 积分）──
 const missingLoudnessCount = computed(() => library.allTracks.filter((t) => t.loudnessLufs == null).length)
 const loudnessPct = computed(() =>
   library.loudnessScan.total > 0 ? Math.round((library.loudnessScan.completed / library.loudnessScan.total) * 100) : 0,
 )
+/** 一批的三种结局。静音条目不写库，所以「缺失」不会归零 —— 不说清楚就像漏跑了。 */
+const loudnessTally = computed(() => {
+  const s = library.loudnessScan
+  if (!s.total || (!s.silent && !s.failed)) return ''
+  const parts = [`有响度 ${s.done}`]
+  if (s.silent) parts.push(`无有效响度 ${s.silent}`)
+  if (s.failed) parts.push(`失败 ${s.failed}`)
+  return parts.join(' · ')
+})
 function startLoudness(): void {
   if (!library.startLoudnessAnalysis(true)) ui.toast('没有待分析的条目', 'info')
 }
@@ -318,6 +327,7 @@ const themeRows = [
                     {{ library.loudnessScan.current || '分析中…' }}
                   </p>
                 </template>
+                <p v-if="loudnessTally" class="set-hint">{{ loudnessTally }}</p>
               </div>
             </section>
 

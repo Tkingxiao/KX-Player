@@ -7,12 +7,12 @@
 //!
 //! 本文件只管读库/写库的纯函数，连接由调用方（命令 / 翻译任务）经 `db::with_db_text`
 //! 注入；缓存键归一化用 crate::model::normalize_path，避免正反斜杠一双键。
+//! 译文文件本身（.zh.*）不进这条账也不进扫描：排除规则在 `ai_prompt::is_translated_output`。
 
 use rusqlite::Connection;
 use std::path::Path;
 
-/// 字幕在扫描里也会被当译文输出再次扫到，`is_translated_subtitle` 只对源文件判；
-/// 这里不碰撞它。缓存守卫规则见 `subtitle_exempt`。
+/// 译文文件（.zh.*）由 `ai_prompt::is_translated_output` 在扫描与管线两处排除，不会走到这条账里。
 /// 音频/视频扩展名：字幕（.lrc 尤其）常跟随同名媒体文件，记录配对路径。
 const MEDIA_EXTS: &[&str] = &[
     "mp3", "flac", "wav", "aac", "ogg", "oga", "opus", "m4a", "m4b", "wma", "ape", "wv", "aiff",
@@ -57,7 +57,9 @@ pub fn stat(path: &str) -> Option<FileStat> {
     Some(FileStat { mtime, size: md.len() })
 }
 
-fn mo_close(a: f64, b: f64) -> bool {
+/// mtime 近似相等（浮点秒走库再回来会有误差）。`subtitle_exempt` 与
+/// `ai_translated` 的现状分类共用同一条判定。
+pub(crate) fn mtime_close(a: f64, b: f64) -> bool {
     (a - b).abs() < 0.001
 }
 
@@ -81,7 +83,7 @@ pub fn subtitle_exempt(conn: &Connection, source: &str, out_path: &str, st: &Fil
         if let Some(rows) = rows {
             for r in rows.flatten() {
                 let (Some(mtime), Some(size), Some(out)) = r else { continue };
-                if mo_close(mtime, st.mtime) && size == st.size as i64 && Path::new(&out).is_file() {
+                if mtime_close(mtime, st.mtime) && size == st.size as i64 && Path::new(&out).is_file() {
                     return true;
                 }
             }
@@ -171,6 +173,93 @@ pub fn subtitle_cached(conn: &Connection, path: &str) -> bool {
     let Some((_, ext)) = path.rsplit_once('.') else { return false };
     let out = crate::ai_prompt::translated_path(path, &ext.to_ascii_lowercase());
     subtitle_exempt(conn, path, &out, &st)
+}
+
+// ── 明文放行名单（P0-3 的显式例外，007 迁移）────────────────────────────
+//
+// 默认策略（ai_url）拒绝公网明文与非 443 端口；自建反代（http://公网IP:自定义端口）
+// 是正当场景，但放行必须是**用户的显式动作**，且落在 SQLite 而不是可被整份覆盖的
+// 设置 JSON —— 同步盘/备份还原不该能悄悄带上一条放行。进程内缓存一份：策略检查
+// 在请求热路径上，不能每块请求都开一次库；登记/撤销（`set_plaintext_allow`）负责刷新。
+
+static PLAINTEXT_ALLOW: std::sync::OnceLock<parking_lot::RwLock<Option<std::sync::Arc<Vec<String>>>>> =
+    std::sync::OnceLock::new();
+
+/// 当前放行名单（`host:port` 形状，见 `ai_url::endpoint_key`）。首次访问从库加载，
+/// 之后走缓存；读库失败按**空名单**处理并记日志 —— 宁可退回默认策略，不能悄悄放行。
+pub fn plaintext_allowlist() -> Vec<String> {
+    let cache = PLAINTEXT_ALLOW.get_or_init(|| parking_lot::RwLock::new(None));
+    if let Some(list) = cache.read().as_ref() {
+        return list.as_ref().clone();
+    }
+    refresh_plaintext_cache()
+}
+
+/// 登记 / 撤销一条放行，返回刷新后的完整名单（前端据此重画）。
+/// `endpoint` 形状 = `host:port`（IPv6 带方括号）；这里重新解析归一化，不信任
+/// 调用方拼好的字符串。本机/局域网地址拒绝登记 —— 它们本来就放行，名单只会误导人。
+pub fn set_plaintext_allow(endpoint: &str, allow: bool) -> Result<Vec<String>, String> {
+    let (host, port) = parse_endpoint(endpoint)?;
+    if crate::ai_url::is_local_host(&host) {
+        return Err("本机/局域网地址本来就允许明文，无需放行".into());
+    }
+    let db = crate::paths::library_db_path();
+    crate::db::with_db_text(&db, |c| set_plaintext_allow_conn(c, &host, port, allow).map_err(|e| e.to_string()))
+        .map_err(|e| format!("写放行名单失败: {e}"))?;
+    Ok(refresh_plaintext_cache())
+}
+
+/// 表读写（拆出来给内存库测）：登记走 upsert，撤销是删除。
+fn set_plaintext_allow_conn(conn: &Connection, host: &str, port: u16, allow: bool) -> rusqlite::Result<()> {
+    if allow {
+        conn.execute(
+            "INSERT INTO ai_plaintext_allow (host, port, confirmed_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(host, port) DO UPDATE SET confirmed_at=excluded.confirmed_at",
+            rusqlite::params![host, port as i64, now_ms()],
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM ai_plaintext_allow WHERE host = ?1 AND port = ?2",
+            rusqlite::params![host, port as i64],
+        )?;
+    }
+    Ok(())
+}
+
+/// `host:port` → 归一化的 (host, port)。必须带显式端口（省端口时补出来的默认值
+/// 十有八九不是用户真实端点）；IPv6 的 host_str 自带方括号，剥成裸 host ——
+/// 与 `ai_url::endpoint_key`（重新按需加括号）共用同一形状。
+fn parse_endpoint(endpoint: &str) -> Result<(String, u16), String> {
+    let url = reqwest::Url::parse(&format!("http://{}/", endpoint.trim()))
+        .map_err(|_| format!("放行目标形状不对：{endpoint}（应为 host:port）"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("放行目标缺少主机：{endpoint}"))?
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    let port = url.port().ok_or_else(|| format!("放行目标必须带端口：{endpoint}"))?;
+    Ok((host, port))
+}
+
+fn load_plaintext_allowlist(conn: &Connection) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare("SELECT host, port FROM ai_plaintext_allow ORDER BY confirmed_at") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) else {
+        return Vec::new();
+    };
+    rows.flatten().map(|(h, p)| crate::ai_url::endpoint_key(&h, p as u16)).collect()
+}
+
+fn refresh_plaintext_cache() -> Vec<String> {
+    let db = crate::paths::library_db_path();
+    let list = crate::db::with_db_text(&db, |c| Ok(load_plaintext_allowlist(c))).unwrap_or_else(|e| {
+        crate::paths::append_log(&format!("[ai] 读放行名单失败，按空名单处理: {e}"));
+        Vec::new()
+    });
+    let cache = PLAINTEXT_ALLOW.get_or_init(|| parking_lot::RwLock::new(None));
+    *cache.write() = Some(std::sync::Arc::new(list.clone()));
+    list
 }
 
 #[cfg(test)]
@@ -280,5 +369,30 @@ mod tests {
         assert_eq!(a.as_deref(), Some(format!("{}/track.mp3", dir.to_str().unwrap())).as_deref());
         assert!(audio_of(&format!("{}/nope.lrc", dir.to_str().unwrap())).is_none(), "无配对媒体");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 放行名单的表读写：登记 upsert、撤销删除、读出按 endpoint_key 归一化。
+    /// 与 `ai_url::check_with` 对一遍：名单里的条目真能解锁那个端点。
+    #[test]
+    fn plaintext_allow_rows_roundtrip_and_unlock_the_endpoint() {
+        let conn = db();
+        set_plaintext_allow_conn(&conn, "125.216.220.3", 8788, true).unwrap();
+        set_plaintext_allow_conn(&conn, "125.216.220.3", 8788, true).unwrap(); // 重复登记 = upsert，不炸
+        let list = load_plaintext_allowlist(&conn);
+        assert_eq!(list, vec!["125.216.220.3:8788".to_string()]);
+        assert!(crate::ai_url::check_with("http://125.216.220.3:8788/v1", &list).is_ok(), "名单要能解锁端点");
+
+        set_plaintext_allow_conn(&conn, "125.216.220.3", 8788, false).unwrap();
+        assert!(load_plaintext_allowlist(&conn).is_empty(), "撤销即删除");
+        assert!(crate::ai_url::check_with("http://125.216.220.3:8788/v1", &load_plaintext_allowlist(&conn)).is_err());
+    }
+
+    /// endpoint 归一化：必须带显式端口；大小写与尾随斜杠都收干净；垃圾形状如实拒。
+    #[test]
+    fn endpoint_parsing_is_strict() {
+        assert_eq!(parse_endpoint("EXAMPLE.com:8788/").unwrap(), ("example.com".into(), 8788));
+        assert_eq!(parse_endpoint("[::1]:8788").unwrap(), ("::1".into(), 8788));
+        assert!(parse_endpoint("example.com").is_err(), "缺端口的默认值不是用户的真实端点");
+        assert!(parse_endpoint("不是地址").is_err());
     }
 }

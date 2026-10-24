@@ -278,6 +278,148 @@ pub fn exec_capture(exe: PathBuf, args: &[String], timeout: Duration, oc: OutCap
     }
 }
 
+// ── 流式执行（stdout 交给调用方，不落内存）─────────────────────
+
+/// 一次流式子进程的结果。`error` 非空 = 没跑成（起不来 / 超时 / 退出中被收走 /
+/// 接收方喊停），此时不看 `code`。`stderr_tail` 只是错误上下文，**不参与判定**。
+#[derive(Debug)]
+pub struct Streamed {
+    pub code: i32,
+    pub stderr_tail: String,
+    pub error: Option<String>,
+}
+
+impl Streamed {
+    fn failed(code: i32, msg: &str) -> Self {
+        Self { code, stderr_tail: String::new(), error: Some(msg.to_string()) }
+    }
+}
+
+/// 跑一个子进程，把它的 stdout 按块交给 `on_data`（边读边算，不整份留内存）。
+/// 与 `exec_capture` 同一套登记 / 超时 / 回收约定（P1-4），所以退出流水线照旧能收走它。
+/// 阻塞调用线程，借共享运行时驱动 —— 因此 `on_data` 不必是 `Send`。
+pub(crate) fn exec_stream(
+    exe: PathBuf,
+    args: &[String],
+    timeout: Duration,
+    chunk_bytes: usize,
+    mut on_data: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Streamed {
+    match runtime() {
+        Ok(rt) => rt.block_on(run_stream(exe, args, timeout, chunk_bytes, &mut on_data)),
+        Err(e) => Streamed::failed(-1, &e),
+    }
+}
+
+/// stdout → 接收方的泵。**读到 EOF 才算正常结束**；接收方返回 Err 时先掐一下
+/// `stop`（让外层别再等这个子进程）再把原因带出去。
+async fn pump_stdout<R>(
+    src: Option<R>,
+    chunk_bytes: usize,
+    on_data: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    stop: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut src) = src else { return Ok(()) };
+    let mut buf = vec![0u8; chunk_bytes.max(1)];
+    loop {
+        match src.read(&mut buf).await {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                if let Err(msg) = on_data(&buf[..n]) {
+                    let _ = stop.send(msg.clone());
+                    return Err(msg);
+                }
+            }
+            Err(e) => {
+                let msg = format!("读取 ffmpeg 输出失败: {e}");
+                let _ = stop.send(msg.clone());
+                return Err(msg);
+            }
+        }
+    }
+}
+
+async fn run_stream(
+    exe: PathBuf,
+    args: &[String],
+    timeout: Duration,
+    chunk_bytes: usize,
+    on_data: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Streamed {
+    let Some((id, kill, done)) = register() else {
+        return Streamed::failed(1, "应用正在退出，未启动子进程");
+    };
+    let mut child = match spawn_hidden(exe, args).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            unregister(id, &done);
+            return Streamed::failed(-1, &format!("启动失败: {e}"));
+        }
+    };
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    let tail = crate::limits::MAX_CHILD_TAIL_BYTES;
+    // 「接收方喊停」的信号。发送端在 `run_stream` 手里留一份不放：接收端只在**全部**
+    // 发送端消失后才报关闭，而泵正常收完时它自己那份会随泵一起析构 —— 不留这一份，
+    // 一次成功的读取就会被误判成「提前收手」。
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // 三路并行（同 `run`）：只等退出会死锁 —— 子进程堵在写满的 stderr 管道上，
+    // 而它的退出码要等它退出才拿得到。离开 `body` 之后才能再碰 child。
+    let mut body = Box::pin(async {
+        tokio::join!(
+            pump_stdout(out, chunk_bytes, on_data, stop_tx.clone()),
+            read_capped(err, OutCap::Tail(tail)),
+            child.wait()
+        )
+    });
+    let expired = tokio::time::sleep(timeout);
+    tokio::pin!(expired);
+    let notified = kill.notified();
+    tokio::pin!(notified);
+    let (finished, stopped_by) = tokio::select! {
+        r = &mut body => (Some(r), None),
+        _ = &mut expired => (None, Some(format!("ffmpeg 超时（{} 秒）", timeout.as_secs()))),
+        _ = &mut notified => (None, Some("应用退出".to_string())),
+        m = stop_rx.recv() => (None, Some(m.unwrap_or_else(|| "接收方已停止".to_string()))),
+    };
+    drop(body);
+    drop(stop_tx);
+
+    let result = match finished {
+        Some((fed, se, status)) => Streamed {
+            code: status.map(|s| s.code().unwrap_or(1)).unwrap_or(1),
+            stderr_tail: last_lines(&String::from_utf8_lossy(&se.0)),
+            // 走到这里说明三路都收了：`fed` 的 Err 只在子进程已退出时才可能留下
+            error: fed.err(),
+        },
+        None => {
+            let reaped = kill_and_reap(&mut child, KILL_GRACE).await;
+            let what = stopped_by.unwrap_or_else(|| "应用退出".to_string());
+            let msg = if reaped {
+                format!("{what}，子进程已终止并回收")
+            } else {
+                format!("{what}，但子进程没有在 {} 秒内退出", KILL_GRACE.as_secs())
+            };
+            crate::paths::append_log(&format!("[ffmpeg] {msg}"));
+            Streamed::failed(1, &msg)
+        }
+    };
+    unregister(id, &done);
+    result
+}
+
+/// stderr 尾巴收成一行日志：最后 3 个非空行。整段可能有几十 KB，读的人只要那几句。
+fn last_lines(s: &str) -> String {
+    let lines: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let keep = lines.len().saturating_sub(3);
+    lines[keep..].join(" | ")
+}
+
 /// 应用退出时回收全部子进程（收尾流水线的第五步）。**必须等它们真的退出再返回**：
 /// 它之后还有「等前端落盘」「收线程」两步，然后才 `app.exit(0)`；只通知不等回收，
 /// 父进程先没了，ffmpeg 就成了孤儿 —— 还在写盘，谁也看不见。
@@ -424,72 +566,6 @@ pub fn log_ffmpeg_identity() {
             version.unwrap_or_else(|| "版本未知".into()),
         ));
     });
-}
-
-// ── 响度分析（ffmpeg ebur128）─────────────────────────────────
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoudnessResult {
-    pub path: String,
-    pub lufs: Option<f64>,
-    pub error: Option<String>,
-}
-
-/// 解析 ffmpeg ebur128 汇总输出中的 Integrated loudness I 值。
-/// 匹配示例：`    I:         -23.5 LUFS`
-pub fn parse_integrated_lufs(stderr: &str) -> Option<f64> {
-    for line in stderr.lines() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("I:") {
-            let token = rest.split_whitespace().next()?;
-            if let Ok(v) = token.parse::<f64>() {
-                if v.is_finite() && v > -100.0 {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 用 ffmpeg ebur128 测量单个文件的整体响度（只分析，不产出文件）。
-/// 单文件 300s 超时；失败返回 error 字符串。
-pub fn measure_loudness(path: &str) -> LoudnessResult {
-    let Some(exe) = crate::paths::locate_ffmpeg() else {
-        return LoudnessResult {
-            path: path.into(),
-            lufs: None,
-            error: Some("ffmpeg.exe 未找到".into()),
-        };
-    };
-    let args: Vec<String> = vec![
-        "-hide_banner".into(),
-        "-nostats".into(),
-        "-i".into(),
-        path.to_string(),
-        "-af".into(),
-        "ebur128=peak=true".into(),
-        "-f".into(),
-        "null".into(),
-        null_device(),
-    ];
-    let result = match runtime() {
-        Ok(rt) => rt.block_on(exec_async(exe, &args, 300)),
-        Err(e) => return LoudnessResult { path: path.into(), lufs: None, error: Some(e) },
-    };
-    if let Some(err) = result.error {
-        return LoudnessResult { path: path.into(), lufs: None, error: Some(err) };
-    }
-    let stderr = result.stderr.unwrap_or_default();
-    match parse_integrated_lufs(&stderr) {
-        Some(v) => LoudnessResult { path: path.into(), lufs: Some(v), error: None },
-        None => LoudnessResult {
-            path: path.into(),
-            lufs: None,
-            error: Some("未能从 ffmpeg 输出解析响度".into()),
-        },
-    }
 }
 
 // ── 转换任务（可取消，任务 + 事件）─────────────────────────────
@@ -714,36 +790,8 @@ pub fn cancel_convert_queue(task_id: u64) -> bool {
     }
 }
 
-/// 空输出设备（跨平台；Windows=NUL，其余=/dev/null）
-fn null_device() -> String {
-    if cfg!(windows) { "NUL".to_string() } else { "/dev/null".to_string() }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_integrated_lufs;
-
-    #[test]
-    fn parses_integrated_loudness_summary() {
-        let stderr = r#"
-[Parsed_ebur128_0 @ 00000234] Summary:
-
-  Integrated loudness:
-    I:         -23.5 LUFS
-    Threshold: -33.8 LUFS
-
-  Loudness range:
-    LRA:         7.2 LU
-"#;
-        assert_eq!(parse_integrated_lufs(stderr), Some(-23.5));
-    }
-
-    #[test]
-    fn ignores_threshold_lines_and_missing_values() {
-        assert_eq!(parse_integrated_lufs("Threshold: -33.8 LUFS"), None);
-        assert_eq!(parse_integrated_lufs("I: -inf LUFS"), None);
-        assert_eq!(parse_integrated_lufs("no loudness here"), None);
-    }
     // ── 转换项校验（P0-2）────────────────────────────────────────
 
     use super::{build_convert_args, validate_items, ConvertItem, Reject};
@@ -1104,5 +1152,91 @@ mod tests {
         CONVERT_FLAGS.lock().remove(&9_000_001);
         CONVERT_FLAGS.lock().remove(&9_000_002);
         assert_eq!(convert_tasks(), 0, "用例收尾要把表还原");
+    }
+
+    // ── 流式执行：stdout 边读边交给调用方（响度链路用）──────────────
+
+    use super::{exec_stream, last_lines};
+
+    /// 收字节的接收端；`reject` 非空 = 第一块就喊停（验「接收方报错不该拖到超时」）
+    #[derive(Default)]
+    struct Sink {
+        got: Vec<u8>,
+        reject: Option<String>,
+    }
+
+    impl Sink {
+        fn feed(&mut self, b: &[u8]) -> Result<(), String> {
+            if let Some(msg) = &self.reject {
+                return Err(msg.clone());
+            }
+            self.got.extend_from_slice(b);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_streamed_child_hands_over_its_stdout_and_reports_the_exit_code() {
+        let _serial = serial();
+        let (exe, args) = echo("hi");
+        let mut sink = Sink::default();
+        let s = exec_stream(exe, &args, Duration::from_secs(20), 4, |b| sink.feed(b));
+        assert!(s.error.is_none(), "{:?}", s.error);
+        assert_eq!(s.code, 0);
+        assert_eq!(String::from_utf8_lossy(&sink.got).trim(), "hi", "小缓冲也要把流收全（分块不丢字节）");
+        assert_eq!(live_count_for_test(), 0, "流式收尾同样要摘表");
+    }
+
+    /// 接收方喊停：立刻掐掉子进程并回收，而不是停在「不再读」上让 ffmpeg 堵在写满的
+    /// 管道里、一路等到超时
+    #[test]
+    fn a_receiver_that_stops_early_kills_the_child_instead_of_waiting_the_timeout() {
+        let _serial = serial();
+        let (exe, args) = if cfg!(windows) {
+            (PathBuf::from("cmd.exe"), vec!["/C".into(), "echo a& ping -n 30 127.0.0.1>nul".into()])
+        } else {
+            (PathBuf::from("sh"), vec!["-c".into(), "echo a; sleep 30".into()])
+        };
+        let mut sink = Sink { reject: Some("接收方不再要了".into()), got: Vec::new() };
+        let t0 = Instant::now();
+        let s = exec_stream(exe, &args, Duration::from_secs(120), 4096, |b| sink.feed(b));
+        let dt = t0.elapsed();
+        let why = s.error.as_deref().unwrap_or("");
+        assert!(why.contains("接收方不再要了"), "要把接收方的原因带出来，别糊成超时：{why:?}");
+        assert!(dt < Duration::from_secs(20), "不该等到超时才回：{dt:?}");
+        assert_eq!(live_count_for_test(), 0, "提前收手也要把子进程回收干净");
+    }
+
+    #[test]
+    fn a_streamed_timeout_kills_and_reaps_the_child() {
+        let _serial = serial();
+        let (exe, args) = sleeper(30);
+        let t0 = Instant::now();
+        let s = exec_stream(exe, &args, Duration::from_millis(300), 4096, |_| Ok(()));
+        let dt = t0.elapsed();
+        assert!(s.error.as_deref().unwrap_or("").contains("超时"), "{:?}", s.error);
+        assert!(dt < Duration::from_secs(10), "到点就回：{dt:?}");
+        assert_eq!(live_count_for_test(), 0);
+    }
+
+    /// 响度链路走的是这条通道，退出闸门必须同样挡得住它
+    #[test]
+    fn no_stream_child_is_born_after_kill_all() {
+        let _serial = serial();
+        kill_all();
+        let (exe, args) = echo("hi");
+        let mut sink = Sink::default();
+        let s = exec_stream(exe, &args, Duration::from_secs(10), 4096, |b| sink.feed(b));
+        assert!(s.error.as_deref().unwrap_or("").contains("退出"), "{:?}", s.error);
+        assert!(sink.got.is_empty(), "闸门关上后不该有输出");
+        assert_eq!(live_count_for_test(), 0);
+        reopen_after_test();
+    }
+
+    #[test]
+    fn stderr_tail_collapses_to_the_last_nonempty_lines() {
+        assert_eq!(last_lines("a\n\n  \nb\nc\nd\n"), "b | c | d", "只留最后 3 个非空行");
+        assert_eq!(last_lines("short\n"), "short", "不足 3 行不补齐");
+        assert_eq!(last_lines(""), "", "没内容就别留个空壳");
     }
 }

@@ -1,19 +1,19 @@
 //! AI 批量任务的**执行器**：一批文本 → 按档位分块并发 → 每行译文（失败回退原文）。
 //!
 //! 从 `ai_job.rs` 拆出来是为了守 Rust 单文件 ≤400 行的红线（第 12 批），职责边界也正好切开：
-//! `ai_job` 管「任务表 + 事件」，这里管「一批文本怎么变成译文」。三条口径都在本文件：
+//! `ai_job` 管「任务表 + 事件流」，`ai_file` 管「单文件的豁免/缓存/落盘」，这里管「分块并发 +
+//! 跨线程共享的任务状态（Hub）」，「块内的重试与对半拆开」在 `ai_batch.rs`。口径：
 //! - 参数（批量大小 / 并发 / 超时 / 重试）来自 `ai_strategy::Strategy` 的外接 vs 本地档位；
 //! - 逐块 tick 事件限速 —— 一个 300 行字幕就是 20 条 tick，而每条都要 UI 线程执行一次脚本，
-//!   前端还不消费它们（只认 file-* 与 cancelled），发得越快越是纯开销；
+//!   发得越快越是纯开销；
 //! - 连续「端点连不上」够 `DEAD_LIMIT` 次就自动按停止处理：否则接口一挂，几百个文件会被
 //!   逐个敲一遍连接拒绝，用户既等不到结束也看不到原因。
 
-use crate::ai_job::{progress, Loc};
+use crate::ai_batch::translate_range;
+use crate::ai_event::{progress, Loc};
 use crate::ai_prompt as prompt;
 use crate::ai_strategy::{ModelKind, Strategy};
-use crate::subtitles as subs;
 use parking_lot::Mutex;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,35 +21,49 @@ use tauri::{AppHandle, Emitter};
 
 /// 连续多少次「端点连不上」就判定这批没救了。3 次 = 已经重试过，仍然全是连接失败。
 const DEAD_LIMIT: usize = 3;
+/// 连续多少次「请求超时」就按失联收场。超时会触发块内对半拆开（`ai_batch`），拆两级
+/// （≈4 个超时）还没落地说明端点已经拖不动了；12 次给足余量，同时把最坏成本钉死。
+const TIMEOUT_ABORT_LIMIT: usize = 12;
 /// 逐块 tick 的最小间隔
 const TICK_GAP: Duration = Duration::from_millis(500);
 
-/// 模型接入三件套（字段名与 `AiChatPayload` 对齐）。
+/// 模型接入四件套（字段名与 `AiChatPayload` 对齐）。
 /// API Key 用 `Zeroizing` 装：`Hub` 是每个请求任务都被 `Arc::clone` 的长期持有者，
 /// 任务结束时必须把这份副本也擦掉（P0-3）。
 pub struct Creds {
-    base_url: String,
-    api_key: zeroize::Zeroizing<String>,
-    model: String,
+    pub(crate) base_url: String,
+    pub(crate) api_key: zeroize::Zeroizing<String>,
+    pub(crate) model: String,
+    /// 接口协议：请求的 URL/鉴权头/线形状与响应解析都跟着它走
+    pub(crate) api_style: crate::model::ApiStyle,
 }
 
-pub fn creds_of(base_url: &str, api_key: &str, model: &str) -> Creds {
+pub fn creds_of(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    api_style: crate::model::ApiStyle,
+) -> Creds {
     Creds {
         base_url: base_url.to_string(),
         api_key: zeroize::Zeroizing::new(api_key.to_string()),
         model: model.to_string(),
+        api_style,
     }
 }
 
 /// 一次任务运行期跨线程共享的部分：会被 `Arc::clone` 进每个请求任务。
 pub struct Hub {
-    creds: Creds,
+    /// 块内重试（`ai_batch`）要用它拼请求；本模块外只读
+    pub(crate) creds: Creds,
     /// 端点地址校验的结果（P0-3）：地址不合规时一条都不该发，别等每块都撞一遍
     ready: Result<(), String>,
     pub st: Strategy,
     pub cancel: Arc<AtomicBool>,
     /// 连续「端点连不上」的次数；任何一次成功都清零
     dead: AtomicUsize,
+    /// 连续「请求超时」的次数；任何一次成功都清零（见 `note_timeout`）
+    timeout_streak: AtomicUsize,
     /// 够数之后就锁死，**不再被清零**：判定失联后仍可能有在途请求成功回来，
     /// 那不能把「这批其实中途停了」这件事洗掉（否则用户只看到「翻译完成」）。
     aborted: AtomicBool,
@@ -67,13 +81,14 @@ impl Hub {
         merge_lines: Option<usize>,
         cancel: Arc<AtomicBool>,
     ) -> Arc<Self> {
-        let ready = crate::ai_url::check(&creds.base_url).map(|_| ());
+        let ready = crate::ai_url::check_for_app(&creds.base_url).map(|_| ());
         Arc::new(Self {
             creds,
             ready,
             st: Strategy::resolve(kind, chunk_size, concurrency, merge_lines),
             cancel,
             dead: AtomicUsize::new(0),
+            timeout_streak: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
             dead_reason: Mutex::new(None),
             emit_err_logged: AtomicBool::new(false),
@@ -85,7 +100,7 @@ impl Hub {
         self.ready.clone()
     }
 
-    fn emit(&self, app: &AppHandle, p: crate::ai_job::AiProgress) {
+    fn emit(&self, app: &AppHandle, p: crate::ai_event::AiProgress) {
         if let Err(e) = app.emit("ai:progress", p) {
             if !self.emit_err_logged.swap(true, Ordering::Relaxed) {
                 // 投递不出去 = UI 线程的消息队列被灌满了。以前这里 `let _ =` 吞掉，
@@ -96,7 +111,7 @@ impl Hub {
     }
 
     /// 记一次「连不上」。够数了就等于用户按了停止 —— 后面的文件没必要再敲。
-    fn note_dead(&self, why: String) {
+    pub(crate) fn note_dead(&self, why: String) {
         if self.dead.fetch_add(1, Ordering::SeqCst) + 1 >= DEAD_LIMIT {
             *self.dead_reason.lock() = Some(why);
             self.aborted.store(true, Ordering::SeqCst);
@@ -104,8 +119,20 @@ impl Hub {
         }
     }
 
-    fn succeeded(&self) {
+    /// 记一次「请求超时」，够数了与 `note_dead` 同一套收场：超时已经触发块内对半拆开，
+    /// 拆了还回回超时就不是批次大小的问题，是端点拖不动了 —— 别让几百个文件各白等
+    /// 十几个超时才收场。
+    pub(crate) fn note_timeout(&self, why: String) {
+        if self.timeout_streak.fetch_add(1, Ordering::SeqCst) + 1 >= TIMEOUT_ABORT_LIMIT {
+            *self.dead_reason.lock() = Some(why);
+            self.aborted.store(true, Ordering::SeqCst);
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn succeeded(&self) {
         self.dead.store(0, Ordering::SeqCst);
+        self.timeout_streak.store(0, Ordering::SeqCst);
     }
 
     /// 失联到值得中断整条队列时，回原因（`ai_job` 把它放进收尾事件的 error）
@@ -114,97 +141,45 @@ impl Hub {
     }
 }
 
-/// 一次任务运行期的上下文（逐块循环与单个文件都用同一份）
-pub struct Run<'a> {
-    app: &'a AppHandle,
-    task_id: u64,
+/// 一次任务运行期的上下文（逐块循环与单个文件都用同一份）。
+/// 拥有 `AppHandle` 与**全局并发池**：分块并发不再按文件各开各的 —— 前一个文件还没
+/// 飞完的块和后一个文件刚切好的块在同一个信号量里排队，文件边界不再有「等池子排空
+/// 才开始切下一份」的空转（`ai_job::file_task` 的流水线靠它吃满并发）。
+pub struct Run {
+    app: AppHandle,
+    /// 事件认领用：每个任务的 ai:progress 都带它
+    pub(crate) task_id: u64,
     pub hub: Arc<Hub>,
+    sem: Arc<tokio::sync::Semaphore>,
 }
 
-impl<'a> Run<'a> {
-    pub fn new(app: &'a AppHandle, task_id: u64, hub: Arc<Hub>) -> Self {
-        Self { app, task_id, hub }
-    }
-
-    pub fn emit(&self, p: crate::ai_job::AiProgress) {
-        self.hub.emit(self.app, p)
-    }
-}
-
-/// 翻译单个字幕文件。Ok(None) = 被取消。带「已翻译豁免 + 复用缓存」：
-/// - 源文件没变且 .zh 译文还在 → 直接复用（不读内容、不烧 token）；
-/// - 原文内容命中复用缓存 → 把缓存里那份译文写出来（也不用烧 token）；
-/// - 否则走 AI，翻完把「源指纹账」和「内容缓存」都落库。
-pub async fn translate_one(run: &Run<'_>, loc: Loc<'_>, path: &str) -> Result<Option<String>, String> {
-    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    let out_path = prompt::translated_path(path, &ext);
-    let db = crate::paths::library_db_path();
-
-    // 0) 已翻译可豁免：源没变 + 译文还在 → 直接复用现成的 .zh.*，不重翻。
-    if crate::ai_cache::stat(path)
-        .map(|st| crate::db::with_db_text(&db, |c| Ok(crate::ai_cache::subtitle_exempt(c, path, &out_path, &st))).unwrap_or(false))
-        .unwrap_or(false)
-    {
-        return Ok(Some(out_path));
-    }
-
-    let content = crate::limits::read_text_capped(std::path::Path::new(path), crate::limits::MAX_TEXT_BYTES)
-        .map_err(|e| format!("读取失败: {e}"))?;
-    let content_hash = crate::ai_cache::hash(prompt::SUBTITLE_PROMPT_VERSION, content.as_bytes());
-
-    // 1) 内容命中复用缓存：译文直接来自缓存，跳过 AI。
-    {
-        let cached: Option<String> =
-            crate::db::with_db_text(&db, |c| crate::ai_cache::get_content(c, &content_hash).map_err(|e| e.to_string()))
-                .map_err(|e| format!("读复用缓存失败: {e}"))?;
-        if let Some(rendered) = cached {
-            crate::atomic::write_str(std::path::Path::new(&out_path), &rendered).map_err(|e| format!("写入失败: {e}"))?;
-            let _ = record_lookup(path, &out_path, &content_hash);
-            return Ok(Some(out_path));
+impl Run {
+    pub fn new(app: AppHandle, task_id: u64, hub: Arc<Hub>) -> Self {
+        Self {
+            app,
+            task_id,
+            sem: Arc::new(tokio::sync::Semaphore::new(hub.st.concurrency)),
+            hub,
         }
     }
 
-    let doc = subs::parse(&content, &ext).ok_or_else(|| format!("不支持的字幕格式: .{ext}"))?;
-    if doc.segment_count() == 0 {
-        return Err("没有可翻译的文本".into());
+    pub fn emit(&self, p: crate::ai_event::AiProgress) {
+        self.hub.emit(&self.app, p)
     }
-    let translated = match translate_chunks(run, loc, doc.segments()).await {
-        Some(list) => list,
-        None => return Ok(None),
-    };
-    let rendered = doc.render(&translated);
-    crate::atomic::write_str(std::path::Path::new(&out_path), &rendered).map_err(|e| format!("写入失败: {e}"))?;
-    // 记账 + 内容缓存：失败只回退到「少了一级缓存」，不把翻译主流程挡住。
-    let _ = record_lookup(path, &out_path, &content_hash).and_then(|_| {
-        crate::db::with_db_text(&db, |c| {
-            crate::ai_cache::put_content(c, &content_hash, &rendered).map_err(|e| format!("写内容缓存失败: {e}"))
-        })
-    });
-    Ok(Some(out_path))
-}
-
-/// 把「源文件 → 这次翻出来的 .zh」记进豁免账，附上配对的音频路径。
-fn record_lookup(path: &str, out_path: &str, content_hash: &str) -> Result<(), String> {
-    let db = crate::paths::library_db_path();
-    let audio = crate::ai_cache::audio_of(path);
-    let Some(st) = crate::ai_cache::stat(path) else {
-        return Ok(()); // 源已被删，账记不记都无所谓
-    };
-    crate::db::with_db_text(&db, |c| {
-        crate::ai_cache::record_subtitle(c, path, out_path, &st, content_hash, audio.as_deref())
-            .map_err(|e| format!("记录翻译账失败: {e}"))
-    })
 }
 
 /// 逐块并发翻译，块级取消。**返回一定与 `texts` 等长**：失败的块回退原文，绝不吐空行。
+/// 同时带回「有多少行最终回退了原文」—— 这是「翻译跑完」与「翻译翻好了」的差值，
+/// 调用方必须把它带给用户（`file-done` 的 `fallbackLines`），不许静默。
 /// `None` = 被取消（调用方别写盘）。
-pub async fn translate_chunks(run: &Run<'_>, loc: Loc<'_>, texts: &[String]) -> Option<Vec<String>> {
+pub async fn translate_chunks(run: &Run, loc: Loc<'_>, texts: &[String]) -> Option<(Vec<String>, usize)> {
     let st = run.hub.st;
     let ranges = prompt::chunk_ranges(texts.len(), st.chunk_size);
     let total = ranges.len();
-    let mut results: Vec<Option<Vec<String>>> = vec![None; total];
+    let mut results: Vec<Option<(Vec<String>, usize)>> = vec![None; total];
 
-    let sem = Arc::new(tokio::sync::Semaphore::new(st.concurrency));
+    // 全局并发池（Run 持有）：同一任务里所有文件的所有块共用一个信号量
+    let sem = Arc::clone(&run.sem);
     let mut set = tokio::task::JoinSet::new();
     for (idx, (start, end)) in ranges.iter().copied().enumerate() {
         let permit = Arc::clone(&sem);
@@ -224,9 +199,7 @@ pub async fn translate_chunks(run: &Run<'_>, loc: Loc<'_>, texts: &[String]) -> 
     while let Some(joined) = set.join_next().await {
         let Ok((idx, out)) = joined else { continue };
         done += 1;
-        if let Some(translated) = out {
-            results[idx] = Some(translated);
-        }
+        results[idx] = out;
         if done == total || last_tick.elapsed() >= TICK_GAP {
             last_tick = Instant::now();
             let mut p = progress(run.task_id, "chunk-done", loc);
@@ -243,97 +216,32 @@ pub async fn translate_chunks(run: &Run<'_>, loc: Loc<'_>, texts: &[String]) -> 
     if run.hub.cancel.load(Ordering::SeqCst) {
         return None;
     }
-    let flat: Vec<String> = results
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, r)| {
-            let (start, end) = ranges[i];
-            r.unwrap_or_else(|| texts[start..end].to_vec()).into_iter()
-        })
-        .collect();
-    Some(prompt::fill_missing(flat, texts))
-}
-
-/// 一批文本的翻译：按档位重试；本地档位解析失败时**对半拆开再试** —— 小模型给 8 行更容易漏
-/// 编号，拆开还能救回大部分，而不是整批退回原文。返回 None = 一批都没翻出来 / 被取消。
-async fn translate_range(hub: &Arc<Hub>, texts: &[String]) -> Option<Vec<String>> {
-    let n = texts.len();
-    let mut out: Vec<Option<String>> = vec![None; n];
-    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
-    queue.push_back((0, n));
-    let mut any_ok = false;
-    while let Some((a, b)) = queue.pop_front() {
-        if hub.cancel.load(Ordering::SeqCst) {
-            return None;
-        }
-        let slice = &texts[a..b];
-        if let Some(list) = attempt_batch(hub, slice).await {
-            for (i, t) in list.into_iter().enumerate() {
-                out[a + i] = Some(t);
+    let mut fallback = 0usize;
+    let mut flat: Vec<String> = Vec::with_capacity(texts.len());
+    for (i, r) in results.into_iter().enumerate() {
+        let (start, end) = ranges[i];
+        match r {
+            Some((list, fb)) => {
+                fallback += fb;
+                flat.extend(list);
             }
-            any_ok = true;
-        } else if hub.st.bisect && b - a > 1 {
-            let mid = (a + b) / 2;
-            queue.push_back((a, mid));
-            queue.push_back((mid, b));
+            None => {
+                fallback += end - start;
+                flat.extend_from_slice(&texts[start..end]);
+            }
         }
     }
-    any_ok.then(|| {
-        out.into_iter()
-            .enumerate()
-            .map(|(i, r)| r.unwrap_or_else(|| texts[i].clone()))
-            .collect()
-    })
-}
-
-/// 一批：最多 `attempts` 次尝试，中间退避；每次尝试的失败原因交给 `Hub` 分类计数。
-async fn attempt_batch(hub: &Arc<Hub>, texts: &[String]) -> Option<Vec<String>> {
-    let payload = crate::model::AiChatPayload {
-        base_url: hub.creds.base_url.clone(),
-        api_key: hub.creds.api_key.to_string(),
-        model: hub.creds.model.clone(),
-        messages: vec![
-            crate::model::ChatMessage { role: "system".into(), content: prompt::SYSTEM_PROMPT.into() },
-            crate::model::ChatMessage { role: "user".into(), content: prompt::numbered_prompt(texts) },
-        ],
-        temperature: Some(0.3),
-        // 字幕一次要回多行，`04 §7.6.4` 那条按单行原文收紧的公式不适用，这里维持不限制
-        max_tokens: None,
-    };
-    for i in 0..hub.st.attempts.max(1) {
-        match crate::ai::chat_completion(&payload, hub.st.timeout_ms).await {
-            Ok(reply) => {
-                if let Some(mut parsed) = prompt::parse_numbered_reply(&reply, texts.len()) {
-                    for (j, t) in parsed.iter_mut().enumerate() {
-                        if t.is_empty() {
-                            *t = texts[j].clone();
-                        }
-                    }
-                    hub.succeeded();
-                    return Some(parsed);
-                }
-            }
-            Err(e) => {
-                if e.is_dead_endpoint() {
-                    hub.note_dead(e.text());
-                }
-            }
-        }
-        if i + 1 < hub.st.attempts && hub.st.retry_delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(hub.st.retry_delay_ms)).await;
-        }
-    }
-    None
+    Some((flat, fallback))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai_job::AiProgress;
+    use crate::ai_event::AiProgress;
 
     fn hub() -> Arc<Hub> {
         Hub::for_job(
-            creds_of("http://x", "", "m"),
+            creds_of("http://x", "", "m", Default::default()),
             ModelKind::Remote,
             None,
             None,
@@ -379,7 +287,29 @@ mod tests {
         assert_eq!(h.fatal().as_deref(), Some("请求失败: 连接被拒绝"), "已经按中断处理了，原因得留住");
     }
 
-    /// 编译级防线：`emit` 的载荷必须仍是 ai_job 的那个事件结构（字段变了这里就红）
+    /// 连续超时同样按失联收场：超时会触发块内对半拆开，拆了还回回超时就不是批次大小的问题。
+    /// 中间成功一次就重新数 —— 「偶尔慢」和「拖不动」要分得开。
+    #[test]
+    fn consecutive_timeouts_abort_the_queue() {
+        let h = hub();
+        for _ in 0..TIMEOUT_ABORT_LIMIT - 1 {
+            h.note_timeout("请求超时：模型可能正在思考或加载权重".into());
+        }
+        assert!(!h.cancel.load(Ordering::SeqCst), "差一次就停，不能提前");
+        h.note_timeout("请求超时：模型可能正在思考或加载权重".into());
+        assert!(h.cancel.load(Ordering::SeqCst), "够数就按停止处理");
+        assert_eq!(h.fatal().as_deref(), Some("请求超时：模型可能正在思考或加载权重"), "原因要能带给用户");
+
+        let h2 = hub();
+        h2.note_timeout("t".into());
+        h2.succeeded();
+        for _ in 0..TIMEOUT_ABORT_LIMIT - 1 {
+            h2.note_timeout("t".into());
+        }
+        assert!(!h2.cancel.load(Ordering::SeqCst), "中间成功过就重新数");
+    }
+
+    /// 编译级防线：`emit` 的载荷必须仍是 ai_event 的那个事件结构（字段变了这里就红）
     #[test]
     fn progress_event_still_carries_the_task_scope() {
         let p: AiProgress = progress(7, "file-start", Loc::new("a.lrc", 1, 3));

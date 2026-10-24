@@ -1,13 +1,17 @@
 //! 应用装配：插件/托盘/关窗到托盘/单实例/命令注册。
 
 mod ai;
+mod ai_batch;
 mod ai_cache;
 mod ai_chunk;
+mod ai_event;
 mod ai_export;
+mod ai_file;
 mod ai_job;
 mod ai_prompt;
 mod ai_scan;
 mod ai_strategy;
+mod ai_translated;
 mod ai_url;
 mod ai_wire;
 mod atomic;
@@ -19,6 +23,7 @@ mod ffprobe;
 mod fftools;
 mod journal;
 mod limits;
+mod loudness;
 mod model;
 mod paths;
 mod player;
@@ -35,7 +40,7 @@ mod watcher;
 use state::AppWindowsState;
 use tauri::tray::TrayIconBuilder;
 use tauri::menu::{Menu, MenuItem};
-use tauri::{Emitter, Manager, WindowEvent};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// PlayerCore 从 player 模块导出
 pub use player::PlayerCore;
@@ -51,9 +56,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }))
         .setup(|app| {
-            // 数据目录与封面目录（沿用 Electron 版 userData 路径）
-            let _ = paths::ensure_data_dir();
+            // 数据目录 = 安装目录旁的 `data/`。先建目录、再搬老位置的数据，顺序不能反：
+            // 搬迁的判据是「新目录还是空的」，先建封面目录就把这条判据污染了。
+            let data_usable = paths::ensure_data_dir().is_ok();
+            let moved = paths::migrate_legacy_data();
             let _ = paths::ensure_covers_dir();
+            if !data_usable {
+                state::startup_warn(format!(
+                    "安装目录不可写，曲库与设置存不下来：请把应用装到一个可写的目录里（数据目录 {}）",
+                    paths::data_dir().display()
+                ));
+            }
+            if moved > 0 {
+                paths::append_log(&format!(
+                    "[迁移] 老数据目录的 {moved} 项已搬进安装目录 {}",
+                    paths::data_dir().display()
+                ));
+            }
             db::check_integrity();
             // P1-11：改名与旧 ID 迁移都跨「文件系统 + 曲库 + 设置」三处，崩在中间留下的是一半
             // 改完的盘和一本没写完的账。启动时先把没删掉的意图核对一遍：改名只补账、不动盘；
@@ -93,6 +112,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             state::set_app_handle(app.handle().clone());
             app.manage(AppWindowsState::new());
             app.manage(PlayerCore::new(app.handle().clone()));
+
+            // 主窗口在代码里建（配置里那条已删，`app.windows` 留空）。原因是 WebView 的
+            // 数据文件夹（localStorage / Cookie / 缓存）：配置项 `dataDirectory` 只能写
+            // 「相对 appDataDir」的路径，写不出安装目录，而它一缺位 Tauri 就把这份数据
+            // 放回 `%LOCALAPPDATA%/<identifier>`。悬浮窗用同一份，见 `commands::player`。
+            let mut main_win = WebviewWindowBuilder::new(
+                app.handle(),
+                "main",
+                WebviewUrl::App("index.html".into()),
+            )
+            .title("KX Player")
+            .inner_size(1200.0, 800.0)
+            .min_inner_size(900.0, 600.0)
+            .decorations(false)
+            .transparent(true)
+            .center();
+            if let Some(dir) = paths::webview_data_dir_if_usable() {
+                main_win = main_win.data_directory(dir);
+            }
+            main_win.build()?;
 
             build_tray(app)?;
             Ok(())
@@ -230,6 +269,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::system::ai_chat,
             commands::system::ai_ping,
             commands::system::ai_list_models,
+            commands::system::ai_endpoint_check,
+            commands::system::ai_plaintext_set,
+            commands::system::ai_translated_list,
+            commands::system::ai_translated_cleanup,
+            commands::system::ai_translated_remove,
+            commands::system::ai_translated_remove_source,
             commands::system::ai_translate_start,
             commands::system::ai_texts_start,
             commands::system::ai_task_cancel,

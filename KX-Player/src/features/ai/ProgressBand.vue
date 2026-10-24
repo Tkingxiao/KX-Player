@@ -3,11 +3,14 @@
   字段顺序锁死：已完成/总数 · 条目每分 · 当前项(截断) · 失败数。
   · 条目每分 = 已完成数 ÷ 已跑秒数 × 60，前端现算（不依赖新契约）；
   · 缓存命中率/平均耗时**不显示**：AiProgress 没有字段，不许假数据填位（设计包 §5.1）；
+  · 填充条在文件粒度上按当前文件的块进度（chunk-done 心跳）内插：大文件翻译期间
+    条子也在走，不再凝固 —— 数字的口径不变，条与条之间由填充条说话（runPercent）；
   · 仅进行中渲染，静止时整个组件不存在（不留骨架位、不做装饰）；
   · 左缘 accent 光泽 = 页面级签名（DESIGN.md §8），prefers-reduced-motion 降静态。
 -->
 <script setup lang="ts">
 import { computed } from 'vue'
+import { runPercent } from './queueStats'
 
 const props = defineProps<{
   done: number
@@ -16,6 +19,9 @@ const props = defineProps<{
   elapsedSec: number
   currentItem?: string
   failed: number
+  /** 当前文件的块进度（chunk-done 心跳；缺席时填充条退回文件粒度） */
+  chunkDone?: number
+  chunkTotal?: number
 }>()
 
 const emit = defineEmits<{ (e: 'open-failures'): void }>()
@@ -25,7 +31,7 @@ const perMinute = computed(() => {
   return Math.max(1, Math.round((props.done / props.elapsedSec) * 60))
 })
 
-const percent = computed(() => (props.total > 0 ? Math.round((props.done / props.total) * 100) : 0))
+const percent = computed(() => runPercent(props.done, props.total, props.chunkDone, props.chunkTotal))
 </script>
 
 <template>

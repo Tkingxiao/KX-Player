@@ -214,29 +214,32 @@ pub async fn pip_open(app: AppHandle, x: i32, y: i32, w: u32, h: u32) -> bool {
     let is_new = app.get_webview_window("pip").is_none();
     let pip = match app.get_webview_window("pip") {
         Some(win) => win,
-        None => match WebviewWindowBuilder::new(
-            &app,
-            "pip",
-            WebviewUrl::App("index.html".into()),
-        )
-        .title("KX 悬浮窗")
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(true)
-        // 窗口 = 画面 + 四周留白，且比例锁死，所以下限只要不妨碍最小的预设档即可
-        .min_inner_size(120.0, 80.0)
-        .focused(false)
-        .build()
-        {
-            Ok(win) => win,
-            Err(e) => {
-                crate::paths::append_log(&format!("[pip] 创建悬浮窗失败: {e}"));
-                app.state::<PlayerCore>().mark_pip_active(false);
-                return false;
+        None => {
+            let mut builder =
+                WebviewWindowBuilder::new(&app, "pip", WebviewUrl::App("index.html".into()))
+                    .title("KX 悬浮窗")
+                    .decorations(false)
+                    .transparent(true)
+                    .always_on_top(true)
+                    .skip_taskbar(true)
+                    .resizable(true)
+                    // 窗口 = 画面 + 四周留白，且比例锁死，所以下限只要不妨碍最小的预设档即可
+                    .min_inner_size(120.0, 80.0)
+                    .focused(false);
+            // WebView 数据文件夹与主窗口共用一份：一半自定义一半默认会各起一个浏览器进程。
+            // 安装目录不可写时这里返回 None，两个窗口一起回落到 Tauri 的默认位置。
+            if let Some(dir) = crate::paths::webview_data_dir_if_usable() {
+                builder = builder.data_directory(dir);
             }
-        },
+            match builder.build() {
+                Ok(win) => win,
+                Err(e) => {
+                    crate::paths::append_log(&format!("[pip] 创建悬浮窗失败: {e}"));
+                    app.state::<PlayerCore>().mark_pip_active(false);
+                    return false;
+                }
+            }
+        }
     };
     // 必须在 show() 之前声明：显示浮窗会让主窗口失焦，那次 Focused(false) 早于
     // attach 到达的话会把视频层一起隐藏（小窗只剩声音）。

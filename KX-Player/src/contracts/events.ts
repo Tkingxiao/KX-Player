@@ -13,6 +13,8 @@ export interface LoudnessProgress {
   total: number
   current: string
   done: number
+  /** 测准了但没有有效响度（数字静音）：不写库，也不该记进失败 */
+  silent: number
   failed: number
   finished: boolean
   cancelled: boolean

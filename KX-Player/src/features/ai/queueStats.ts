@@ -14,6 +14,8 @@ export type QueueRowState = 'pending' | 'running' | 'done' | 'failed' | 'skipped
 
 export interface QueueStatRow {
   state: QueueRowState
+  /** file-done 带回的「回退原文」行数：done 行也可能没翻干净（部分未翻） */
+  fallback?: number
 }
 
 export interface QueueStat {
@@ -64,6 +66,21 @@ export interface RunSummary {
   skipped: number
 }
 
+/**
+ * 进度带填充条的百分比：文件粒度做骨架，当前文件用块进度（chunk-done 心跳）内插 ——
+ * 不内插的话，大文件翻译期间整条进度带凝固在原地，看起来像卡死（tick 一直在发，
+ * 只是没人消费）。chunk 信息缺席（两文件的间隙 / 收尾时刻）自动退回文件粒度。
+ * `done/total` 的数字仍按文件数走（设计包 §4 锁死字段口径），条与条之间由填充条说话。
+ */
+export function runPercent(done: number, total: number, chunkDone?: number, chunkTotal?: number): number {
+  if (total <= 0) return 0
+  const frac =
+    chunkTotal !== undefined && chunkTotal > 0
+      ? Math.min(Math.max(chunkDone ?? 0, 0), chunkTotal) / chunkTotal
+      : 0
+  return Math.min(100, Math.round(((done + frac) / total) * 100))
+}
+
 /** 只统计快照里的那批行：path 不在 runPaths 的（历史完成、中途扫进来的）一律不算 */
 export function summarizeRun(
   runPaths: readonly string[],
@@ -105,14 +122,21 @@ export function resetOne<T extends QueueStatRow & { error?: string; path: string
 }
 
 /**
- * 手动重译一条已豁免的行（AI-15）：扫描时默认把「已翻译」行标记为 exempt 跳过，
- * 用户想重翻某个文件时点行内「重译」= 把这行放回 pending。铁律同 resetOne：
- * 不改顺序、不增删行 —— 导出批次的序号绑整个队列，动序就全错。
- * 返回是否放回队列（找不到 / 不是 exempt 都返回 false）。
+ * 行内重译（AI-15 + 部分未翻）：按 path 定位，两种行放得回队列 ——
+ * · `exempt`：已翻译豁免（扫描默认跳过），用户点名重翻；
+ * · `done` 且 `fallback > 0`：「完成」但混着原文的行，不重译就只能一直用着半成品。
+ * 放回时把 `force` 置上：后端对点名的文件绕开豁免账与内容缓存，逼一次真翻译 ——
+ * 否则豁免账/缓存命中只会把旧译文再抄一遍，重译名存实亡。
+ * 与 resetOne 同一条铁律：不改顺序、不增删行 —— 导出批次的序号绑整个队列。
+ * 返回是否放回队列（找不到 / 状态不符都返回 false，视图据此决定要不要提示）。
  */
-export function reenableOne<T extends QueueStatRow & { path: string }>(rows: T[], path: string): boolean {
+export function reenableOne<T extends QueueStatRow & { path: string; force?: boolean }>(rows: T[], path: string): boolean {
   const row = rows.find((r) => r.path === path)
-  if (!row || row.state !== 'exempt') return false
+  if (!row) return false
+  const partial = row.state === 'done' && (row.fallback ?? 0) > 0
+  if (row.state !== 'exempt' && !partial) return false
   row.state = 'pending'
+  row.fallback = undefined
+  row.force = true
   return true
 }

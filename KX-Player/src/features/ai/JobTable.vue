@@ -15,15 +15,32 @@ export interface JobRow {
   state: 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'exempt'
   error?: string
   out?: string
+  /** file-done 带回：本次回退原文的行数（>0 = 完成但没翻干净）与该文件总段数 */
+  fallback?: number
+  segments?: number
+  /** 运行中由 chunk-done 心跳刷新：当前文件翻到第几块 */
+  chunkDone?: number
+  chunkTotal?: number
 }
 
 const props = defineProps<{
   rows: JobRow[]
   /** 表头后面的说明（如「该文件夹下没有找到 .lrc / .srt / .vtt 文件」走空态，不走这里） */
   emptyText?: string
+  /** 开出行首选择列（「只翻译选中的」）；不传 = 整列不渲染 */
+  selectable?: boolean
+  /** 当前选中的文件路径（父组件持有；这里只回事件，不改状态） */
+  selected?: Set<string>
 }>()
 
-const emit = defineEmits<{ (e: 'retry-one', path: string): void; (e: 're-enable-one', path: string): void }>()
+const emit = defineEmits<{
+  (e: 'retry-one', path: string): void
+  (e: 're-enable-one', path: string): void
+  (e: 'toggle-one', path: string): void
+  (e: 'toggle-all', on: boolean): void
+}>()
+
+const allSelected = (): boolean => props.rows.length > 0 && props.rows.every((r) => props.selected?.has(r.path))
 
 const STATE_LABEL: Record<JobRow['state'], string> = {
   pending: '等待',
@@ -50,8 +67,17 @@ const base = (p: string): string => p.split(/[\\/]/).pop() ?? p
 </script>
 
 <template>
-  <div class="job-table" role="table" aria-label="翻译队列">
+  <div class="job-table" :class="{ selectable }" role="table" aria-label="翻译队列">
     <div class="jt-head" role="row">
+      <span v-if="selectable" class="jt-col jt-check" role="columnheader">
+        <input
+          type="checkbox"
+          :checked="allSelected()"
+          :disabled="!rows.length"
+          aria-label="全选队列"
+          @change="emit('toggle-all', !allSelected())"
+        />
+      </span>
       <span class="jt-col jt-state" role="columnheader">状态</span>
       <span class="jt-col jt-name" role="columnheader">文件</span>
       <span class="jt-col jt-out" role="columnheader">译文文件</span>
@@ -65,6 +91,14 @@ const base = (p: string): string => p.split(/[\\/]/).pop() ?? p
       :class="f.state"
       role="row"
     >
+      <div v-if="selectable" class="jt-cell jt-check" role="cell">
+        <input
+          type="checkbox"
+          :checked="selected?.has(f.path) ?? false"
+          :aria-label="`选择 ${f.name}`"
+          @change="emit('toggle-one', f.path)"
+        />
+      </div>
       <div class="jt-cell jt-state" role="cell">
         <span class="jt-state-text">{{ STATE_LABEL[f.state] }}</span>
       </div>
@@ -80,7 +114,12 @@ const base = (p: string): string => p.split(/[\\/]/).pop() ?? p
         <span v-else class="jt-name-text" :title="f.path">{{ f.name }}</span>
       </div>
       <div class="jt-cell jt-out" role="cell">
-        <span v-if="f.out" class="jt-out-text" :title="f.out">→ {{ base(f.out) }}</span>
+        <!-- 运行中：块进度（chunk-done 心跳）；完成：回退行数 —— 两种「没翻完」都要看得见 -->
+        <span v-if="f.state === 'running' && f.chunkTotal" class="jt-chunk tnum">{{ f.chunkDone }}/{{ f.chunkTotal }} 块</span>
+        <template v-else>
+          <span v-if="f.out" class="jt-out-text" :title="f.out">→ {{ base(f.out) }}</span>
+          <span v-if="f.state === 'done' && (f.fallback ?? 0) > 0" class="jt-fallback" title="这些行模型没翻出来，写进文件的是原文；点「重译」重新翻这个文件">部分未翻 {{ f.fallback }}/{{ f.segments }}</span>
+        </template>
       </div>
       <div class="jt-cell jt-op" role="cell">
         <button
@@ -93,6 +132,12 @@ const base = (p: string): string => p.split(/[\\/]/).pop() ?? p
           v-else-if="f.state === 'exempt'"
           class="jt-retry"
           title="该文件已有 .zh.* 译文（默认跳过），点它重新翻译"
+          @click="emit('re-enable-one', f.path)"
+        >重译</button>
+        <button
+          v-else-if="f.state === 'done' && (f.fallback ?? 0) > 0"
+          class="jt-retry"
+          title="这个文件混着没翻出来的原文，点它重新翻译"
           @click="emit('re-enable-one', f.path)"
         >重译</button>
       </div>
@@ -121,6 +166,11 @@ const base = (p: string): string => p.split(/[\\/]/).pop() ?? p
   align-items: center;
   padding: 0 10px;
 }
+/* 选择列：勾选「只翻译选中的」时在最前面多出一格 */
+.job-table.selectable .jt-head,
+.job-table.selectable .jt-row { grid-template-columns: 28px 72px minmax(0, 1fr) minmax(0, 280px) 64px; }
+.jt-check { display: flex; align-items: center; }
+.jt-check input { accent-color: rgb(var(--accent-rgb)); }
 .jt-head {
   height: 32px;
   font-size: 11px;
@@ -165,6 +215,12 @@ const base = (p: string): string => p.split(/[\\/]/).pop() ?? p
 .jt-caret { flex-shrink: 0; font-size: 10px; }
 
 .jt-out-text { font-size: 11.5px; color: var(--success); }
+.jt-chunk { font-size: 11px; color: var(--text-muted); }
+.jt-fallback {
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--danger);
+}
 .jt-retry {
   padding: 3px 10px;
   border: 1px solid var(--border);

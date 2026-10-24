@@ -21,6 +21,7 @@ import AiManualPanel from './AiManualPanel.vue'
 import AiRenamePanel from './AiRenamePanel.vue'
 import AiApiPane from './AiApiPane.vue'
 import AiFolderNamePanel from './AiFolderNamePanel.vue'
+import AiTranslatedPanel from './AiTranslatedPanel.vue'
 import { jobOpts } from './useAiAccess'
 import type { AiProgress, SubtitleScanItem } from '@/contracts/api'
 
@@ -29,11 +30,41 @@ const settings = useSettingsStore()
 const library = useLibraryStore()
 
 type FileState = 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'exempt'
-type FileRow = SubtitleScanItem & { state: FileState; error?: string; out?: string }
+type FileRow = SubtitleScanItem & {
+  state: FileState
+  error?: string
+  out?: string
+  /** 本次回退原文的行数 / 总段数（file-done 带回，>0 = 完成但没翻干净） */
+  fallback?: number
+  segments?: number
+  /** 运行中的块进度（chunk-done 心跳） */
+  chunkDone?: number
+  chunkTotal?: number
+  /** 行内「重译」点的名：本次启动对这个文件绕开豁免账与内容缓存 */
+  force?: boolean
+}
 
 const files = ref<FileRow[]>([])
 const scanning = ref(false)
 const running = ref(false)
+// ── 选择性翻译 ──
+// 勾哪些就翻哪些（与「全翻」按钮并存）；选中状态由这里持有，JobTable 只回事件。
+// 重扫清空（路径换了一批，旧选中不再有意义）。
+const selected = ref<Set<string>>(new Set())
+
+function toggleOne(path: string): void {
+  const next = new Set(selected.value)
+  if (next.has(path)) next.delete(path)
+  else next.add(path)
+  selected.value = next
+}
+
+function toggleAll(on: boolean): void {
+  selected.value = on ? new Set(files.value.map((f) => f.path)) : new Set()
+}
+
+/** 选中且这轮真能跑的行：等待 / 失败 / 已跳过（已翻译豁免的行内用「重译」，不进这批） */
+const selectedRetryable = computed(() => files.value.filter((f) => selected.value.has(f.path) && isRetryable(f)))
 /**
  * 本次运行的范围快照：进度与收尾统计只认它。
  * 旧实现用 files 全量过滤/累加，历史完成的行会混进本次成功率（audit B3），
@@ -59,14 +90,17 @@ const runFailedCount = computed(() => runStat.value.failed)
 const targetDir = computed(() => ui.aiFolder)
 
 // ── 工种切换（DESIGN.md「AI 工作台」§2）：分段控件，不重建页面 ──
-type WorkKind = 'subtitle' | 'foldername' | 'rename'
+type WorkKind = 'subtitle' | 'foldername' | 'rename' | 'translated'
 const workKind = ref<WorkKind>('subtitle')
 /** 工种二的条目数由子组件 emit 回来（父级不再持有一份扫描状态） */
 const dirCount = ref(0)
+/** 译文管理的条目数，同样由子组件 emit 回来 */
+const translatedCount = ref(0)
 const workKinds = computed(() => [
   { key: 'subtitle' as const, label: '字幕翻译', hint: '批量翻译 .lrc / .srt / .vtt，生成 .zh.* 译文文件，不覆盖原文件', count: files.value.length },
   { key: 'foldername' as const, label: '文件夹名翻译', hint: 'AI 生成目录译名，确认后才重命名', count: dirCount.value },
   { key: 'rename' as const, label: '规则改名', hint: '本地规则规范化，先算一遍再应用，整批可回滚', count: 0 },
+  { key: 'translated' as const, label: '译文管理', hint: '管理已翻译的文件：重译、删除译文、清账。已翻译的不占翻译队列', count: translatedCount.value },
 ])
 const rangeLabel = computed(() => {
   if (!targetDir.value) return '未选择文件夹'
@@ -156,9 +190,13 @@ async function rescan(): Promise<void> {
   scanning.value = true
   try {
     const found = await scanSubtitleFiles(ui.aiFolder)
-    // 已翻译可豁免（源没变 + .zh 译文仍在）：扫描默认跳过，点行内「重译」才放回队列（AI-15）
-    files.value = found.map((f) => ({ ...f, state: (f.translated ? 'exempt' : 'pending') as FileState }))
+    // 已翻译（账命中 + 译文还在）的不进队列：它们的家在「译文管理」标签，
+    // 重译 / 删除译文 / 清账都在那边处置 —— 队列只留真正要翻的源文件
+    files.value = found
+      .filter((f) => !f.translated)
+      .map((f) => ({ ...f, state: 'pending' as FileState }))
     runPaths = []
+    selected.value = new Set()
   } catch (e) {
     // 递归扫描整体失败要吭声：静默清空会被当成「这个文件夹没有字幕文件」
     files.value = []
@@ -174,10 +212,15 @@ let job: AiTranslateJob | null = null
  * 已翻译豁免（exempt）不在其列 —— AI-15 要求「扫描时默认跳过」，「开始翻译」默认不重翻；要重译单点行内「重译」。 */
 const isRetryable = (f: FileRow): boolean => f.state === 'pending' || f.state === 'failed' || f.state === 'skipped'
 
-async function startTranslate(): Promise<void> {
+/**
+ * 「全翻」与「只翻选中」共用同一条启动流水：queue 是本次运行的范围快照，
+ * 统计 / 进度 / force 点名都只认它（audit B3）。
+ */
+async function startTranslate(scope?: 'selected'): Promise<void> {
   if (running.value) return
-  const queue = files.value.filter(isRetryable)
-  if (!queue.length) return
+  const pool = scope === 'selected' ? selectedRetryable.value : files.value.filter(isRetryable)
+  if (!pool.length) return
+  const queue = pool
   running.value = true
   runSettled.value = false
   startRunTimer()
@@ -185,9 +228,11 @@ async function startTranslate(): Promise<void> {
   runPaths = queue.map((f) => f.path)
   // 行对象与 paths 同序：Rust 事件的 fileIndex 就是这里的下标
   const paths = queue.map((f) => f.path)
+  // 行内「重译」点过名的文件要真翻译：后端对它们绕开豁免账与内容缓存
+  const forcePaths = queue.filter((f) => f.force).map((f) => f.path)
   // 队列被提前掐断时的原因（端点失联），收尾事件带来
   let aborted = ''
-  job = translateSubtitleFiles({ ...jobOpts(), paths }, (p: AiProgress) => {
+  job = translateSubtitleFiles({ ...jobOpts(), paths, forcePaths }, (p: AiProgress) => {
     applyProgress(queue, p)
     if (p.state === 'queue-finished' && p.error) aborted = p.error
   })
@@ -200,13 +245,22 @@ async function startTranslate(): Promise<void> {
     stopRunTimer()
     runSettled.value = true
     job = null
+    // force 是「这一轮」的点名：跑完就清，下一轮不再绕开省钱闸门
+    for (const r of queue) r.force = false
   }
   const summary = summarizeRun(runPaths, files.value)
   if (aborted) {
     ui.toast(`AI 翻译已中断：${aborted}`, 'error')
     return
   }
-  ui.toast(`AI 翻译完成：成功 ${summary.done}/${summary.total}`, summary.done ? 'success' : 'error')
+  const take = new Set(runPaths)
+  const partial = files.value.filter((r) => take.has(r.path) && r.state === 'done' && (r.fallback ?? 0) > 0).length
+  const base = `AI 翻译完成：成功 ${summary.done}/${summary.total}`
+  if (partial) {
+    ui.toast(`${base}，其中 ${partial} 个文件部分未翻（行内有「重译」）`, 'error')
+  } else {
+    ui.toast(base, summary.done ? 'success' : 'error')
+  }
 }
 
 function stopTranslate(): void {
@@ -216,6 +270,9 @@ function stopTranslate(): void {
 function clearFinished(): void {
   files.value = files.value.filter((f) => f.state === 'pending' || f.state === 'running')
   runPaths = []
+  // 清掉的行从选中集里一并摘除，别让「翻译选中」对着空号
+  const alive = new Set(files.value.map((f) => f.path))
+  selected.value = new Set([...selected.value].filter((p) => alive.has(p)))
 }
 
 /**
@@ -254,8 +311,10 @@ function reEnableOne(path: string): void {
   if (reenableOne(files.value, path)) ui.toast('已把该文件放回翻译队列', 'info')
 }
 
-/** 进度带上的当前项：最后一个 running 行的名字（事件只带来下标，用行状态反推最稳） */
-const currentItem = computed(() => files.value.find((f) => f.state === 'running')?.name ?? '')
+/** 进度带上的当前项：最后一个 running 行（事件只带来下标，用行状态反推最稳）；
+ *  它的块进度同时喂给进度带做填充内插，大文件期间条子也在走 */
+const runningRow = computed(() => files.value.find((f) => f.state === 'running'))
+const currentItem = computed(() => runningRow.value?.name ?? '')
 
 /** 进度带上点「失败 N」：JobTable 的展开态是内部状态，本期先提示到账（第 5 期随 LedgerDrawer 收口） */
 function openFailures(): void {
@@ -278,7 +337,7 @@ onBeforeUnmount(() => { job?.stop() })
 // 且这组键只在 AI 视图有意义 —— 本地监听挂载/卸载即得，不碰全局语义。
 function onKeydown(e: KeyboardEvent): void {
   if (!(e.ctrlKey || e.metaKey) || e.altKey) return
-  const idx = ['1', '2', '3'].indexOf(e.key)
+  const idx = ['1', '2', '3', '4'].indexOf(e.key)
   if (idx < 0) return
   const kinds = workKinds.value
   if (idx >= kinds.length) return
@@ -347,6 +406,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             :elapsed-sec="elapsedSec"
             :current-item="currentItem"
             :failed="runFailedCount"
+            :chunk-done="runningRow?.chunkDone"
+            :chunk-total="runningRow?.chunkTotal"
             @open-failures="openFailures"
           />
           <!-- 汇总播报：只报里程碑（DESIGN.md §7），视觉上隐藏 -->
@@ -360,10 +421,22 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
               <button class="btn-ghost" :disabled="!files.length" @click="clearFinished">清除已完成</button>
               <button v-if="running" class="btn-ghost danger-ghost" @click="stopTranslate">停止</button>
               <button
+                v-if="selected.size && !running"
+                class="btn-primary"
+                :disabled="!selectedRetryable.length || !settings.aiModel"
+                :title="selectedRetryable.length
+                  ? `只翻译选中的 ${selectedRetryable.length} 个文件（选中共 ${selected.size} 个）`
+                  : '选中的文件里没有可翻译的：已翻译的行内用「重译」'
+                "
+                @click="startTranslate('selected')"
+              >
+                {{ `翻译选中（${selectedRetryable.length}）` }}
+              </button>
+              <button
                 class="btn-primary"
                 :disabled="running || !files.filter(isRetryable).length || !settings.aiModel"
                 :title="!settings.aiModel ? '先在左列配置模型服务' : !files.filter(isRetryable).length ? '没有等待中的文件' : ''"
-                @click="startTranslate"
+                @click="startTranslate()"
               >
                 {{ running ? '翻译中…' : `开始翻译（${files.filter(isRetryable).length}）` }}
               </button>
@@ -372,6 +445,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <JobTable
             :rows="files"
             :empty-text="targetDir ? '该文件夹下没有找到 .lrc / .srt / .vtt 文件' : '请先在左列选择目标文件夹'"
+            selectable
+            :selected="selected"
+            @toggle-one="toggleOne"
+            @toggle-all="toggleAll"
             @retry-one="retryOne"
             @re-enable-one="reEnableOne"
           />
@@ -387,6 +464,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         <!-- 规则改名工种：dry-run 只算不改，应用与回滚下一批才有 -->
         <section v-show="workKind === 'rename'" class="wb-work" :aria-hidden="workKind !== 'rename'">
           <AiRenamePanel :target-dir="targetDir" />
+        </section>
+
+        <!-- 译文管理工种：已翻译文件的盘点与处置（active 时才拉数据，切走不打扰） -->
+        <section v-show="workKind === 'translated'" class="wb-work" :aria-hidden="workKind !== 'translated'">
+          <AiTranslatedPanel :active="workKind === 'translated'" @count="translatedCount = $event" />
         </section>
       </div>
     </div>

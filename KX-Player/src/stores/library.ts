@@ -2,6 +2,7 @@
 import { defineStore } from 'pinia'
 import { ref, shallowRef, computed } from 'vue'
 import type { FolderNode, Track, ScanResult, ScanStatus, PlayProgress } from '@/contracts/api'
+import type { LoudnessProgress } from '@/contracts/events'
 import { api, onEvent } from '@/bridge/ipc'
 import { buildFolderMeta, findNodeByPath, collectAllTracks, type FolderMeta } from '@/utils/folderTree'
 import { invalidateFolderCoverMisses } from '@/utils/covers'
@@ -204,22 +205,20 @@ export const useLibraryStore = defineStore('library', () => {
     progress.value = m
   }
 
-  // ── 后台响度分析（ffmpeg ebur128，任务 + 事件）──
-  const loudnessScan = ref({ active: false, completed: 0, total: 0, done: 0, failed: 0, current: '' })
+  // ── 后台响度分析（ffmpeg 出 PCM + Rust 侧 EBU R128 积分，任务 + 事件）──
+  const loudnessScan = ref({ active: false, completed: 0, total: 0, done: 0, silent: 0, failed: 0, current: '' })
   let loudnessListenerBound = false
 
   function bindLoudnessEvents(): void {
     if (loudnessListenerBound) return
     loudnessListenerBound = true
-    onEvent<{
-      completed: number; total: number; current: string; done: number; failed: number
-      finished: boolean; cancelled: boolean
-    }>('loudness:progress', (p) => {
+    onEvent<LoudnessProgress>('loudness:progress', (p) => {
       loudnessScan.value = {
         active: !p.finished,
         completed: p.completed,
         total: p.total,
         done: p.done,
+        silent: p.silent,
         failed: p.failed,
         current: p.current,
       }
@@ -237,7 +236,7 @@ export const useLibraryStore = defineStore('library', () => {
       targets.push([t.id, t.path])
     }
     if (!targets.length) return false
-    loudnessScan.value = { active: true, completed: 0, total: targets.length, done: 0, failed: 0, current: '' }
+    loudnessScan.value = { active: true, completed: 0, total: targets.length, done: 0, silent: 0, failed: 0, current: '' }
     void api.analyzeLoudness(targets)
     return true
   }

@@ -38,7 +38,11 @@ pub struct Plan {
 
 /// 规划：重算预览（与 `rename_preview`、`rename_apply` 用的是同一份纯函数），挑出要问模型的
 /// 条目，命中缓存的直接算数。片段按「键 + 拒绝集」去重 —— 同目录几十条常是同一个词根。
-pub fn plan(conn: &Connection, roots: &[String]) -> Result<Plan, String> {
+/// `only` 非空时只清点**精确命中这些条目路径**的行（文件夹名翻译的「只生成选中的」）：
+/// 预览仍按整根列一遍 —— 路径必须能在这一层里对上号才算数，账外的路径静默落空，
+/// 不存在「前端指哪删哪」的口子。`needed` / `cached` / `missing` 一起收窄，
+/// 报告的口径与实际问出去的请求一致。
+pub fn plan_scoped(conn: &Connection, roots: &[String], only: &[String]) -> Result<Plan, String> {
     let preview = crate::rename::listing::preview_roots(roots);
     if preview.truncated {
         return Err(format!(
@@ -46,7 +50,12 @@ pub fn plan(conn: &Connection, roots: &[String]) -> Result<Plan, String> {
             crate::rename::listing::MAX_ITEMS
         ));
     }
-    let items: Vec<&Item> = preview.items.iter().filter(|i| i.needs_ai).collect();
+    let items: Vec<&Item> = preview
+        .items
+        .iter()
+        .filter(|i| i.needs_ai)
+        .filter(|i| only.is_empty() || only.iter().any(|p| p == &i.path))
+        .collect();
     if items.len() > MAX_NAMES {
         return Err(format!("一次最多生成 {} 个译名，当前 {} 条，请减少选择的目录后分批", MAX_NAMES, items.len()));
     }
@@ -203,7 +212,7 @@ pub fn record(conn: &Connection, model: &str, outcomes: &[Outcome]) -> Result<us
 
 #[cfg(test)]
 mod tests {
-    use super::{annotate, blocked_by_refusal, ledger_state, plan, record, reject, suggestion, Ledger, Plan};
+    use super::{annotate, blocked_by_refusal, ledger_state, plan_scoped, record, reject, suggestion, Ledger, Plan};
     use crate::rename::ai_name::cache_key;
     use crate::rename::judge::Verdict;
     use crate::rename::preview::{Item, Kind, Preview};
@@ -338,7 +347,7 @@ mod tests {
     #[test]
     fn plan_asks_only_for_the_missing_fragments() {
         let conn = db();
-        let Plan { needed, cached, .. } = plan(&conn, &["T:/不存在/的目录".into()]).expect("规划");
+        let Plan { needed, cached, .. } = plan_scoped(&conn, &["T:/不存在/的目录".into()], &[]).expect("规划");
         assert_eq!((needed, cached), (0, 0), "没有目录就一条都不用问");
     }
 }

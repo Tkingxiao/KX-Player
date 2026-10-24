@@ -10,8 +10,12 @@ import type {
   AiExportResult,
   AiImportResult,
   AiJobOptions,
+  AiApiStyle,
   AiModelKind,
   AiModelsResult,
+  AiEndpointPolicy,
+  AiTranslatedEntry,
+  AiRemoveReport,
   AiPingResult,
   AudioDevice,
   BgImageData,
@@ -100,11 +104,25 @@ export interface AppApi {
     model: string
     messages: { role: string; content: string }[]
     temperature?: number
+    apiStyle?: AiApiStyle
   }) => Promise<AiChatResult>
-  aiPing: (payload: { baseURL: string; apiKey: string; model: string }) => Promise<AiPingResult>
-  aiListModels: (payload: { baseURL: string; apiKey: string }) => Promise<AiModelsResult>
+  /** modelKind 决定 Rust 侧测试超时的档位：本地档给足加载权重的时间（60s vs 300s）；apiStyle 决定走哪种协议 */
+  aiPing: (payload: { baseURL: string; apiKey: string; model: string; modelKind?: AiModelKind; apiStyle?: AiApiStyle }) => Promise<AiPingResult>
+  aiListModels: (payload: { baseURL: string; apiKey: string; apiStyle?: AiApiStyle }) => Promise<AiModelsResult>
+  /** 端点策略体检：地址能不能直接用 / 被拦原因 / 放行哪个端点能救（显式放行按钮以此供靶） */
+  aiEndpointCheck: (baseURL: string) => Promise<AiEndpointPolicy>
+  /** 登记 / 撤销一条明文放行，返回刷新后的名单（落 SQLite，Rust 侧缓存同步刷新） */
+  aiPlaintextSet: (endpoint: string, allow: boolean) => Promise<string[]>
+  /** 译文管理：全部已翻译条目（账 + 文件系统现状分类），按翻译时间倒序 */
+  aiTranslatedList: () => Promise<AiTranslatedEntry[]>
+  /** 一键清理失效账（源、译文都不在），返回清掉的条数 */
+  aiTranslatedCleanup: () => Promise<number>
+  /** 删译文（连账）或只清账；译文路径以账里记录的为准 */
+  aiTranslatedRemove: (paths: string[], removeFile: boolean) => Promise<AiRemoveReport>
+  /** 删除选中条目的原文：路径必须精确命中翻译账（Rust 侧守最后一道）；译文与账保留 */
+  aiTranslatedRemoveSource: (paths: string[]) => Promise<AiRemoveReport>
   /** 字幕翻译任务（B3）：返回 taskId，进度与结果走 ai:progress 事件，可 aiTaskCancel */
-  aiTranslateStart: (opts: AiJobOptions & { paths: string[] }) => Promise<number>
+  aiTranslateStart: (opts: AiJobOptions & { paths: string[]; forcePaths?: string[] }) => Promise<number>
   /** 纯文本批量翻译任务（文件夹名译名）：结果在收尾事件的 translated 里 */
   aiTextsStart: (opts: AiJobOptions & { texts: string[] }) => Promise<number>
   aiTaskCancel: (taskId: number) => Promise<boolean>
@@ -133,7 +151,7 @@ export interface AppApi {
    * 把核准的名字写进 `rename_name_cache`。**不改盘**：下一次 `renameApply` 才把它们落地上去。
    * 一次最多 200 个名字，没有取消按钮，所以目录要挑小一点。
    */
-  renameSuggestNames: (paths: string[], baseURL: string, apiKey: string, model: string, modelKind?: AiModelKind | null) => Promise<RenameSuggestReport>
+  renameSuggestNames: (paths: string[], baseURL: string, apiKey: string, model: string, modelKind?: AiModelKind | null, apiStyle?: AiApiStyle | null, onlyPaths?: string[] | null) => Promise<RenameSuggestReport>
   /**
    * 记一条「这个条目不要这个译名」（`04 §7.7` 第 9 条）。只写拒绝表，**不改盘也不删缓存**：
    * 名字还留给别的条目用，但这一条从此不再生成、不再应用。写完之后重新预览就会看到它消失。

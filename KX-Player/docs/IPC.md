@@ -96,20 +96,26 @@
 | `rename_redo` | `batchId: String` | `Report` | src-tauri/src/commands/rename.rs |
 | `rename_reject_suggestion` | `path: String`, `suggestion: String` | `null` | src-tauri/src/commands/rename.rs |
 | `rename_rollback` | `batchId: String` | `Report` | src-tauri/src/commands/rename.rs |
-| `rename_suggest_names` | `paths: Vec<String>`, `baseUrl: String`, `apiKey: String`, `model: String`, `modelKind: Option<ModelKind>` | `NameReport` | src-tauri/src/commands/rename.rs |
+| `rename_suggest_names` | `paths: Vec<String>`, `baseUrl: String`, `apiKey: String`, `model: String`, `modelKind: Option<ModelKind>`, `apiStyle: Option<crate::model::ApiStyle>`, `onlyPaths: Option<Vec<String>>` | `NameReport` | src-tauri/src/commands/rename.rs |
 
 ## system
 
 | 命令 | 参数（JS 键名 : Rust 类型） | resolve | 位置 |
 |---|---|---|---|
 | `ai_chat` | `payload: AiChatPayload` | `AiChatResult` | src-tauri/src/commands/system.rs |
+| `ai_endpoint_check` | `baseUrl: String` | `AiEndpointPolicy` | src-tauri/src/commands/system.rs |
 | `ai_export_prompts` | `paths: Vec<String>` | `ExportResult` | src-tauri/src/commands/system.rs |
 | `ai_import_translations` | `paths: Vec<String>`, `text: String`, `apply: bool` | `ImportResult` | src-tauri/src/commands/system.rs |
-| `ai_list_models` | `baseUrl: String`, `apiKey: String` | `AiModelsResult` | src-tauri/src/commands/system.rs |
+| `ai_list_models` | `baseUrl: String`, `apiKey: String`, `apiStyle: Option<ApiStyle>` | `AiModelsResult` | src-tauri/src/commands/system.rs |
 | `ai_ping` | `payload: AiChatPayload` | `AiPingResult` | src-tauri/src/commands/system.rs |
+| `ai_plaintext_set` | `endpoint: String`, `allow: bool` | `string[]` | src-tauri/src/commands/system.rs |
 | `ai_task_cancel` | `taskId: u64` | `boolean` | src-tauri/src/commands/system.rs |
 | `ai_texts_start` | `spec: crate::ai_job::AiTextsSpec` | `number` | src-tauri/src/commands/system.rs |
 | `ai_translate_start` | `spec: crate::ai_job::AiTranslateSpec` | `number` | src-tauri/src/commands/system.rs |
+| `ai_translated_cleanup` | — | `usize` | src-tauri/src/commands/system.rs |
+| `ai_translated_list` | — | `TranslatedEntry[]` | src-tauri/src/commands/system.rs |
+| `ai_translated_remove` | `paths: Vec<String>`, `removeFile: bool` | `RemoveReport` | src-tauri/src/commands/system.rs |
+| `ai_translated_remove_source` | `paths: Vec<String>` | `RemoveReport` | src-tauri/src/commands/system.rs |
 | `close_window` | — | `null` | src-tauri/src/commands/system.rs |
 | `convert_cancel` | `taskId: u64` | `boolean` | src-tauri/src/commands/system.rs |
 | `convert_run` | `items: Vec<crate::fftools::ConvertItem>` | `number` | src-tauri/src/commands/system.rs |

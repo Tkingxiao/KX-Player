@@ -12,24 +12,27 @@
 Tauri 2 桌面应用：单个 `kx-player.exe` + WebView2 渲染前端，前端与 Rust 之间只有 IPC。
 **无 Node 运行时**（Node 只在构建期用）。
 
-窗口（`src-tauri/tauri.conf.json`）：
+窗口（主窗口在 `src-tauri/src/lib.rs` 的 `setup` 里用 `WebviewWindowBuilder` 建出来，
+`tauri.conf.json` 的 `app.windows` 留空：配置项的 `dataDirectory` 只能写「相对 appDataDir」
+的路径，写不出安装目录旁的 `data/webview`，见 §7.1）：
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| label | `main` | tauri.conf.json:15 |
-| 默认尺寸 | 1200 × 800 | tauri.conf.json:17-18 |
-| 最小尺寸 | 900 × 600 | tauri.conf.json:19-20 |
-| 装饰 | `decorations: false`（自绘标题栏） | tauri.conf.json:21 |
-| 托盘 | Rust 侧建（显示窗口 / 退出），关窗 = 隐藏到托盘 | lib.rs:238-259 |
+| label | `main` | lib.rs:115-129 |
+| 默认尺寸 | 1200 × 800 | lib.rs:121 |
+| 最小尺寸 | 900 × 600 | lib.rs:122 |
+| 装饰 | `decorations(false)`（自绘标题栏） | lib.rs:123 |
+| 透明 | `transparent(true)` | lib.rs:124 |
+| 托盘 | Rust 侧建（显示窗口 / 退出），关窗 = 隐藏到托盘 | lib.rs:343-379 |
 
 ⚠️ **差距**：规范 `02 §1.3` 要求主窗口 `transparent: true`，且 `html, body { background: transparent }`。
-现状：`tauri.conf.json` 里没有 `transparent` 字段（默认 false），`src/styles/base.css:12` 是
-`background: var(--bg)`（不透明）。**只有 pip 悬浮窗**内部靠 DOM 透明让视频透出，主窗口不是透明窗。
+现状：窗口侧已经是 `transparent(true)`，但 `src/styles/base.css:118` 是 `background: var(--bg)`
+（不透明）。**只有 pip 悬浮窗**内部靠 DOM 透明让视频透出，主窗口实际不是透明窗。
 
-⚠️ **差距**：`pip` 窗口**不在** `tauri.conf.json` 的 `windows[]` 里声明，而是运行期在
-`commands/player.rs` 用 `WebviewWindowBuilder` 动态创建，首次 `pip_open` 才建、之后复用实例
-（`pip_close` 只 `hide()` 不销毁，见 commands/player.rs:276-280）；`CloseRequested`/`Destroyed` 只
-`prevent_close` + `hide()`（lib.rs:68-79）。capabilities 同时覆盖 `main` 与 `pip`
+⚠️ **差距**：`pip` 窗口是运行期在 `commands/player.rs` 用 `WebviewWindowBuilder` 动态创建，
+首次 `pip_open` 才建、之后复用实例
+（`pip_close` 只 `hide()` 不销毁，见 commands/player.rs:284-286）；`CloseRequested`/`Destroyed` 只
+`prevent_close` + `hide()`（lib.rs:136-160）。capabilities 同时覆盖 `main` 与 `pip`
 （`capabilities/default.json:5`）。
 
 ### Tauri features（Cargo.toml:17-22）
@@ -77,8 +80,8 @@ Tauri 2 桌面应用：单个 `kx-player.exe` + WebView2 渲染前端，前端�
 | **tracing / tracing-subscriber** | **无** | §1.1 要求结构化日志 + 1MB 轮转 | ⚠️ 见 §7.1 |
 | **pinyin** | **无** | §1.1 要求（拼音索引下沉 Rust） | ⚠️ 见 §2.1 |
 | **tauri-plugin-global-shortcut** | **无** | §1.1 要求（媒体键） | ⚠️ 媒体键未实现 |
-| tauri-plugin-single-instance | `2.4` | 要求 | ✅ lib.rs:30 |
-| tauri-plugin-dialog | `2.7` | 要求 | ✅ lib.rs:29 |
+| tauri-plugin-single-instance | `2.4` | 要求 | ✅ lib.rs:46 |
+| tauri-plugin-dialog | `2.7` | 要求 | ✅ lib.rs:45 |
 | windows-sys | `0.59`（6 个 Win32 feature） | 要求 | ✅ 仅 `[target.'cfg(windows)'.dependencies]`，Cargo.toml:44-52 |
 
 `[package]`：`name = "kx-player"`、`version = "2.0.0"`、**`edition = "2021"`**、`rust-version = "1.88"`。
@@ -142,9 +145,10 @@ KX-Player/
       ├─ paths.rs            # 数据目录/日志/ffmpeg 定位
       ├─ settingsio.rs       # 设置 JSON 读写
       ├─ bgimage.rs          # 背景图存取 + 超大图迁移压缩
-      ├─ fftools.rs          # ffmpeg 执行器 + 转换队列 + convert:progress
+      ├─ fftools.rs          # ffmpeg 执行器（捕获 + 流式）+ 转换队列 + convert:progress
+      ├─ loudness.rs         # 响度测量：ffmpeg 只解码出 PCM，EBU R128 在 Rust 侧积分
       ├─ ffprobe.rs          # ffprobe 探测
-      ├─ ai.rs               # OpenAI 兼容 chat/completions（reqwest blocking）
+      ├─ ai.rs               # AI 接口协议分派：OpenAI chat/completions / OpenAI Responses / Anthropic Messages（async reqwest）
       ├─ taxonomy.rs         # 分类/标签 SQL + 自动打标词表
       ├─ watcher.rs          # notify 文件监听 → scanner:fsChanged
       ├─ commands/           # dialog_fs / library / player / system / taxonomy + mod.rs
@@ -170,7 +174,7 @@ KX-Player/
 | 规范层 | 现状 | 证据 |
 |---|---|---|
 | `domain/`（模型 + 端口 trait + error，无 IO） | **不存在**。等价职责散在三处：`model.rs`（DTO + `normalize_path`）、`error.rs`（`IpcError`/`AppErrorCode`）、`taxonomy.rs`（分类树/标签/自动打标，**直接在函数里开库**） | `taxonomy.rs:53` 起全是 `pub fn ... -> Vec<CategoryDto>` 直接读写 SQLite |
-| `infra/`（paths/logging/db/text/media/video 具体实现） | **不存在独立层**。`paths.rs`、`settingsio.rs`、`bgimage.rs`、`db/*`、`scanner/meta.rs`、`scanner/covers.rs`、`fftools.rs`、`ffprobe.rs`、`ai.rs` 各自平铺 | `paths.rs:44` `log_path()`、`db/library.rs` |
+| `infra/`（paths/logging/db/text/media/video 具体实现） | **不存在独立层**。`paths.rs`、`settingsio.rs`、`bgimage.rs`、`db/*`、`scanner/meta.rs`、`scanner/covers.rs`、`fftools.rs`、`ffprobe.rs`、`ai.rs` 各自平铺 | `paths.rs:153` `log_path()`、`db/library.rs` |
 | `services/`（编排，只依赖端口 trait） | **不存在独立层**。编排在 `scanner/mod.rs`（扫描）、`player/mod.rs`（播放状态机 + mpv 适配**合体**）、`fftools.rs`（转换队列） | `player/mod.rs:9` 同时 import `libmpv2::{Format, Mpv}` 与 `crate::model` |
 | `commands/` | ✅ **存在**，但**不是薄壳**：是「参数校验 + 加锁 + spawn_blocking + 错误收口」的组装点 | `commands/player.rs:15-34`、`commands/mod.rs:11-19` |
 
@@ -239,7 +243,7 @@ db::* / scanner::* / player::PlayerCore / fftools::* / taxonomy::* / ai::*
 
 ### 5.3 命令规模
 
-`lib.rs:134-230` 的 `generate_handler!` 注册了 **95 条命令**：
+`lib.rs:215-323` 的 `generate_handler!` 注册了 **95 条命令**：
 
 | 模块 | 条数 | 域 |
 |---|---|---|
@@ -259,7 +263,8 @@ db::* / scanner::* / player::PlayerCore / fftools::* / taxonomy::* / ai::*
 
 ## 6. 事件机制（Rust → 前端）
 
-**单向广播**，前端只 `listen`，没有回调通道。全部 13 个事件（grep `emit("` 实测）：
+**单向广播**，前端只 `listen`，没有回调通道。全部 16 个事件（与 `contracts/events.ts` 的
+`EventSpecs` 同集合，`npm run check:ipc` 逐名比对）：
 
 | 事件 | 载荷 | 生产者 | 消费方 |
 |---|---|---|---|
@@ -271,9 +276,11 @@ db::* / scanner::* / player::PlayerCore / fftools::* / taxonomy::* / ai::*
 | `scanner:stage` | `string` | scanner/mod.rs:91 | App.vue:155 |
 | `scanner:fsChanged` | `string[]`（这一批的脏路径，去重、最多 1024 条） | watcher.rs（单 debounce worker） | App.vue:170 |
 | `convert:progress` | `{...}`（7 处发） | fftools.rs:285-336 | convert 视图 |
+| `loudness:progress` | `LoudnessProgress`（`done`/`silent`/`failed` 三种结局分开记） | commands/library.rs（响度任务的消费者线程） | stores/library.ts → SettingsModal |
+| `ai:progress` | `AiProgress` | ai_job.rs、ai_chunk.rs | services/aiTranslate.ts |
 | `window:beforeClose` | `null` | shutdown.rs（退出收尾第一步之后广播） | App.vue（落盘设置并回执 `shutdown_ready`） |
-| `window:maximizeChange` | `boolean` | lib.rs:108 | TitleBar |
-| `pip:shown` / `pip:closed` / `pip:restored` / `pip:pinned` | — | player.rs:247-306、lib.rs:73-78 | ui store、PipRoot |
+| `window:maximizeChange` | `boolean` | lib.rs:181 | TitleBar |
+| `pip:shown` / `pip:closed` / `pip:restored` / `pip:pinned` | — | player.rs:256-315、lib.rs:146-151 | ui store、PipRoot |
 
 **节流约定**：`player:state` 有 100ms 下限（规范 `02 §2.3` 的 10Hz）——
 `PlayerCore::emit_state`（`player/mod.rs:70-79`）用**系统毫秒**，
@@ -291,24 +298,30 @@ db::* / scanner::* / player::PlayerCore / fftools::* / taxonomy::* / ai::*
 
 ### 7.1 位置与文件
 
-`paths.rs` 决定一切，**刻意沿用 Electron 版的 userData 目录**，老用户原地继承：
+`paths.rs` 决定一切，**用户数据一律落在安装目录旁的 `data/`**（不写 `%APPDATA%` /
+`%LOCALAPPDATA%`）。老位置 `%APPDATA%/kx-music-player/Cache/kx-music-player` 里的东西在首次
+启动时由 `migrate_legacy_data()` 整体搬过来，升上来的用户曲库不空。代价是安装目录必须可写，
+所以安装包按 `bundle.windows.nsis.installMode: perMachine` 装（默认位置 `Program Files\KX-Player`，
+安装时要管理员权限），`src-tauri/nsis/hooks.nsh` 的 POSTINSTALL 建出 `data/` 并**只对它**放开
+Users 的写权限 —— 安装根目录仍对普通用户只读，免得有人把 `libmpv-2.dll` 换成自己的那份。
+绕过安装包手动拷进不可写位置时，启动自检会警告「曲库与设置存不下来」。卸载只删安装器铺过的
+文件，`data/` 留在原处。
 
 | 用途 | 路径 |
 |---|---|
-| 数据目录 | `%APPDATA%/kx-music-player/Cache/kx-music-player/`（paths.rs:12-14） |
+| 数据目录 | `<exe 所在目录>/data/`（`paths.rs::data_dir`） |
+| WebView 数据文件夹（localStorage / Cookie / 缓存） | `data/webview/`（`paths.rs::webview_data_dir`，主窗口与悬浮窗共用；建不出来时回落到 `%LOCALAPPDATA%/com.kxplayer.music`） |
 | 主库 | `kx-player-library.sqlite` |
 | 设置 | `kx-player-settings.json` |
 | 封面 | `covers/` |
 | 背景图 | `kx-player-bg.png` |
-| 日志 | `kx-player-log.txt`（paths.rs:96-121） |
+| 日志 | `kx-player-log.txt`（`paths.rs::append_log`） |
 
 ⚠️ **日志轮转的现状**：`append_log` 在文件 >1MB 时**只保留尾部 512KB 并原地覆盖**，
-不是滚成多个文件；且截断点按**字节**切（`paths.rs:116-117` 用 `content.len()` + 字符串切片）——
-日志含中文时理论上可能切在多字节字符中间。`read_to_string` 保证读到的是合法 UTF-8，
-但 `&content[keep_from..]` 的 `keep_from` 是纯字节偏移，**这是潜在 panic 点**，建议改为
-`char_indices` 取边界。
+不是滚成多个文件。截断点由 `tail_start`（`paths.rs:267`）取，它会跳到最近的**字符边界**、
+再对齐到**行首**，所以中文日志不会被切成半字符；落盘走 `crate::atomic::write`，不会留半截文件。
 ⚠️ **差距**：规范 `§1.1` 要 `tracing` 结构化日志。现状是自研 `append_log(&str)` + 手写
-`epoch_to_utc`（`paths.rs:123-140`，注释写「避免引入 chrono」），无级别、无 span、无 JSON。
+`epoch_to_utc`（`paths.rs:280`，注释写「避免引入 chrono」），无级别、无 span、无 JSON。
 
 ### 7.2 迁移机制
 
@@ -331,7 +344,7 @@ pub(crate) const MIGRATIONS: &[(i64, &str, &str)] = &[
 `apply_adopts_a_preexisting_unversioned_database` —— 没有 `schema_migrations` 但表已存在时
 **接管而不是报错**（所有语句都是 `IF NOT EXISTS`）。
 
-**启动时的旧 ID 改写**：`lib.rs:42` `db::migrate_legacy_ids(...)` 把
+**启动时的旧 ID 改写**：`lib.rs:76` `db::migrate_legacy_ids(...)` 把
 `md5(路径)前 12 位` 的旧条目 ID 全量改成 **UUIDv5**（含封面文件名与 settings 引用），
 改写前把库与设置各备份成 `*.pre-uuid5`。这也是 `Cargo.toml` 只开 `uuid/v5` 的原因。
 
@@ -447,7 +460,7 @@ tags(id, name UNIQUE, color, kind DEFAULT 'topic', use_count)
 
 `player/embed.rs`（262 行）用 Win32 覆盖窗口：
 
-- 独立**舞台线程**创建覆盖窗口并跑消息循环（`lib.rs:94-96` 的注释）：
+- 独立**舞台线程**创建覆盖窗口并跑消息循环（`player/mod.rs:158` 的注释）：
   「窗口操作只在该线程执行，避免跨线程 `SendMessage` 死锁」。
 - 命令**异步入队**（`enqueue(StageCmd::Rect/Visible/Attach/Destroy)`），
   `set_stage_rect` 只入队不阻塞（`embed.rs:296-299`）。
@@ -485,17 +498,20 @@ tags(id, name UNIQUE, color, kind DEFAULT 'topic', use_count)
 | `services/ai/rename/normalize.rs`（前缀切分/规范化） | ✅ 等价物 `rename/norm.rs`（先把序号前缀切出来原样留着，再按符号表收敛） |
 | `commands/rename.rs` + 冲突检测 + 回滚 + `rename_history.json` | ✅ 七条命令（`rename_preview` / `apply` / `suggest_names` / `reject_suggestion` / `rollback` / `redo` / `batches`）；批次账 `rename/batch.rs`、原始名账 `rename/history.rs`、执行与撤销 `apply.rs` / `rollback.rs` |
 | `infra/ai/{credentials,http}.rs` | ❌ 不存在（凭据**只在内存**，见下） |
-| `providers/{ollama,openai,anthropic,gemini}` | ❌ 不存在，只有**一个** OpenAI 兼容客户端；Ollama 靠 `/v1/models` 与 `/api/tags` 两种列表形状兼容 |
+| `providers/{ollama,openai,anthropic,gemini}` | ⚠️ 没有独立 provider 模块，但 `ai.rs` 已按 `ApiStyle` 分派**三种协议**：OpenAI Chat Completions（缺省）/ OpenAI Responses / Anthropic Messages —— 同一份接入参数（地址 / Key / 模型名），URL 末段、鉴权头（Bearer vs `x-api-key`+版本头）与请求/响应 JSON 形状随协议切换；Ollama 仍靠 `/v1/models` 与 `/api/tags` 两种列表形状兼容（`/api/tags` 只对 chat/completions 档回退） |
 | `services/ai/{job,cache,prompt}.rs` + 后置校验 | ✅ `ai_job.rs`（任务与 `ai:progress`）/ `ai_cache.rs`（豁免账 + `blake3(提示词版本 + 原文)` 复用缓存，LRU 淘汰）/ `ai_prompt.rs`（`SUBTITLE_PROMPT_VERSION`）；后置九道校验 = `rename/postcheck.rs`，只管译名 |
 | `ai.exportPrompts` / `ai.importTranslations` | ✅ `ai_export_prompts` / `ai_import_translations`（`commands/system.rs`，实现在 `ai_export.rs` + `ai_wire.rs`）—— 没有 Provider 也能走完一批（AI-16） |
 | 字幕/歌词翻译闭环 | ✅ 扫描 `ai_scan.rs` → 切块与重试 `ai_chunk.rs` → 逐块请求 `ai_job.rs` → 回写同目录 `.zh` 文件 |
 
 **实际实现的层次**：
 
-1. **传输层** `ai.rs`（309 行）：`POST {base}/v1/chat/completions`，**async** `reqwest::Client`
+1. **传输层** `ai.rs`：按 `model::ApiStyle` 分派三种协议 —— `POST {base}/v1/chat/completions`（缺省）、
+   `POST {base}/v1/responses`（OpenAI 新版，`input`/`max_output_tokens`，正文在 `output[].content[].text`）、
+   `POST {base}/v1/messages`（Anthropic，`x-api-key` + `anthropic-version` 头，system 挪顶层、
+   `max_tokens` 必填缺省 4096、截断即报错）。**async** `reqwest::Client`
    （B3 之前是 `reqwest::blocking` + 同步命令，`client()` 上头的注释记了为什么换）。对外三个命令
-   `ai_chat` / `ai_ping` / `ai_list_models`。`normalize_base_url` 去尾斜杠、无版本段时补 `/v1`，
-   空值时默认 `http://127.0.0.1:11434`（**本地 Ollama 优先**）。`brief()` 按**字符**截断而非字节 ——
+   `ai_chat` / `ai_ping` / `ai_list_models`。版本段由 `ai_url` 的规范化统一补 `/v1`，三种协议只差末段路径；
+   `note_endpoint` 的首次联系日志带协议名。`brief()` 按**字符**截断而非字节 ——
    注释记录了原因：`&text[..n]` 落在多字节字符中间会 panic，而 panic 在命令线程上会把「HTTP 状态 +
    厂商原文」全丢成一句「任务失败」。
 
@@ -565,7 +581,7 @@ pub async fn player_set_volume(app: AppHandle, vol: f64) -> IpcResult<()> {
   必须经 `join_task`（`commands/mod.rs:11-19`）收口，否则「后端 panic」和「业务报错」
   会混成同一句话。
 
-### ② 在 `src-tauri/src/lib.rs` 的 `generate_handler!` 里注册（`lib.rs:134-230`）
+### ② 在 `src-tauri/src/lib.rs` 的 `generate_handler!` 里注册（`lib.rs:215-323`）
 
 漏了这一步：命令能编译，但前端 `invoke` 报「command not found」。
 

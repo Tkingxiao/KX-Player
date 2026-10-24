@@ -84,6 +84,9 @@ pub async fn rename_apply(scope: tauri::State<'_, PathScope>, paths: Vec<String>
 /// 这是一条会长跑的命令（外接模型几十秒、本地模型可能几分钟），但它是 `async` 的：请求在
 /// tokio 上跑，主线程与窗口不因此停顿（第 12 批那次卡死是**同步**命令里做重活）。
 /// 代价是这一条没有取消按钮，所以 `ai_ledger::MAX_NAMES` 把一次的上限压到 200 个名字。
+// 接入参数（地址 / Key / 模型名 / 档位 / 协议）必须逐项平铺过 IPC，Tauri 命令签名收不成结构体；
+// 参数个数是线形状带来的，不是坏味道。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn rename_suggest_names(
     scope: tauri::State<'_, PathScope>,
@@ -92,6 +95,8 @@ pub async fn rename_suggest_names(
     api_key: String,
     model: String,
     model_kind: Option<ModelKind>,
+    api_style: Option<crate::model::ApiStyle>,
+    only_paths: Option<Vec<String>>,
 ) -> IpcResult<NameReport> {
     if paths.is_empty() {
         return Err(IpcError::invalid_argument("没有选中要生成译名的目录"));
@@ -103,15 +108,17 @@ pub async fn rename_suggest_names(
     // Tauri 交过来的 String 用完就擦：这条链路里 Key 会活到整批问完为止（P0-3）
     let api_key = zeroize::Zeroizing::new(api_key);
     let kind = model_kind.unwrap_or_default();
+    // 「只生成选中的」：非空时只清点精确命中这些条目路径的行（文件夹名翻译的选择性生成）
+    let only = only_paths.unwrap_or_default();
     let plan = join_task(
         "清点待生成译名",
-        tauri::async_runtime::spawn_blocking(move || in_db(|conn| ai_ledger::plan(conn, &paths))).await,
+        tauri::async_runtime::spawn_blocking(move || in_db(|conn| ai_ledger::plan_scoped(conn, &paths, &only))).await,
     )?;
     // 全部命中缓存是常态（同一批名字再生成一次不该再花钱），这一步一次请求都不发
     let outcomes = if plan.missing.is_empty() {
         Vec::new()
     } else {
-        ai_ask::translate(&base_url, &api_key, &model, kind, &plan.missing).await
+        ai_ask::translate(&base_url, &api_key, &model, api_style.unwrap_or_default(), kind, &plan.missing).await
     };
     let rep = ai_ask::report(plan.needed, plan.cached, &outcomes, &model);
     join_task(

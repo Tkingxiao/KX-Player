@@ -42,7 +42,7 @@ async function generate(): Promise<void> {
   emit('busy', true)
   try {
     const o = jobOpts()
-    const r = await api.renameSuggestNames(props.roots, o.baseURL, o.apiKey, o.model, o.modelKind)
+    const r = await api.renameSuggestNames(props.roots, o.baseURL, o.apiKey, o.model, o.modelKind, o.apiStyle)
     rep.value = r
     ui.toast(
       `译名：新拿到 ${r.generated} 个${r.cached ? `，${r.cached} 个本来就有` : ''}` +

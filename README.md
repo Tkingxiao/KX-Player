@@ -122,6 +122,7 @@ KX-Player/                      仓库根
 - **ffmpeg 不随包（决定，非欠账）**：理由与口径见上文「环境要求」的 ffmpeg 条与 `docs-vibecoding/02 §1.2`。应用侧已具备能力检测（`ffmpeg_probe`）与降级（转换页警告条 + 置灰执行按钮），缺它只影响转换类功能。因为不分发二进制，带 `libx264` 的 GPL v2+ 源码获取义务也不落在本项目上。
 - **筛选与搜索在前端执行**：组合筛选/搜索目前是全库载入后 JS 过滤，未下沉为 SQL；大库（万条级以上）的启动与搜索响应会退化。
 - 字幕目前由前端解析并自绘浮层，未统一交由 libass 渲染。
+- **数据目录在安装目录里（`<安装目录>\data\`）**：装两份互不串数据，整个目录拷走就是搬家。安装包是**按所有用户安装**（`installMode: perMachine`，装的时候要有管理员权限，默认位置 `C:\Program Files\KX-Player`），安装脚本单独给 `data\` 放开 Users 的写权限 —— 安装根目录仍对普通用户只读，免得有人把 `libmpv-2.dll` 换成自己的那份。**卸载只删安装器自己铺过的文件，`data\` 会留在原处**（曲库、设置、WebView 缓存），重装即恢复；要清干净得手动删掉 `data\`。
 
 以上限制连同当前仍未闭合的问题、证据定位、整改顺序与验证规则，记录在根目录的 [AUDIT.md](AUDIT.md) 与 [HANDOVER.md](HANDOVER.md) 中。两者是项目维护文档：前者记录当前问题，后者记录执行顺序和验收规则。
 
@@ -131,9 +132,9 @@ KX-Player/                      仓库根
 |---|---|
 | 启动白屏 / 「127.0.0.1 拒绝连接」 | 见上文「不要用 cargo build --release」；确认 dev server 已在 `127.0.0.1:5173` 监听 |
 | 视频黑屏但有声 | 确认 exe 同目录有 `libmpv-2.dll`。它由 `build.rs` 从 `.toolchain/mpv-dev` 铺设，构建日志里出现「缺少 libmpv-2.dll」warning 就是没铺成 |
-| 极少数情况启动白屏 | 清除 `%LOCALAPPDATA%\com.kxplayer.music*` 缓存后重试 |
+| 极少数情况启动白屏 | 清除 WebView 缓存目录 `<安装目录>\data\webview\`（安装目录不可写时才在 `%LOCALAPPDATA%\com.kxplayer.music`）后重试 |
 | 转换/响度分析报「ffmpeg.exe 未找到」 | 安装 ffmpeg 并加入 PATH（或设 `KX_FFMPEG` 指向 exe）—— 它**不随安装包分发**，见上文「环境要求」；`npm run check:ffmpeg` 能一次报清「找到了哪个、缺哪些编解码器」 |
 | 新增 Rust 命令前端调不到 | Tauri 按 camelCase 归一化参数名：`base_url` → 前端键名必须是 `baseUrl`（不是 `baseURL`）；同时确认已在 `lib.rs` 的 `invoke_handler` 注册 |
 | 升级后进度/收藏对不上 | 条目 ID 已由 `md5(路径)前 12 位` 改为 UUIDv5，启动时由 `db::migrate_legacy_ids` 全量改写（含封面文件名与 settings）。改写前会把 `library.db` 与 `settings.json` 各复制为 `*.pre-uuid5`，异常时用同目录备份整对回滚 |
 
-数据与日志位置由 `src-tauri/src/paths.rs` 决定（Windows 下位于 `%APPDATA%` / `%LOCALAPPDATA%`），日志按 1 MB 轮转。
+数据与日志位置由 `src-tauri/src/paths.rs` 决定：**用户数据一律落在安装目录旁的 `data/`**（曲库 SQLite、设置、封面、背景图、日志，以及 WebView 的 `data/webview/`），不写 `%APPDATA%` / `%LOCALAPPDATA%`；老位置 `%APPDATA%\kx-music-player\Cache\kx-music-player` 里的东西首次启动时自动搬过来。日志按 1 MB 轮转。

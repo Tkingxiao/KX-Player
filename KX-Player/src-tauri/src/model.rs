@@ -166,6 +166,35 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// 接口协议：同一份接入参数（地址 / Key / 模型名）按三种线形状之一发。
+/// 版本段都由 `ai_url` 的规范化统一补成 `/v1`，三种协议的差别只在末段路径、
+/// 鉴权头与请求/响应的 JSON 形状 —— 缺省 `OpenAiChat` = 既有行为，老前端与
+/// 老设置不带这个字段时照旧走 chat/completions。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ApiStyle {
+    /// OpenAI Chat Completions：`POST {base}/chat/completions`，Bearer 鉴权（历史缺省）
+    #[default]
+    #[serde(rename = "openai-chat")]
+    OpenAiChat,
+    /// OpenAI Responses（新版）：`POST {base}/responses`，同为 Bearer 鉴权
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
+    /// Anthropic Messages：`POST {base}/messages`，`x-api-key` + `anthropic-version` 鉴权
+    #[serde(rename = "anthropic")]
+    Anthropic,
+}
+
+impl ApiStyle {
+    /// 设置与日志里的稳定名（与 serde 线值一致；derive 的 Debug 名是实现细节）
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai-chat",
+            Self::OpenAiResponses => "openai-responses",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiChatPayload {
@@ -181,6 +210,13 @@ pub struct AiChatPayload {
     /// `None` = 不由软件侧限制（字幕那条链路的既有行为，参数是第 11 批定的）。
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// 模型档位，只有 `ai_ping` 消费：测试连接的超时跟着档位走（本地模型加载权重
+    /// 与推理模型的长思考都不是 15 秒级的事）。`ai_chat` 与批量任务不看它。
+    #[serde(default)]
+    pub model_kind: Option<crate::ai_strategy::ModelKind>,
+    /// 接口协议，缺省 `openai-chat`（历史行为）。请求的 URL/鉴权头/线形状与响应解析都跟着它走。
+    #[serde(default)]
+    pub api_style: ApiStyle,
 }
 
 /// API Key 只该活在这条请求里。`String` 被丢弃不会擦掉堆上的字节 —— 那块内存会被
@@ -202,6 +238,8 @@ impl std::fmt::Debug for AiChatPayload {
             .field("messages", &self.messages.len())
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
+            .field("model_kind", &self.model_kind)
+            .field("api_style", &self.api_style.name())
             .finish()
     }
 }
@@ -235,6 +273,22 @@ pub struct AiModelsResult {
     pub models: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// `ai_endpoint_check` 的回执：地址现状 + 被拦原因 + 「放行即可用」的端点。
+/// 给界面的显式放行按钮供靶 —— 公网/私网判断只活在 Rust 一处，前端不复刻规则。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiEndpointPolicy {
+    pub ok: bool,
+    /// ok=false 时的原因原文（与测试连接看到的一致）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 被拦、但显式放行这个 `host:port` 就能用；缺席 = 放行也救不了（地址本身不合规/本机被拦）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// 当前放行名单，随每条回执带上（前端免一次专门查询）
+    pub allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -305,5 +359,27 @@ mod tests {
             serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m"}"#).unwrap();
         assert!(p.messages.is_empty());
         assert!(p.temperature.is_none());
+        assert_eq!(p.model_kind, None, "档位缺席 = 按外接档给测试超时");
+        let with_kind: AiChatPayload =
+            serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m","modelKind":"local"}"#).unwrap();
+        assert_eq!(with_kind.model_kind, Some(crate::ai_strategy::ModelKind::Local));
+    }
+
+    /// 接口协议是可选的：老前端不带 `apiStyle` 时必须照旧走 chat/completions，
+    /// 不能因为加了新协议就让存量请求反序列化失败。
+    #[test]
+    fn ai_chat_payload_defaults_to_the_legacy_protocol() {
+        use super::ApiStyle;
+        let p: AiChatPayload =
+            serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m"}"#).unwrap();
+        assert_eq!(p.api_style, ApiStyle::OpenAiChat);
+        let responses: AiChatPayload =
+            serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m","apiStyle":"openai-responses"}"#).unwrap();
+        assert_eq!(responses.api_style, ApiStyle::OpenAiResponses);
+        let anthropic: AiChatPayload =
+            serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m","apiStyle":"anthropic"}"#).unwrap();
+        assert_eq!(anthropic.api_style, ApiStyle::Anthropic);
+        // 稳定名与 serde 线值一致：日志与设置里出现的是这一个形状
+        assert_eq!(ApiStyle::default().name(), "openai-chat");
     }
 }

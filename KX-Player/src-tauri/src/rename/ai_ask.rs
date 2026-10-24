@@ -79,6 +79,8 @@ struct Creds<'a> {
     base_url: &'a str,
     api_key: &'a str,
     model: &'a str,
+    /// 接口协议：请求的线形状与解析跟着它走
+    style: crate::model::ApiStyle,
     dead: &'a AtomicUsize,
     aborted: &'a AtomicBool,
 }
@@ -88,6 +90,7 @@ pub async fn translate(
     base_url: &str,
     api_key: &str,
     model: &str,
+    style: crate::model::ApiStyle,
     kind: ModelKind,
     missing: &[Fragment],
 ) -> Vec<Outcome> {
@@ -102,7 +105,14 @@ pub async fn translate(
         let f = f.clone();
         set.spawn(async move {
             let _permit = sem.acquire().await;
-            let c = Creds { base_url: &base_url, api_key: &api_key, model: &model, dead: &dead, aborted: &aborted };
+            let c = Creds {
+                base_url: &base_url,
+                api_key: &api_key,
+                model: &model,
+                style,
+                dead: &dead,
+                aborted: &aborted,
+            };
             (i, ask_one(&c, &f, st).await)
         });
     }
@@ -177,6 +187,8 @@ async fn ask(c: &Creds<'_>, f: &Fragment, hint: Option<&str>, st: Strategy) -> O
         ],
         temperature: Some(0.3),
         max_tokens: Some(ai_name::max_tokens(&f.src)),
+        model_kind: None,
+        api_style: c.style,
     };
     for i in 0..st.attempts.max(1) {
         if c.aborted.load(Ordering::SeqCst) {
@@ -203,7 +215,7 @@ async fn ask(c: &Creds<'_>, f: &Fragment, hint: Option<&str>, st: Strategy) -> O
 }
 
 /// 报告：把明细摊开给界面。`needed`/`cached` 是问之前算出来的账（在
-/// [`plan`](super::ai_ledger::plan) 那一侧），这里只补上问回来之后才知道的部分。
+/// [`plan_scoped`](super::ai_ledger::plan_scoped) 那一侧），这里只补上问回来之后才知道的部分。
 pub fn report(needed: usize, cached: usize, outcomes: &[Outcome], model: &str) -> NameReport {
     let mut rep = NameReport {
         needed,

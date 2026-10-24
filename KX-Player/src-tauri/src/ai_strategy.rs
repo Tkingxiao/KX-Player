@@ -70,11 +70,15 @@ impl Strategy {
         };
         Self {
             chunk_size: chunk_size.unwrap_or(base.chunk_size).clamp(1, 200),
-            concurrency: concurrency.unwrap_or(base.concurrency).clamp(1, 8),
+            concurrency: concurrency.unwrap_or(base.concurrency).clamp(1, MAX_CONCURRENCY),
             ..base
         }
     }
 }
+
+/// 并发的硬上限。显式并发是给「反代/自建服务扛得住」的用户的，但盲目拉高只会
+/// 把限流 429 与超时放大 —— 12 已经远超任何单卡推理服务能真正并行处理的量。
+pub const MAX_CONCURRENCY: usize = 12;
 
 #[cfg(test)]
 mod tests {
@@ -109,6 +113,18 @@ mod tests {
         // 选的是本地档位，显式覆盖仍然说话：并发被人指定就听人的
         let st = Strategy::resolve(ModelKind::Local, Some(30), Some(3), Some(5));
         assert_eq!((st.chunk_size, st.concurrency), (30, 3));
+    }
+
+    /// 显式并发两档通用、上限 12：UI 的「多路并发」选择器按这个口径给值。
+    #[test]
+    fn explicit_concurrency_follows_the_caller_up_to_the_cap() {
+        assert_eq!(Strategy::resolve(ModelKind::Remote, None, Some(12), None).concurrency, 12);
+        assert_eq!(Strategy::resolve(ModelKind::Local, None, Some(12), None).concurrency, 12);
+        assert_eq!(Strategy::resolve(ModelKind::Remote, None, Some(99), None).concurrency, MAX_CONCURRENCY);
+        assert_eq!(Strategy::resolve(ModelKind::Remote, None, Some(0), None).concurrency, 1);
+        // 没显式指定就听档位的：外接 2 路、本地 1 路
+        assert_eq!(Strategy::resolve(ModelKind::Remote, None, None, None).concurrency, 2);
+        assert_eq!(Strategy::resolve(ModelKind::Local, None, None, None).concurrency, 1);
     }
 
     #[test]

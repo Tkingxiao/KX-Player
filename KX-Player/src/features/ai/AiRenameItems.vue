@@ -5,6 +5,9 @@
  * 顺序由后端排（目录在前、文件在后，各自按名字），与**应用的顺序一致**（`04 §7.8`），
  * 所以这里不许再排一次 —— 让人看到的顺序就是将来动的顺序。
  * 同理，箭头右边也不许自己挑：有已核准译名的就显示译名，因为后端那一刻用的就是它（`04 §7.7`）。
+ *
+ * 选择列是**可选**的（`selectable`）：文件夹名翻译工种用它挑「只生成选中的」，
+ * 规则改名工种不传就整列不渲染 —— 选中状态由父组件持有，这里只回事件（纯展示）。
  */
 import { useUiStore } from '@/stores/ui'
 import { api } from '@/bridge/ipc'
@@ -12,10 +15,24 @@ import { errText } from '@/contracts/result'
 import type { RenamePreviewItem } from '@/contracts/api'
 import { CONFLICT_LABEL, REASON_LABEL, VERDICT_LABEL } from './renameLabels'
 
-defineProps<{ items: RenamePreviewItem[] }>()
-const emit = defineEmits<{ (e: 'refresh'): void }>()
+const props = defineProps<{
+  items: RenamePreviewItem[]
+  /** 开出行首选择列（文件夹名翻译的「只生成选中的」；规则改名不传 = 无选择列） */
+  selectable?: boolean
+  /** 当前选中的条目路径（父组件持有） */
+  selected?: Set<string>
+}>()
+
+const emit = defineEmits<{
+  (e: 'refresh'): void
+  (e: 'toggle-one', path: string): void
+}>()
 
 const ui = useUiStore()
+
+function checked(i: RenamePreviewItem): boolean {
+  return props.selected?.has(i.path) ?? false
+}
 
 const rowCls = (i: RenamePreviewItem): string => `v-${i.verdict}${i.conflict ? ' bad' : ''}`
 const to = (i: RenamePreviewItem): string => i.suggested ?? i.target
@@ -37,6 +54,14 @@ async function reject(i: RenamePreviewItem): Promise<void> {
 <template>
   <ul class="rn-items">
     <li v-for="i in items" :key="i.path" :class="rowCls(i)">
+      <input
+        v-if="selectable"
+        class="rn-check"
+        type="checkbox"
+        :checked="checked(i)"
+        :aria-label="`选择 ${i.name}`"
+        @change="emit('toggle-one', i.path)"
+      />
       <span class="rn-kind">{{ i.kind === 'folder' ? '目录' : '文件' }}</span>
       <span class="rn-verdict">{{ VERDICT_LABEL[i.verdict] }}</span>
       <span class="rn-from" :title="i.path">{{ i.name }}</span>
@@ -69,6 +94,7 @@ async function reject(i: RenamePreviewItem): Promise<void> {
   font-size: 11.5px;
 }
 .rn-items li { display: flex; align-items: baseline; gap: 8px; color: var(--text-sub); }
+.rn-check { flex: 0 0 auto; accent-color: rgb(var(--accent-rgb)); align-self: center; }
 .rn-kind,
 .rn-verdict { flex: 0 0 auto; color: var(--text-muted); }
 .rn-verdict { min-width: 5.5em; }

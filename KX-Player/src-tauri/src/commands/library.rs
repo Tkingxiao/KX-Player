@@ -206,11 +206,51 @@ pub(crate) fn request_cancel_loudness() -> bool {
     loudness_running()
 }
 
-/// 后台响度分析：逐文件 ffmpeg ebur128，进度走事件，结果写回 DB。
+/// 并发度：封顶 4 路。再多没有意义 —— 每一路都是一个 ffmpeg 在解整轨，瓶颈是磁盘
+/// 顺序读和解码线程，而不是任务数；同时给实时播放留出核心（P1-9 的同一条理由）。
+fn loudness_workers() -> usize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    cores.clamp(1, 4)
+}
+
+/// 一批任务的共用状态。`no_ffmpeg` 是批内的「到此为止」：二进制缺失时每条都会失败在
+/// 同一个原因上，第一例记完日志就不必再空转剩下的几百条。
+struct LoudnessBatch {
+    gen: u64,
+    no_ffmpeg: std::sync::atomic::AtomicBool,
+}
+
+/// 这一批还要不要继续：被新任务取代、用户取消、应用正在退出收尾、或已确认没有 ffmpeg。
+fn loudness_stopped(batch: &LoudnessBatch) -> bool {
+    use std::sync::atomic::Ordering;
+    batch.no_ffmpeg.load(Ordering::SeqCst)
+        || LOUDNESS_CANCEL.load(Ordering::SeqCst)
+        || LOUDNESS_GENERATION.load(Ordering::SeqCst) != batch.gen
+        || crate::fftools::shutdown_requested()
+}
+
+/// 一条测量结果的去向。`Silent` 与 `Failed` 分家：数字静音是**测准了**（只是没有响度），
+/// 「没测成」才是失败 —— 旧实现把两者一起记进 failed。
+enum Outcome {
+    Value(f64),
+    Silent,
+    Failed(String),
+    /// 没起 ffmpeg 就收手了
+    Skipped,
+}
+
+struct Measured {
+    id: String,
+    path: String,
+    outcome: Outcome,
+}
+
+/// 后台响度分析：ffmpeg 只解码出 PCM，积分响度在 Rust 侧算（见 `loudness.rs`）。
 /// 任务 + 事件模式（红线条款：长任务不得同步阻塞 IPC）。
-/// 事件 `loudness:progress`：{ completed, total, current, done, failed, finished, cancelled }
+/// 事件 `loudness:progress`：{ completed, total, current, done, silent, failed, finished, cancelled }
 #[tauri::command]
 pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec<(String, String)>) -> bool {
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
     use std::sync::atomic::Ordering;
     use tauri::Emitter;
     // 退出途中不再开新队列（P1-3 第一步「停止接收」）
@@ -238,48 +278,82 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
     let total = tracks.len();
     std::thread::spawn(move || {
         LOUDNESS_RUNNING.store(true, Ordering::SeqCst);
-        let mut completed = 0usize;
-        let mut done = 0usize;
-        let mut failed = 0usize;
-        let mut cancelled = false;
-        for (id, path) in &tracks {
-            // 被新任务取代、收到取消请求，或应用正在退出时收尾
-            if LOUDNESS_CANCEL.load(Ordering::SeqCst)
-                || LOUDNESS_GENERATION.load(Ordering::SeqCst) != gen
-                || crate::fftools::shutdown_requested()
-            {
-                cancelled = true;
-                break;
-            }
-            let result = crate::fftools::measure_loudness(path);
-            completed += 1;
-            match result.lufs {
-                Some(v) => {
-                    done += 1;
-                    let _ = crate::db::library::set_track_loudness(&db_path(), id, v);
+        let batch = std::sync::Arc::new(LoudnessBatch {
+            gen,
+            no_ffmpeg: std::sync::atomic::AtomicBool::new(false),
+        });
+        let workers = loudness_workers();
+        // 有界：攒够 2×并发度就堵在生产方上，内存与任务数无关
+        let (tx, rx) = crossbeam_channel::bounded::<Measured>(workers * 2);
+
+        // 写库 + 发进度收在**一条**线程上：SQLite 没设 busy_timeout，几个 writer 并发
+        // 就会撞 SQLITE_BUSY（丢的是已经算出来的响度值）；顺带让计数按完成顺序单调走。
+        let emitter = app2.clone();
+        let consumer = std::thread::spawn(move || {
+            let (mut completed, mut done, mut silent, mut failed, mut skipped) = (0usize, 0, 0, 0, 0);
+            for m in rx.iter() {
+                match &m.outcome {
+                    // 没起 ffmpeg 就收手的（取消 / 被取代 / 退出收尾）不进计数也不发帧：
+                    // 一旦收手，剩下的条目会一条接一条地 Skipped，发出去只是刷 WebView
+                    Outcome::Skipped => {
+                        skipped += 1;
+                        continue;
+                    }
+                    Outcome::Value(v) => {
+                        done += 1;
+                        let _ = crate::db::library::set_track_loudness(&db_path(), &m.id, *v);
+                    }
+                    Outcome::Silent => {
+                        silent += 1;
+                        crate::paths::append_log(&format!("[loudness] {} 无有效响度（数字静音）", m.path));
+                    }
+                    Outcome::Failed(e) => {
+                        failed += 1;
+                        crate::paths::append_log(&format!("[loudness] {} failed: {e}", m.path));
+                    }
                 }
-                None => {
-                    failed += 1;
-                    crate::paths::append_log(&format!(
-                        "[loudness] {} failed: {}",
-                        path,
-                        result.error.unwrap_or_default()
-                    ));
+                completed += 1;
+                let _ = emitter.emit(
+                    "loudness:progress",
+                    serde_json::json!({
+                        "completed": completed,
+                        "total": total,
+                        "current": m.path,
+                        "done": done,
+                        "silent": silent,
+                        "failed": failed,
+                        "finished": false,
+                        "cancelled": false,
+                    }),
+                );
+            }
+            (completed, done, silent, failed, skipped)
+        });
+
+        // 只有解码这一段并行；`measure_one` 每次开工前先认一次代际/取消
+        let run = |tx: crossbeam_channel::Sender<Measured>| match rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+        {
+            Ok(pool) => pool.install(|| {
+                tracks.par_iter().for_each_with(tx.clone(), |s, (id, path)| {
+                    let _ = s.send(measure_one(&batch, id, path));
+                });
+            }),
+            Err(e) => {
+                crate::paths::append_log(&format!("[loudness] 线程池建不起来（{e}），退成逐个测量"));
+                for (id, path) in &tracks {
+                    if tx.send(measure_one(&batch, id, path)).is_err() {
+                        break;
+                    }
                 }
             }
-            let _ = app2.emit(
-                "loudness:progress",
-                serde_json::json!({
-                    "completed": completed,
-                    "total": total,
-                    "current": path,
-                    "done": done,
-                    "failed": failed,
-                    "finished": false,
-                    "cancelled": false,
-                }),
-            );
-        }
+        };
+        run(tx.clone());
+        // 生产方全部收手：放下最后一个发送端，消费者读到关闭就退出
+        drop(tx);
+
+        let (completed, done, silent, failed, skipped) = consumer.join().unwrap_or((0, 0, 0, 0, 0));
         // 仅当仍是当前任务时才发完成帧，避免旧任务覆盖新任务状态
         if LOUDNESS_GENERATION.load(Ordering::SeqCst) == gen {
             let _ = app2.emit(
@@ -289,15 +363,35 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
                     "total": total,
                     "current": "",
                     "done": done,
+                    "silent": silent,
                     "failed": failed,
                     "finished": true,
-                    "cancelled": cancelled,
+                    "cancelled": skipped > 0,
                 }),
             );
         }
         LOUDNESS_RUNNING.store(false, Ordering::SeqCst);
     });
     true
+}
+
+/// 测一条：先认旗标，再起 ffmpeg。ffmpeg 缺失时给批内共享位置一次，整批就此收手。
+fn measure_one(batch: &LoudnessBatch, id: &str, path: &str) -> Measured {
+    use std::sync::atomic::Ordering;
+    let outcome = if loudness_stopped(batch) {
+        Outcome::Skipped
+    } else {
+        match crate::loudness::measure_loudness(Path::new(path)) {
+            Ok(Some(v)) => Outcome::Value(v),
+            Ok(None) => Outcome::Silent,
+            Err(crate::loudness::LoudnessError::FfmpegMissing) => {
+                batch.no_ffmpeg.store(true, Ordering::SeqCst);
+                Outcome::Failed("ffmpeg.exe 未找到".into())
+            }
+            Err(e) => Outcome::Failed(e.to_string()),
+        }
+    };
+    Measured { id: id.to_string(), path: path.to_string(), outcome }
 }
 
 /// 取消正在进行的响度分析（幂等）

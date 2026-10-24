@@ -6,11 +6,14 @@
 //! 里跑，前端只负责「启动 + 收事件 + 画进度」。
 //!
 //! 本文件只管「任务表 + 事件流 + 队列循环」，「一批文本怎么翻」在 `ai_chunk.rs`，
-//! 「外接 / 本地各自的参数档」在 `ai_strategy.rs`。两个任务共用同一条 `ai:progress`：
+//! 「单文件的豁免/缓存/落盘」在 `ai_file.rs`，「外接 / 本地各自的参数档」在 `ai_strategy.rs`，
+//! 「事件的载荷结构」在 `ai_event.rs`。两个任务共用同一条 `ai:progress`：
 //! - `run_translate`：一批字幕文件 → 各自的 `.zh.*` 译文文件（写盘）
 //! - `run_texts`：一批纯文本（AI 页的「文件夹名翻译」）→ 只在收尾事件里回传译文，不落盘
 
-use crate::ai_chunk::{creds_of, translate_chunks, translate_one, Hub, Run};
+use crate::ai_chunk::{creds_of, translate_chunks, Hub, Run};
+use crate::ai_event::{progress, AiProgress, Loc};
+use crate::ai_file::translate_one;
 use crate::ai_strategy::ModelKind;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -18,20 +21,6 @@ use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-
-/// 事件里定位「哪一个单元的哪一块」，两个任务的字段口径一致
-#[derive(Debug, Clone, Copy)]
-pub struct Loc<'a> {
-    path: &'a str,
-    file_index: usize,
-    file_count: usize,
-}
-
-impl<'a> Loc<'a> {
-    pub fn new(path: &'a str, file_index: usize, file_count: usize) -> Self {
-        Self { path, file_index, file_count }
-    }
-}
 
 #[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,9 +30,16 @@ pub struct AiTranslateSpec {
     pub model: String,
     /// 待翻译的字幕文件路径（扫描由 subtitle_scan_dir 负责，任务只认路径）
     pub paths: Vec<String>,
+    /// 点名要**真重译**的路径子集（行内「重译」放进队列的）：对这些文件绕开「已翻译
+    /// 豁免」与「内容复用缓存」，逼一次真翻译 —— 否则重译只是把旧译文再抄一遍。
+    #[serde(default)]
+    pub force_paths: Vec<String>,
     /// 模型档位，缺省 `remote` = 第 11 批的参数
     #[serde(default)]
     pub model_kind: ModelKind,
+    /// 接口协议，缺省 `openai-chat` = 既有行为（老前端不带这个字段时照旧）
+    #[serde(default)]
+    pub api_style: crate::model::ApiStyle,
     /// 本地模型一次合并几条（2–10），只有 `modelKind = local` 时起作用
     pub merge_lines: Option<usize>,
     /// 显式覆盖档位（前端两页都不传，留着给调用方精确控制）
@@ -60,6 +56,9 @@ pub struct AiTextsSpec {
     pub texts: Vec<String>,
     #[serde(default)]
     pub model_kind: ModelKind,
+    /// 接口协议，缺省 `openai-chat` = 既有行为
+    #[serde(default)]
+    pub api_style: crate::model::ApiStyle,
     pub merge_lines: Option<usize>,
     pub chunk_size: Option<usize>,
     pub concurrency: Option<usize>,
@@ -89,7 +88,9 @@ impl std::fmt::Debug for AiTranslateSpec {
             .field("api_key", &crate::ai::redact(&self.api_key))
             .field("model", &self.model)
             .field("paths", &self.paths.len())
+            .field("force_paths", &self.force_paths.len())
             .field("model_kind", &self.model_kind)
+            .field("api_style", &self.api_style.name())
             .field("merge_lines", &self.merge_lines)
             .field("chunk_size", &self.chunk_size)
             .field("concurrency", &self.concurrency)
@@ -105,32 +106,12 @@ impl std::fmt::Debug for AiTextsSpec {
             .field("model", &self.model)
             .field("texts", &self.texts.len())
             .field("model_kind", &self.model_kind)
+            .field("api_style", &self.api_style.name())
             .field("merge_lines", &self.merge_lines)
             .field("chunk_size", &self.chunk_size)
             .field("concurrency", &self.concurrency)
             .finish()
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiProgress {
-    pub task_id: u64,
-    /// file-start | chunk-done | file-done | file-failed | cancelled | queue-finished
-    pub state: String,
-    pub path: String,
-    pub file_index: usize,
-    pub file_count: usize,
-    pub chunk_done: usize,
-    pub chunk_total: usize,
-    pub segment_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub out_path: Option<String>,
-    /// `file-failed` = 这个文件为什么没翻成；`queue-finished` = 整条队列**为什么提前结束**
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// 仅 `run_texts` 的收尾事件带：与请求等长、缺项已回退原文
-    pub translated: Option<Vec<String>>,
 }
 
 static AI_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -233,32 +214,25 @@ fn rejected_event(task_id: u64, units: usize, error: String) -> AiProgress {
     p
 }
 
-pub(crate) fn progress(task_id: u64, state: &str, loc: Loc<'_>) -> AiProgress {
-    AiProgress {
-        task_id,
-        state: state.to_string(),
-        path: loc.path.to_string(),
-        file_index: loc.file_index,
-        file_count: loc.file_count,
-        chunk_done: 0,
-        chunk_total: 0,
-        segment_count: 0,
-        out_path: None,
-        error: None,
-        translated: None,
-    }
-}
+/// 流水线预备深度：同时处于「已读入并切好块」状态的文件数。
+/// 前一个文件的块还在全局池里飞时，后面的文件就提前读盘、解析、把块排进池子 ——
+/// 「上一份的最后几块 + 下一份还没开始切」的文件边界不再让并发空转。
+/// 深度再大只是多占内存（每多一份解析结果），4 份足够喂满默认并发。
+const PREPARE_AHEAD: usize = 4;
 
 async fn run_all(app: &AppHandle, spec: &AiTranslateSpec, task_id: u64, cancel: &Arc<AtomicBool>) {
-    let hub = Hub::for_job(
-        creds_of(&spec.base_url, &spec.api_key, &spec.model),
-        spec.model_kind,
-        spec.chunk_size,
-        spec.concurrency,
-        spec.merge_lines,
-        Arc::clone(cancel),
-    );
-    let run = Run::new(app, task_id, hub);
+    let run = Arc::new(Run::new(
+        app.clone(),
+        task_id,
+        Hub::for_job(
+            creds_of(&spec.base_url, &spec.api_key, &spec.model, spec.api_style),
+            spec.model_kind,
+            spec.chunk_size,
+            spec.concurrency,
+            spec.merge_lines,
+            Arc::clone(cancel),
+        ),
+    ));
     let file_count = spec.paths.len();
     // 端点地址不合规（P0-3）：一条都别发 —— 否则用户看到的是几条「已取消」，
     // 真正的原因藏在收尾事件里
@@ -268,42 +242,74 @@ async fn run_all(app: &AppHandle, spec: &AiTranslateSpec, task_id: u64, cancel: 
         run.emit(p);
         return;
     }
+    let prepare = Arc::new(tokio::sync::Semaphore::new(PREPARE_AHEAD));
+    let mut files = tokio::task::JoinSet::new();
     for (i, path) in spec.paths.iter().enumerate() {
-        let loc = Loc::new(path, i, file_count);
-        if run.hub.cancel.load(Ordering::SeqCst) {
-            run.emit(progress(task_id, "cancelled", loc));
-            continue;
-        }
-        run.emit(progress(task_id, "file-start", loc));
-        match translate_one(&run, loc, path).await {
-            Ok(Some(out_path)) => {
-                let mut p = progress(task_id, "file-done", loc);
-                p.out_path = Some(out_path);
-                run.emit(p);
-            }
-            Ok(None) => run.emit(progress(task_id, "cancelled", loc)),
-            Err(e) => {
-                let mut p = progress(task_id, "file-failed", loc);
-                p.error = Some(e);
-                run.emit(p);
-            }
-        }
+        // 行内「重译」点名的那几个文件要逼一次真翻译：绕开豁免账与内容缓存（ai_file）
+        let force = spec.force_paths.iter().any(|p| p == path);
+        files.spawn(file_task(
+            Arc::clone(&run),
+            path.clone(),
+            i,
+            file_count,
+            force,
+            Arc::clone(&prepare),
+        ));
     }
+    while files.join_next().await.is_some() {}
     let mut p = progress(task_id, "queue-finished", Loc::new("", file_count, file_count));
     p.error = run.hub.fatal();
     run.emit(p);
 }
 
+/// 一个文件的全生命周期：排队拿「预备深度」名额 → file-start → 翻译（块在全局池里飞，
+/// 同期后面文件的块也在这个池里排队）→ 写盘记账 → 终态事件。
+/// 取消语义与旧版一致：没开始就 cancelled；翻到一半的在飞块跑完为止，不写盘。
+async fn file_task(
+    run: Arc<Run>,
+    path: String,
+    index: usize,
+    count: usize,
+    force: bool,
+    prepare: Arc<tokio::sync::Semaphore>,
+) {
+    // 预备名额先于一切：没排到就不发 file-start，界面上它还是「等待」
+    let Ok(_permit) = prepare.acquire().await else { return };
+    let loc = Loc::new(&path, index, count);
+    if run.hub.cancel.load(Ordering::SeqCst) {
+        run.emit(progress(run.task_id, "cancelled", loc));
+        return;
+    }
+    run.emit(progress(run.task_id, "file-start", loc));
+    match translate_one(&run, loc, &path, force).await {
+        Ok(Some(done)) => {
+            let mut p = progress(run.task_id, "file-done", loc);
+            p.out_path = Some(done.out_path);
+            p.segment_count = done.segment_count;
+            if done.fallback_lines > 0 {
+                p.fallback_lines = Some(done.fallback_lines);
+            }
+            run.emit(p);
+        }
+        Ok(None) => run.emit(progress(run.task_id, "cancelled", loc)),
+        Err(e) => {
+            let mut p = progress(run.task_id, "file-failed", loc);
+            p.error = Some(e);
+            run.emit(p);
+        }
+    }
+}
+
 async fn run_all_texts(app: &AppHandle, spec: &AiTextsSpec, task_id: u64, cancel: &Arc<AtomicBool>) {
     let hub = Hub::for_job(
-        creds_of(&spec.base_url, &spec.api_key, &spec.model),
+        creds_of(&spec.base_url, &spec.api_key, &spec.model, spec.api_style),
         spec.model_kind,
         spec.chunk_size,
         spec.concurrency,
         spec.merge_lines,
         Arc::clone(cancel),
     );
-    let run = Run::new(app, task_id, hub);
+    let run = Run::new(app.clone(), task_id, hub);
     let loc = Loc::new("", 0, spec.texts.len());
     if let Err(e) = run.hub.check_ready() {
         let mut p = progress(task_id, "queue-finished", loc);
@@ -313,10 +319,13 @@ async fn run_all_texts(app: &AppHandle, spec: &AiTextsSpec, task_id: u64, cancel
     }
     let translated = translate_chunks(&run, loc, &spec.texts).await;
     match translated {
-        Some(list) => {
+        Some((list, fallback)) => {
             let mut p = progress(task_id, "queue-finished", loc);
             p.segment_count = spec.texts.len();
             p.translated = Some(list);
+            if fallback > 0 {
+                p.fallback_lines = Some(fallback);
+            }
             p.error = run.hub.fatal();
             run.emit(p);
         }
@@ -352,11 +361,23 @@ mod tests {
         let s: AiTranslateSpec =
             serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m","paths":["a.lrc"]}"#).unwrap();
         assert_eq!(s.model_kind, ModelKind::Remote);
+        assert_eq!(s.api_style, crate::model::ApiStyle::OpenAiChat, "apiStyle 缺席 = 照旧走 chat/completions");
         assert_eq!(s.merge_lines, None);
+        assert!(s.force_paths.is_empty(), "forcePaths 缺席 = 全部走省钱闸门，不逼重译");
         let s2: AiTextsSpec =
             serde_json::from_str(r#"{"baseUrl":"u","apiKey":"k","model":"m","texts":["x"],"modelKind":"local","mergeLines":6}"#)
                 .unwrap();
         assert_eq!((s2.model_kind, s2.merge_lines), (ModelKind::Local, Some(6)));
+        let s3: AiTranslateSpec = serde_json::from_str(
+            r#"{"baseUrl":"u","apiKey":"k","model":"m","paths":["a.lrc"],"forcePaths":["a.lrc"]}"#,
+        )
+        .unwrap();
+        assert_eq!(s3.force_paths, vec!["a.lrc".to_string()], "行内重译点名走 force 通道");
+        let s4: AiTranslateSpec = serde_json::from_str(
+            r#"{"baseUrl":"u","apiKey":"k","model":"m","paths":["a.lrc"],"apiStyle":"anthropic"}"#,
+        )
+        .unwrap();
+        assert_eq!(s4.api_style, crate::model::ApiStyle::Anthropic, "新协议随 spec 透传到批量任务");
     }
 
     /// 收尾事件带 error 是「队列提前结束」的唯一对外信号，缺席时必须整键消失

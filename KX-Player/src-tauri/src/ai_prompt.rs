@@ -36,6 +36,22 @@ pub fn translated_path(src: &str, ext: &str) -> String {
     join_path(dir, &format!("{base}.zh.{ext}"))
 }
 
+/// 该路径是不是本软件写出的译文（[`translated_path`] 的逆命题）：去扩展名后以 `.zh` 结尾。
+/// 两道防线共用这一个约定的事实源：
+/// - 扫描（`ai_scan`）在源头排除译文文件 —— 否则 1.zh.lrc 会被当新字幕扫进队列，
+///   一路翻出 1.zh.zh.lrc，用户看到的正是「翻译过的内容又被翻译一遍」；
+/// - 翻译管线入口（`ai_file::translate_one`）再兜一层 —— 旧扫描结果还挂在界面上时，
+///   用户可能不重扫就点「开始翻译」，防线不能只有扫描那一道。
+pub fn is_translated_output(path: &str) -> bool {
+    let name = path.rsplit_once('/').map(|(_, n)| n).unwrap_or(path);
+    let name = name.rsplit_once('\\').map(|(_, n)| n).unwrap_or(name);
+    match name.rsplit_once('.') {
+        // 大小写不敏感：Windows 文件名本就无大小写之分，工具同步改写大小写不该漏网
+        Some((stem, _)) => stem.to_ascii_lowercase().ends_with(".zh"),
+        None => false,
+    }
+}
+
 /// 按块大小切段，返回每块的段下标区间 [start, end)
 pub fn chunk_ranges(total: usize, chunk_size: usize) -> Vec<(usize, usize)> {
     let size = chunk_size.max(1);
@@ -89,16 +105,9 @@ pub fn parse_numbered_reply(reply: &str, expected: usize) -> Option<Vec<String>>
     if hit < (expected * 8).div_ceil(10) {
         return None;
     }
+    // 命中够 80% 但仍有缺行的，以空串占位 —— 缺哪行由调用方（ai_chunk）记入
+    // 「回退原文」的账，不再在这里就地替换：静默替换正是「是否翻译正确未知」的根源。
     Some(got.into_iter().map(|v| v.unwrap_or_default()).collect())
-}
-
-/// 空译文回退原文（与前端一致：宁可留原文，也不要空行）
-pub fn fill_missing(translated: Vec<String>, origin: &[String]) -> Vec<String> {
-    translated
-        .into_iter()
-        .enumerate()
-        .map(|(i, t)| if t.is_empty() { origin.get(i).cloned().unwrap_or_default() } else { t })
-        .collect()
 }
 
 #[cfg(test)]
@@ -150,5 +159,22 @@ mod tests {
         assert_eq!(translated_path("/a/b/y", "lrc"), "/a/b/y.zh.lrc");
         assert_eq!(translated_path("z.lrc", "lrc"), "z.zh.lrc");
         assert_eq!(join_path("/a/b/", "c"), "/a/b/c");
+    }
+
+    #[test]
+    fn translated_output_recognizes_its_own_convention() {
+        assert!(is_translated_output("/a/b/1.zh.lrc"));
+        assert!(is_translated_output(r"C:\x\y\1.zh.srt"));
+        assert!(is_translated_output("/a/1.zh.zh.lrc"), "译文的译文更是译文");
+        assert!(is_translated_output("/a/1.ZH.LRC"), "Windows 文件名不分大小写");
+        assert!(!is_translated_output("/a/1.lrc"), "源文件放行");
+        assert!(!is_translated_output("/a/1.zhang.lrc"), "只是恰好含 zh 的名字不是译文");
+        assert!(!is_translated_output("/a/1zh.lrc"));
+        assert!(!is_translated_output("/a/noext"));
+        // 自洽：translated_path 的产物必须被逆命题认出来，否则扫描过滤会漏
+        for src in ["/a/b/x.srt", "/a/b/y.lrc", "z.vtt"] {
+            let ext = src.rsplit_once('.').map(|(_, e)| e).unwrap_or("lrc");
+            assert!(is_translated_output(&translated_path(src, ext)), "{src} 的译文该被认出");
+        }
     }
 }

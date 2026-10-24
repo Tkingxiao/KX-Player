@@ -512,7 +512,7 @@ function applyResponsive(): void {
 | 1200–1440 | 三栏全开，卡片 4–6 列 | 同上 |
 | 1024–1200 | 检查器自动折叠 | ✅ `w < 1200` |
 | 900–1024 | 侧栏折叠为图标栏 | ✅ `w < 1024` |
-| < 900 | 不允许（最小窗口 900×600） | ✅ 靠 `tauri.conf.json` 的 `minWidth: 900 / minHeight: 600` 兜住 |
+| < 900 | 不允许（最小窗口 900×600） | ✅ 靠主窗口的 `min_inner_size(900, 600)` 兜住（`lib.rs:122`） |
 
 ⚠️ **差距**：规范里 ≥1440 / 1200–1440 的「卡片 5–7 / 4–6 列」**没有对应实现**。
 列数完全由「容器宽 + gridSize」算出（`VirtualGrid.vue:51`），在不同 DPI/侧栏状态下不会
@@ -540,7 +540,8 @@ function applyResponsive(): void {
 
 ### 11.3 窗口级限制
 
-`tauri.conf.json:17-20`：默认 1200 × 800，`minWidth 900` / `minHeight 600`。
+`lib.rs:121-122`（主窗口在 `setup` 里用 `WebviewWindowBuilder` 建，见 ARCHITECTURE §1）：
+默认 1200 × 800，`min_inner_size` 900 × 600。
 这也解释了规范为什么把 `< 900` 标为「不允许」—— 系统层面就到不了那个宽度。
 
 ---

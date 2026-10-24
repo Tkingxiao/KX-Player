@@ -207,6 +207,9 @@ export interface ConvertProgress {
 /** Rust: `ai_strategy::ModelKind` —— 翻译策略档位。`local` 走小批量、单并发、长超时、解析失败二分回收 */
 export type AiModelKind = 'remote' | 'local'
 
+/** Rust: `model::ApiStyle` —— 接口协议（线形状）。缺省 `openai-chat` = 历史 chat/completions 行为 */
+export type AiApiStyle = 'openai-chat' | 'openai-responses' | 'anthropic'
+
 /** 两个 AI 任务共用的接入参数；前端侧沿用 `baseURL` 命名，桥接层映射成 wire 的 `baseUrl` */
 export interface AiJobOptions {
   baseURL: string
@@ -214,6 +217,8 @@ export interface AiJobOptions {
   model: string
   /** 缺省 `remote` = 第 11 批的参数 */
   modelKind?: AiModelKind
+  /** 接口协议：缺省 `openai-chat`；三种协议的 URL 末段/鉴权头/线形状都由 Rust 侧分派 */
+  apiStyle?: AiApiStyle
   /** 本地模型一次合并几条（2–10），仅 `modelKind = 'local'` 时起作用 */
   mergeLines?: number
   chunkSize?: number
@@ -226,7 +231,10 @@ export interface AiTranslateSpec {
   apiKey: string
   model: string
   paths: string[]
+  /** 点名要真重译的路径子集（行内「重译」放进队列的）：后端据此绕开豁免账与内容缓存 */
+  forcePaths?: string[]
   modelKind?: AiModelKind
+  apiStyle?: AiApiStyle
   mergeLines?: number
   chunkSize?: number
   concurrency?: number
@@ -239,6 +247,7 @@ export interface AiTextsSpec {
   model: string
   texts: string[]
   modelKind?: AiModelKind
+  apiStyle?: AiApiStyle
   mergeLines?: number
   chunkSize?: number
   concurrency?: number
@@ -266,8 +275,10 @@ export interface AiProgress {
   outPath?: string
   /** `file-failed` = 这个文件为什么没翻成；`queue-finished` = 整条队列**为什么提前结束**（端点失联） */
   error?: string
-  /** 仅文本任务的 `queue-finished`：与请求等长，缺项已回退原文 */
+  /** 仅文本任务的 `queue-finished`：与请求等长、缺项已回退原文 */
   translated?: string[]
+  /** 本次有多少行最终回退了原文（>0 才出现）：「翻译跑完」和「翻译翻好了」的差值必须可见 */
+  fallbackLines?: number
 }
 
 /** Rust: `ai_scan::ScannedItem` —— `subtitle_scan_dir` 的条目 */
@@ -278,6 +289,44 @@ export interface SubtitleScanItem {
   ext?: string
   /** 是否已翻译可豁免（源没变 + .zh 译文仍在） */
   translated?: boolean
+}
+
+/** Rust: `model::AiEndpointPolicy` —— `ai_endpoint_check` 的端点策略体检回执 */
+export interface AiEndpointPolicy {
+  ok: boolean
+  /** 被拦时的原因原文（与测试连接看到的一致） */
+  reason?: string
+  /**
+   * 被拦、但显式放行这个 `host:port` 就能用的端点；缺席 = 放行也救不了
+   * （地址本身不合规）。公网/私网判断只活在 Rust，前端不复刻规则。
+   */
+  endpoint?: string
+  /** 当前明文放行名单，随每条回执带上 */
+  allowlist: string[]
+}
+
+// ── 译文管理（AI 工作台第四工种：已翻译文件的盘点与处置）──
+
+export type AiTranslatedStatus = 'ok' | 'changed' | 'out_missing' | 'source_gone'
+
+/** Rust: `ai_translated::TranslatedEntry` —— 翻译账一条 + 文件系统现状分类 */
+export interface AiTranslatedEntry {
+  sourcePath: string
+  sourceName: string
+  outPath: string
+  /** 译文文件现在还在盘上吗（「打开译文」按钮的可用性跟着它走） */
+  outExists: boolean
+  audioPath?: string
+  /** 翻译完成时刻（epoch ms） */
+  translatedAt: number
+  status: AiTranslatedStatus
+}
+
+/** Rust: `ai_translated::RemoveReport` —— 删译文/清账的逐条回执 */
+export interface AiRemoveReport {
+  removed: number
+  /** 形状「路径：原因」，整体照常返回不挡其余条目 */
+  errors: string[]
 }
 
 // ── AI-16 半自动模式（导出 / 导入批次，无 Provider 也能走通）──
@@ -368,6 +417,10 @@ export interface AiChatPayload {
   /** `ai_ping` 不需要它（Rust 侧 `#[serde(default)]`），由后端补一条最小请求 */
   messages?: ChatMessage[]
   temperature?: number
+  /** 模型档位，仅 `ai_ping` 消费：测试连接的超时跟着档位走（本地档给足加载权重的时间） */
+  modelKind?: AiModelKind
+  /** 接口协议，缺省 `openai-chat`（Rust 侧 `#[serde(default)]`，老调用方不带时照旧） */
+  apiStyle?: AiApiStyle
 }
 
 export interface AiChatResult {

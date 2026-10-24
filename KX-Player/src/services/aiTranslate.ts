@@ -27,6 +27,15 @@ export interface TranslateRow {
   state: 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'exempt'
   error?: string
   out?: string
+  /** `file-done` 带回：本次有多少行回退了原文（>0 = 「完成」但没翻干净，可点名重译） */
+  fallback?: number
+  /** `file-done` 带回：这个文件共多少段（fallback 的分母） */
+  segments?: number
+  /** 运行中由 chunk-done 心跳刷新：当前文件翻到第几块（前端从此消费 tick，进度不再整文件级凝固） */
+  chunkDone?: number
+  chunkTotal?: number
+  /** 行内「重译」点的名：本次启动要绕开后端的豁免账与内容缓存，逼一次真翻译 */
+  force?: boolean
 }
 
 /**
@@ -39,20 +48,39 @@ export function applyProgress(rows: TranslateRow[], p: AiProgress): void {
   switch (p.state) {
     case 'file-start':
       row.state = 'running'
+      row.chunkDone = 0
+      row.chunkTotal = 0
+      row.fallback = undefined
+      row.segments = undefined
+      break
+    case 'chunk-done':
+      // 心跳只刷块进度，不动行状态（限速 ≥500ms 一条，缺席是正常输入）
+      if (p.chunkTotal > 0) {
+        row.chunkDone = p.chunkDone
+        row.chunkTotal = p.chunkTotal
+      }
       break
     case 'file-done':
       row.state = 'done'
       row.out = p.outPath ?? ''
+      row.fallback = p.fallbackLines
+      row.segments = p.segmentCount
+      row.chunkDone = undefined
+      row.chunkTotal = undefined
       break
     case 'file-failed':
       row.state = 'failed'
       row.error = p.error ?? '翻译失败'
+      row.chunkDone = undefined
+      row.chunkTotal = undefined
       break
     case 'cancelled':
       row.state = 'skipped'
+      row.chunkDone = undefined
+      row.chunkTotal = undefined
       break
     default:
-      // chunk-done / queue-finished 不改单行状态，进度由调用方自己累计
+      // queue-finished 不改单行状态，进度由调用方自己累计
       break
   }
 }
@@ -124,7 +152,7 @@ function startJob(launch: () => Promise<number>, onProgress: (p: AiProgress) => 
 
 /** 启动字幕翻译队列：每个文件一个任务单元，产物是同目录的 .zh.* */
 export function translateSubtitleFiles(
-  opts: AiJobOptions & { paths: string[] },
+  opts: AiJobOptions & { paths: string[]; forcePaths?: string[] },
   onProgress: (p: AiProgress) => void,
 ): AiTranslateJob {
   return startJob(() => api.aiTranslateStart(opts), onProgress)

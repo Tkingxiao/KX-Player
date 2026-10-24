@@ -14,8 +14,12 @@
 import type {
   AiChatPayload,
   AiChatResult,
+  AiEndpointPolicy,
   AiExportResult,
   AiImportResult,
+  AiRemoveReport,
+  AiTranslatedEntry,
+  AiApiStyle,
   AiModelKind,
   AiModelsResult,
   AiPingResult,
@@ -126,10 +130,17 @@ export interface CommandSpecs {
 
   // ── 窗口、设置、ffmpeg、AI（commands/system.rs）──
   ai_chat: { args: { payload: AiChatPayload }, returns: AiChatResult }
+  ai_endpoint_check: { args: { baseUrl: string }, returns: AiEndpointPolicy }
+  ai_translated_cleanup: { args: {}, returns: number }
+  ai_translated_list: { args: {}, returns: AiTranslatedEntry[] }
+  ai_translated_remove: { args: { paths: string[], removeFile: boolean }, returns: AiRemoveReport }
+  /** 删除选中条目的原文文件：路径必须精确命中翻译账；译文与账保留 */
+  ai_translated_remove_source: { args: { paths: string[] }, returns: AiRemoveReport }
   ai_export_prompts: { args: { paths: string[] }, returns: AiExportResult }
   ai_import_translations: { args: { paths: string[], text: string, apply: boolean }, returns: AiImportResult }
-  ai_list_models: { args: { baseUrl: string, apiKey: string }, returns: AiModelsResult }
+  ai_list_models: { args: { baseUrl: string, apiKey: string, apiStyle?: AiApiStyle | null }, returns: AiModelsResult }
   ai_ping: { args: { payload: AiChatPayload }, returns: AiPingResult }
+  ai_plaintext_set: { args: { endpoint: string, allow: boolean }, returns: string[] }
   ai_task_cancel: { args: { taskId: number }, returns: boolean }
   ai_texts_start: { args: { spec: AiTextsSpec }, returns: number }
   ai_translate_start: { args: { spec: AiTranslateSpec }, returns: number }
@@ -160,8 +171,8 @@ export interface CommandSpecs {
   rename_preview: { args: { paths: string[] }, returns: RenamePreview }
   rename_redo: { args: { batchId: string }, returns: RenameReport }
   rename_rollback: { args: { batchId: string }, returns: RenameReport }
-  /** 生成模型译名：只往 `rename_name_cache` 写**过了九道校验**的名字，一个字都不改盘 */
-  rename_suggest_names: { args: { paths: string[], baseUrl: string, apiKey: string, model: string, modelKind?: AiModelKind | null }, returns: RenameSuggestReport }
+  /** 生成模型译名：只往 `rename_name_cache` 写**过了九道校验**的名字，一个字都不改盘。`onlyPaths` 非空 = 只清点这些条目路径（只生成选中的） */
+  rename_suggest_names: { args: { paths: string[], baseUrl: string, apiKey: string, model: string, modelKind?: AiModelKind | null, apiStyle?: AiApiStyle | null, onlyPaths?: string[] | null }, returns: RenameSuggestReport }
   rename_reject_suggestion: { args: { path: string, suggestion: string }, returns: void }
 }
 
