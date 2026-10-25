@@ -34,6 +34,14 @@ export function useTrackActions() {
     })
   }
 
+  function openInExplorer(path: string, label = '文件位置'): void {
+    void api.showItemInFolder(path)
+      .then((ok) => {
+        if (!ok) ui.toast(`无法打开${label}：${path}`, 'error')
+      })
+      .catch((e) => ui.toast(errText(e), 'error'))
+  }
+
   /** 加入分类子菜单（含新建入口） */
   function buildCategoryTargets(track: Track): ContextMenuItem[] {
     const cats = taxonomy.flatCategories
@@ -143,7 +151,7 @@ export function useTrackActions() {
       { label: '复制文件路径', action: () => copyText(track.path, '路径') },
       {
         label: '打开所在文件夹',
-        action: () => void api.showItemInFolder(track.path),
+        action: () => openInExplorer(track.path, '所在文件夹'),
       },
       {
         label: '定位到所在目录',
@@ -193,5 +201,5 @@ export function useTrackActions() {
     }
   }
 
-  return { playTrackInContext, playTrackFromLast, trackMenuItems, showTrackMenu, confirmRemoveList, copyText }
+  return { playTrackInContext, playTrackFromLast, trackMenuItems, showTrackMenu, confirmRemoveList, copyText, openInExplorer }
 }

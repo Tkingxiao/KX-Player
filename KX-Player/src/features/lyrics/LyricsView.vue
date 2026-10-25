@@ -9,13 +9,12 @@ import { useTrackActions } from '@/composables/useTrackActions'
 import { resolveTrackCover } from '@/utils/covers'
 import { activeLyricIndex } from '@/utils/parsers/lyrics'
 import { fmtTime, fmtFSize, fmtQuality, trackDir } from '@/utils/format'
-import { api } from '@/bridge/ipc'
 
 const ui = useUiStore()
 const player = usePlayerStore()
 const library = useLibraryStore()
 const playlists = usePlaylistsStore()
-const { copyText } = useTrackActions()
+const { copyText, openInExplorer } = useTrackActions()
 
 const coverUrl = ref<string | null>(null)
 let coverReqId = 0
@@ -156,7 +155,7 @@ const isFavorite = computed(() => (player.currentId ? playlists.isFavorite(playe
           </div>
           <div class="lv-info-actions">
             <button class="btn-ghost" @click="player.current && copyText(trackDir(player.current) || '', '文件夹路径')">复制所在文件夹</button>
-            <button class="btn-ghost" @click="player.current && api.showItemInFolder(player.current.path)">在资源管理器中显示</button>
+            <button class="btn-ghost" @click="player.current && openInExplorer(player.current.path, '所在文件夹')">在资源管理器中显示</button>
           </div>
         </div>
       </div>

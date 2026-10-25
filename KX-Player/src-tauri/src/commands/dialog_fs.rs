@@ -318,11 +318,10 @@ fn set_clipboard_win(text: &str) -> bool {
     }
 }
 
-/// 资源管理器中定位文件。
+/// 资源管理器中打开文件或目录。
 ///
-/// `explorer.exe` 只认**一个**参数 `/select,<路径>`：拆成 `["/select,", path]` 时它把
-/// 第一个参数当成要打开的位置、第二个当成不存在的东西，结果是静默什么都不做
-/// （不报错、不弹窗，用户只看见「点了没反应」）。
+/// 文件要用一个 `/select,<路径>` 参数定位；目录不能也走 `/select`，否则资源管理器只会
+/// 打开它的父目录并选中目录，用户会误以为「打开所在文件夹」失效。
 ///
 /// 这里用 `std::process::Command` 而不是 `tokio::process`：只是把进程拉起来就走，
 /// 不需要 reactor，也就不该因为取不到运行时（`fftools::runtime()` 失败）而误报 false。
@@ -332,19 +331,53 @@ pub fn show_item_in_folder(scope: tauri::State<'_, PathScope>, path: String) -> 
     if path.is_empty() {
         return false;
     }
-    if !scope.allows(&path) {
-        deny("show_item_in_folder", &path, crate::scope::Denied::Outside);
-        return false;
-    }
+    let resolved = match scope.resolve(&path) {
+        Ok(p) => p,
+        Err(why) => {
+            deny("show_item_in_folder", &path, why);
+            return false;
+        }
+    };
     #[cfg(windows)]
     {
-        std::process::Command::new("explorer.exe")
-            .arg(format!("/select,{path}"))
-            .spawn()
-            .is_ok()
+        let args = explorer_args(&resolved, resolved.is_dir());
+        match std::process::Command::new("explorer.exe").args(args).spawn() {
+            Ok(_) => true,
+            Err(e) => {
+                crate::paths::append_log(&format!("[fs] 打开资源管理器失败：{path}（{e}）"));
+                false
+            }
+        }
     }
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+#[cfg(windows)]
+fn explorer_args(path: &Path, is_dir: bool) -> Vec<std::ffi::OsString> {
+    if is_dir {
+        vec![path.as_os_str().to_os_string()]
+    } else {
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path.as_os_str());
+        vec![arg]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn explorer_uses_a_directory_as_the_location_but_selects_a_file() {
+        use super::explorer_args;
+        use std::path::Path;
+
+        let dir = explorer_args(Path::new(r"C:\Music\Album"), true);
+        assert_eq!(dir, vec![std::ffi::OsString::from(r"C:\Music\Album")]);
+
+        let file = explorer_args(Path::new(r"C:\Music\Album\song.lrc"), false);
+        assert_eq!(file, vec![std::ffi::OsString::from(r"/select,C:\Music\Album\song.lrc")]);
     }
 }

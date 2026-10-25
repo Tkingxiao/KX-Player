@@ -20,12 +20,21 @@ import { normDir, fmtFSize } from '@/utils/format'
 import { api } from '@/bridge/ipc'
 import type { ContextMenuItem } from '@/stores/ui'
 import type { Category } from '@/contracts/api'
+import { errText } from '@/contracts/result'
 
 const ui = useUiStore()
 const library = useLibraryStore()
 const playlists = usePlaylistsStore()
 const settings = useSettingsStore()
 const taxonomy = useTaxonomyStore()
+
+function openInExplorer(path: string): void {
+  void api.showItemInFolder(path)
+    .then((ok) => {
+      if (!ok) ui.toast(`无法打开文件夹：${path}`, 'error')
+    })
+    .catch((e) => ui.toast(errText(e), 'error'))
+}
 
 const collapsed = computed({
   get: () => settings.sidebarCollapsed,
@@ -236,7 +245,7 @@ function showFolderMenu(e: MouseEvent, path: string): void {
   const isRoot = library.folderPaths.some((p) => normDir(p) === np)
   const items: ContextMenuItem[] = [
     { label: '进入文件夹', action: () => goFolder(np) },
-    { label: '在资源管理器中打开', action: () => void api.showItemInFolder(np) },
+    { label: '在资源管理器中打开', action: () => openInExplorer(np) },
     {
       label: 'AI 翻译此文件夹…',
       action: () => {
