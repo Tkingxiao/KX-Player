@@ -366,7 +366,7 @@ App 启动后仍可能无条件加载搜索依赖；搜索每个输入都遍历�
 - `ai_translate_start` 的返回类型是 taskId、回不了错误信封：拒绝走 `ai_job::reject` —— **不登记任务表**（没有东西在跑，`cancel` 也不认它），只发一条与正常收尾**同形**的 `queue-finished` + error（`file_index = 0`、`file_count` = 整批条数）。前端 `startJob` 的「先订阅再启动 + 暂存早到事件」正好覆盖这条路径，UI 不会漏掉原因。
 - `subtitle_scan_dir` 不能把 `State<'_, PathScope>` 当入参：Tauri 不接受「带引用的 async 命令返回非 Result」，所以 scope 从 `AppHandle` 取（`open_folder` 的先例），并且在 `spawn_blocking().await` 之前就放掉借用；拒绝 = 空列表 + `[scope]` 日志。
 - 不需要闸门的：`ai_texts_start`（纯文本、无路径）与 `ai_ping`/`ai_chat`/`ai_list_models`（只有网络）；`rename_reject_suggestion` 只往拒绝表写一行、不碰盘，也不在闸门范围内 —— 别按「带路径参数」一刀切把它加进去，加了只会让「先移除文件夹、再拒译名」这类流程平白失败。
-- 正当来路仍只有两条：`open_folder` 选中的目录（`allow_root`）→ `subtitle_scan_dir` 扫出的路径；`open_text_files` 授权的译文文件。所以正常流程走不到闸门 —— 这是边界，不是默认路径。
+- 正当来路（2026-10-25 第 38 批起为四条）：`open_folder` 选中的目录（`allow_root`）→ `subtitle_scan_dir` 扫出的路径；`open_text_files` 授权的译文文件；**翻译账里记录过的目录**（`ai_translated::ledger_dirs`：账内 `source_path`/`out_path` 的去重真实父目录，启动时随 `folderPaths` 一起登记——账是应用自己写入的、目录是用户当年对话框授权过的延续，没有它重启后译文管理页的「打开译文 / 重译」全被闸门拒掉，详见 HANDOVER 第 38 批）。
 - 用例 2 条：AI 闸门整批拒且**指出越界的那一条**（授权前后各断言一次）；拒绝事件与收尾事件同形（`taskId`/`state`/`fileIndex`/`fileCount`/`error` 齐全，且不带译文）。
 
 **改名与旧 ID 迁移的 intent journal 与启动恢复（P1-11）**于 2026-09-24（第 27 批）闭合：

@@ -11,7 +11,7 @@
 
 use crate::ai_cache;
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +83,35 @@ pub fn list(conn: &Connection) -> Vec<TranslatedEntry> {
             TranslatedEntry { source_path, source_name, out_path, out_exists, audio_path, translated_at, status }
         })
         .collect()
+}
+
+/// 翻译账里记录过的**目录**（`source_path` 与 `out_path` 的去重父目录，不存在的不算）。
+///
+/// 这是 `PathScope` 的第四条授权来路（P0-1）：账是应用自己写入的，目录是用户在**某次
+/// 会话里用对话框授权过的**——但 `PathScope` 是内存态，重启即失忆，于是译文管理页
+/// 「打开译文」被闸门静默拒掉、重译整批拒（前端 fire-and-forget 连错误都看不见）。
+/// 把账里的目录在启动时记回去，与 `folderPaths`（库里登记的根）同一个信任等级；
+/// 不存在与读不出来的目录自然漏掉，`allow_root` 那边也会再 canonicalize 一次。
+pub fn ledger_dirs(conn: &Connection) -> Vec<PathBuf> {
+    let Ok(mut stmt) = conn
+        .prepare("SELECT source_path, out_path FROM ai_translate_cache WHERE kind = 'subtitle'")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))) else {
+        return Vec::new();
+    };
+    let mut dirs = std::collections::BTreeSet::new();
+    for (source, out) in rows.flatten() {
+        for p in [Some(source), out] {
+            if let Some(parent) = p.as_deref().map(Path::new).and_then(Path::parent) {
+                if parent.is_dir() {
+                    dirs.insert(parent.to_path_buf());
+                }
+            }
+        }
+    }
+    dirs.into_iter().collect()
 }
 
 /// 清理失效账：源、译文都不在的行是纯垃圾（留着只会让列表虚胖），一键删掉。
@@ -318,5 +347,41 @@ mod tests {
         assert_eq!(r.removed, 0);
         assert!(r.errors[0].contains("已不在"), "{}", r.errors[0]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 授权来路的第四条（PathScope 重启失忆的解药）：账里记录的目录要去重、
+    /// 只算真实存在的；源没了（source_gone）的条目靠 out_path 的父目录也能认回来。
+    #[test]
+    fn ledger_dirs_lists_distinct_existing_parents() {
+        let dir = tmpdir("ledger-dirs");
+        let other = tmpdir("ledger-dirs-out");
+        let conn = db();
+
+        // 正常条目：源与译文在同一目录 → 只记一个
+        std::fs::write(dir.join("a.lrc"), "x").unwrap();
+        let a_out = dir.join("a.zh.lrc").to_str().unwrap().to_string();
+        record(&conn, dir.join("a.lrc").to_str().unwrap(), &a_out);
+        std::fs::write(&a_out, "译文").unwrap();
+
+        // 译文写在另一个目录（异常但合法）→ 两个都记
+        std::fs::write(dir.join("b.lrc"), "x").unwrap();
+        let b_out = other.join("b.zh.lrc").to_str().unwrap().to_string();
+        record(&conn, dir.join("b.lrc").to_str().unwrap(), &b_out);
+        std::fs::write(&b_out, "译文").unwrap();
+
+        // source_gone：源没了，靠 out_path 的父目录照样能认回来
+        std::fs::write(dir.join("c.lrc"), "x").unwrap();
+        let c_out = dir.join("c.zh.lrc").to_str().unwrap().to_string();
+        record(&conn, dir.join("c.lrc").to_str().unwrap(), &c_out);
+        std::fs::write(&c_out, "译文").unwrap();
+        let _ = std::fs::remove_file(dir.join("c.lrc"));
+
+        let dirs = ledger_dirs(&conn);
+        assert!(dirs.contains(&dir), "源与译文的共同父目录必须在");
+        assert!(dirs.contains(&other), "译文独占的父目录也必须");
+        assert_eq!(dirs.len(), 2, "去重后只有这两个目录：{dirs:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }

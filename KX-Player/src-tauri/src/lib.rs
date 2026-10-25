@@ -107,6 +107,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             for root in db::library::folder_paths(&paths::library_db_path()) {
                 scope.allow_root(std::path::Path::new(&root));
             }
+            // 第四条来路：翻译账里记录过的目录（应用写入的账，是用户当年在对话框里授权过的延续）。
+            // 没有它，重启后译文管理页的「打开译文 / 重译」全被闸门拒掉——点击无声无息。
+            for dir in db::with_db(&paths::library_db_path(), |c| Ok(ai_translated::ledger_dirs(c))).unwrap_or_default() {
+                scope.allow_root(&dir);
+            }
             app.manage(scope);
 
             state::set_app_handle(app.handle().clone());

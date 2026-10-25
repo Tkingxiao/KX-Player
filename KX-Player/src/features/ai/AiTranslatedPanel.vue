@@ -166,8 +166,15 @@ async function cleanupGone(): Promise<void> {
   }
 }
 
-function openOut(entry: AiTranslatedEntry): void {
-  void api.showItemInFolder(entry.outPath)
+async function openOut(entry: AiTranslatedEntry): Promise<void> {
+  // 打不开要让人看见：false = 资源管理器没起来，reject = 命令层报错——都提示，不再点了没反应
+  try {
+    if (!(await api.showItemInFolder(entry.outPath))) {
+      ui.toast(`资源管理器打不开这份译文：${entry.outPath}`, 'error')
+    }
+  } catch (e) {
+    ui.toast(errText(e), 'error')
+  }
 }
 </script>
 
