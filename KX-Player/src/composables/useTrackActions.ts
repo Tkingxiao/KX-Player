@@ -9,6 +9,7 @@ import type { Track } from '@/contracts/api'
 import type { ContextMenuItem } from '@/stores/ui'
 import { trackDir } from '@/utils/format'
 import confirmHost from '@/services/confirmHost'
+import { errText } from '@/contracts/result'
 
 export function useTrackActions() {
   const player = usePlayerStore()
@@ -159,11 +160,12 @@ export function useTrackActions() {
       items.push(
         { label: '-', separatorBefore: true },
         { label: '清除播放进度', danger: true, action: () => {
+          // 失败如实提示：后端已把「写失败」与「没这行」分开（P1-6），这里不能吞
           void api.clearTrackProgress(track.id).then(() => {
             library.progress.delete(track.id)
             library.progress = new Map(library.progress)
             ui.toast('已清除进度', 'success')
-          })
+          }).catch((e) => ui.toast(errText(e), 'error'))
         } },
       )
     }

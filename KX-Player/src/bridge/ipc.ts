@@ -208,11 +208,14 @@ export const api: AppApi = {
   clipboardWriteText: (t) => invoke('clipboard_write_text', { text: t }),
   showItemInFolder: (p) => invoke('show_item_in_folder', { path: p }),
   getProgressAll: () => invoke('get_progress_all'),
+  // set_progress / mark_track_completed 是播放中的高频回写：「尽力而为」，失败不提示，
+  // 状态以 player:state 事件收敛（与下方播放内核调节同类）；用户主动的清除与书签操作
+  // 失败必须如实 reject，由调用方提示 —— 不再吞成 false/[]（P1-6）。
   setProgress: (id, ms, c, sp) =>
     invoke('set_progress', { trackId: id, positionMs: Math.round(ms), completed: c, lastSpeed: sp }).catch(() => false),
   markTrackCompleted: (id, c) => invoke('mark_track_completed', { trackId: id, completed: c }).catch(() => false),
-  clearTrackProgress: (id) => invoke('clear_track_progress', { trackId: id }).catch(() => false),
-  listBookmarks: (id) => invoke('list_bookmarks', { trackId: id }).then(decorateBookmarks).catch(() => []),
+  clearTrackProgress: (id) => invoke('clear_track_progress', { trackId: id }),
+  listBookmarks: (id) => invoke('list_bookmarks', { trackId: id }).then(decorateBookmarks),
   addBookmark: async (id, ms, label) => {
     try {
       return await invoke('add_bookmark', { trackId: id, atMs: Math.round(ms), label })
@@ -220,8 +223,8 @@ export const api: AppApi = {
       return null
     }
   },
-  renameBookmark: (id, label) => invoke('rename_bookmark', { id, label }).catch(() => false),
-  removeBookmark: (id) => invoke('remove_bookmark', { id }).catch(() => false),
+  renameBookmark: (id, label) => invoke('rename_bookmark', { id, label }),
+  removeBookmark: (id) => invoke('remove_bookmark', { id }),
 
   // ── 播放内核 ──
   // 这些命令的 Rust 侧一律 resolve `()`，成功/失败只由 reject 表达；

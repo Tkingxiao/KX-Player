@@ -128,9 +128,14 @@
 
 ### P1-6 错误被吞，成功语义不可信
 
-`bridge/ipc.ts`、`commands/library.rs`、进度/书签/响度/监听等链路仍有 `catch fallback`、`let _ =`、只判断 `JoinHandle` 成功的路径。数据库写失败、事件发送失败、watcher 启动失败可能被 UI 当作成功或空数据。
+进度/书签/响度链路的后端半已于 2026-10-25（第 37 批）闭合，证据见 §7：`db::progress` 七个函数返回 `Result`（写失败上抛；读侧「库不存在 = Ok(空)」与「库在但读失败 = Err」分开）、八条命令改 `IpcResult`（校验 `invalid_argument` / join `join_failed` / 库 `IpcError::db` 三分类）、响度「量出来了但写库失败」进 `failed` 计数并记日志、`loudness:progress` 两处 emit 失败记 `[loudness]` 日志、bridge 对用户主动操作（clear/list/rename/remove）撤 catch 让 reject 上抛并由调用方 toast/warn 接住。
 
-整改方向：写操作统一 `IpcResult<T>`；读取区分 empty/not-found/unavailable/failed；事件发送失败带 taskId 并写结构化日志；UI 统一 loading/success/error/retry action wrapper。
+当前仍未闭合的剩余项：
+
+- UI 统一 loading/success/error/retry action wrapper：各视图仍各写各的（`errText` + toast 只在部分面板有），没有统一的 action 包装层与重试入口。
+- watcher 挂不上监听（离线盘）现在只有 console.warn 与 `[watcher]` 日志，没有 UI error/retry 状态（P1-5 的已知残留归到这里）。
+- 读取「empty/not-found/unavailable/failed」的区分只在进度/书签做了；其余读类命令（封面、设备、目录树等）仍是失败冒充空数据。
+- 残余的 `let _ =`：pip 与主窗口的 show/hide/focus 这类 UI 操作、`addBookmark` 的 catch→null（调用方尚未区分 null 来源）等，影响面小，按链路逐条裁决，不一刀切。
 
 ### P1-7 设置、历史、封面和译文落盘不具备崩溃恢复
 
@@ -262,18 +267,19 @@ App 启动后仍可能无条件加载搜索依赖；搜索每个输入都遍历�
 
 ## 7. 验证基线
 
-2026-10-25 复核（三个工作流合批入库前全量实跑：第 34 批响度 Rust 侧积分、数据目录进安装目录与 NSIS 安装器、AI 三协议/端点放行/译文管理；另有一次 `.ulpi/design/DESIGN.md` 被误删已从 HEAD 恢复，门禁脚本与 `.gitignore` 未动）：
+2026-10-25 复核（第 37 批进度/书签/响度错误语义入库前，全量实跑；其上一次全量基线见本节末「合批入库」段）：
 
 - `npm run check:types`：通过。
-- 前端 Vitest：17 个测试文件、148 条用例通过（`tests/` 按用户 2026-09-22 裁决不入库、只在本机跑；较第 34 批基线 16 文件 / 130 条 = +1 文件 / +18 条：新文件 `tests/ai-translated.test.ts` 8 条，其余为既有文件的用例扩展）。
-- `npm run check:ipc`：通过（113 条命令 / 16 个事件 / 115 处 invoke / 16 处监听）——较第 34 批基线 +6 条命令：`ai_endpoint_check` / `ai_plaintext_set` / `ai_translated_list` / `ai_translated_cleanup` / `ai_translated_remove` / `ai_translated_remove_source`；`docs/IPC.md` 已随 `gen:ipc` 同步。
-- `npm run check:columns`：通过（18 张表 / 101 个列名 / 68 个 db/*.rs / 342 处列引用 / 7 个 DTO 接口 / 263 个字段 / 8 条例外）——源文件数 64 → 68：本批新增 `ai_batch.rs` / `ai_event.rs` / `ai_file.rs` / `ai_translated.rs` 四个模块。
-- `npm run check:colors`：通过（DESIGN.md role 26 个 hex / theme.css 57 处字面值 / 组件侧 45 处字面值覆盖 81 个文件 / 16 处例外）——组件文件数 79 → 81：译文管理页的 `AiTranslatedPanel.vue` 与 `translated.ts`。
-- `npm run build`：通过（985 ms）。
-- `cargo test`：352 passed / 0 failed（第 34 批基线 327 → 净 +25：`ai_translated` 新模块 4 条、`ai_url` 12 条（含放行名单）、`ai_cache` 7 条（放行名单表读写 + 连续超时失联口径）、`ai_batch` / `ai_event` / `model` / `paths` 各有扩展；`loudness.rs` 6 条与 `fftools.rs` 25 条为第 34 批口径的存量。已知缺口：`ai_file` 尚无独立用例，其文件闭环当前靠 `ai_batch` 的拆开用例与译文管理页的间接覆盖，后续批次补）。分布（`cargo test -- --list`）：rename 101 / scanner 31 / player 25 / fftools 25 / db 17 / ai 17 / ai_url 12 / watcher 10 / scope 9 / ai_export 9 / shutdown 7 / ai_cache 7 / loudness 6 / paths 6 / subtitles 6 / limits 6 / atomic 6 / ai_wire 6 / ai_prompt 6 / ai_strategy 5 / ai_job 5 / ai_chunk 5 / 其余 ≤4。
-- 与 ffmpeg 自带 `ebur128` 滤镜**对账**（2026-09-24 一次性真跑，结论留档；用例不入库因为要装 ffmpeg，本机 `C:\ffmpeg\bin` 命中固定路径来路）：48 kHz 立体声 WAV `-32.2146` vs `-32.2`、44.1 kHz MP3 `-27.7754` vs `-27.8`、5.1 声道 FLAC `-29.7157` vs `-29.7`、带封面图的 MP4 `-32.2166` vs `-32.2` —— 差都在滤镜法「只报一位小数」的舍入里；带封面的 MP4 与它的音频源同值，说明 `-vn -sn -map 0:a:0` 真把图/视频流挡在测量之外。
+- 前端 Vitest：18 个测试文件、153 条用例通过（`tests/` 按用户 2026-09-22 裁决不入库、只在本机跑；本批新增 `tests/bridge-progress-errors.test.ts` 5 条：四类用户主动操作失败 reject 上抛、`setProgress` 仍按「尽力而为」resolve false）。
+- `npm run check:ipc`：通过（113 条命令 / 16 个事件 / 115 处 invoke / 16 处监听）—— 命令数与上一基线相同（`IpcResult<T>` 在契约里本来就写 `T`，八条进度/书签命令改信封不动契约），`docs/IPC.md` 已随 `gen:ipc` 校验一致。
+- `npm run check:columns`：通过（18 张表 / 101 个列名 / 68 个 db/*.rs / 342 处列引用 / 7 个 DTO 接口 / 263 个字段 / 8 条例外）。
+- `npm run check:colors`：通过（DESIGN.md role 26 个 hex / theme.css 57 处字面值 / 组件侧 45 处字面值覆盖 81 个文件 / 16 处例外）。
+- `npm run build`：通过（900 ms）。
+- `cargo test`：354 passed / 0 failed（上一基线 352 + `db/progress.rs` 新增 2 条：进度/书签读写往返一条龙、「写失败必须上抛、库不存在是 Ok(空) 不是 Err」）。
 - `cargo clippy --all-targets -- -D warnings`：无告警。
 - `npm run check` 是前六段串成的一条命令（types → ipc → columns → colors → vitest → clippy），2026-10-25 一次跑通；`npm run test` 另含 `cargo test` —— 注意 npm 派生的 shell 不带 `~/.cargo/bin`，跑之前先把 cargo 加进 PATH，否则 vitest 过了 cargo 却「不是内部或外部命令」。
+
+2026-10-25 合批入库基线（第 34–36 批：响度 Rust 侧积分、数据目录进安装目录与 NSIS 安装器、AI 三协议/端点放行/译文管理；当时一次实跑：vitest 17 文件 / 148 条、check:ipc 113 命令、check:columns 68 个 db/*.rs / 342 引用、check:colors 81 文件、cargo test 352 / 0 failed、build 985 ms；与 ffmpeg 自带 `ebur128` 滤镜的对账是 2026-09-24 一次性真跑，结论留档：48 kHz WAV `-32.2146` vs `-32.2`、44.1 kHz MP3 `-27.7754` vs `-27.8`、5.1 FLAC `-29.7157` vs `-29.7`、带封面 MP4 `-32.2166` vs `-32.2`，差都在滤镜法只报一位小数的舍入里）。`.ulpi/design/DESIGN.md` 曾被误删致 check:colors 红，已从 HEAD 恢复，门禁与 `.gitignore` 未动。
 
 ## 8. 优先级结论
 

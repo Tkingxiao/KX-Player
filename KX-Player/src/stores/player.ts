@@ -417,7 +417,11 @@ export const usePlayerStore = defineStore('player', () => {
 
   // ── 书签 ──
   async function refreshBookmarks(trackId: string): Promise<void> {
-    try { bookmarks.value = await api.listBookmarks(trackId) } catch { bookmarks.value = [] }
+    try { bookmarks.value = await api.listBookmarks(trackId) } catch (e) {
+      // 读失败不冒充「没有书签」：留空但留一句日志，重开 Inspector 能重试
+      console.warn('[bookmarks] 读取失败', e)
+      bookmarks.value = []
+    }
   }
 
   async function addBookmarkAt(label: string): Promise<void> {

@@ -72,7 +72,10 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   async function loadProgress(): Promise<void> {
-    try { setProgressInfo(await api.getProgressAll()) } catch { /* ignore */ }
+    try { setProgressInfo(await api.getProgressAll()) } catch (e) {
+      // 启动时的尽力而为读（曲库照常出界面），但失败要留痕，不再无声
+      console.warn('[progress] 进度读取失败', e)
+    }
   }
 
   async function init(): Promise<void> {
@@ -91,7 +94,7 @@ export const useLibraryStore = defineStore('library', () => {
     }
     // 没有扫描路径时保持空库状态，由用户手动导入
     if (folderPaths.value.length > 0) {
-      void api.startWatching(folderPaths.value)
+      void api.startWatching(folderPaths.value).catch((e) => console.warn('[watcher] 启动监听失败', e))
     }
     loaded.value = true
   }
@@ -140,7 +143,7 @@ export const useLibraryStore = defineStore('library', () => {
       if (gen === scanGeneration) {
         applyScanResult(result)
         void loadProgress()
-        void api.startWatching(merged)
+        void api.startWatching(merged).catch((e) => console.warn('[watcher] 启动监听失败', e))
       }
     } finally {
       if (gen === scanGeneration) {
@@ -159,7 +162,7 @@ export const useLibraryStore = defineStore('library', () => {
     if (gen === scanGeneration && result) {
       applyScanResult(result)
       void loadProgress()
-      void api.startWatching(remaining)
+      void api.startWatching(remaining).catch((e) => console.warn('[watcher] 启动监听失败', e))
       // 正在浏览被移除的目录（或其子目录）时回到默认视图
       const ui = useUiStore()
       if (ui.view === 'folder' && (normDir(ui.folderPath) === np || normDir(ui.folderPath).startsWith(np + '/'))) {

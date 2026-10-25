@@ -1,7 +1,7 @@
 //! 命令层：曲库/扫描/封面/进度/书签/文件监听。
 //! 全部 async + spawn_blocking：Tauri 同步命令会在主线程执行，任何 IO 都可能卡住 UI。
 
-use crate::error::IpcResult;
+use crate::error::{IpcError, IpcResult};
 use crate::model::{Bookmark, PlayProgress, ScanResult};
 use crate::scope::PathScope;
 use std::path::{Path, PathBuf};
@@ -170,22 +170,26 @@ pub async fn load_folder_covers() -> std::collections::HashMap<String, String> {
 }
 
 #[tauri::command]
-pub async fn get_progress_all() -> Vec<PlayProgress> {
+pub async fn get_progress_all() -> IpcResult<Vec<PlayProgress>> {
     tauri::async_runtime::spawn_blocking(|| crate::db::progress::get_all_progress(&db_path()))
         .await
-        .unwrap_or_default()
+        .map_err(|e| IpcError::join_failed("读播放进度", e))?
+        .map_err(IpcError::db)
 }
 
 #[tauri::command]
-pub async fn set_progress(track_id: String, position_ms: i64, completed: Option<bool>, last_speed: Option<f64>) -> bool {
+pub async fn set_progress(track_id: String, position_ms: i64, completed: Option<bool>, last_speed: Option<f64>) -> IpcResult<bool> {
     if track_id.is_empty() || position_ms < 0 {
-        return false;
+        return Err(IpcError::invalid_argument("曲目 ID 不能为空，进度不能为负"));
     }
+    let db = db_path();
     tauri::async_runtime::spawn_blocking(move || {
-        crate::db::progress::set_progress(&db_path(), &track_id, position_ms, completed, last_speed);
+        crate::db::progress::set_progress(&db, &track_id, position_ms, completed, last_speed)
     })
     .await
-    .is_ok()
+    .map_err(|e| IpcError::join_failed("写播放进度", e))?
+    .map_err(IpcError::db)?;
+    Ok(true)
 }
 
 /// 响度分析任务代际旗标：每次启动新任务时 bump 代际并复位取消位；
@@ -300,8 +304,15 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
                         continue;
                     }
                     Outcome::Value(v) => {
-                        done += 1;
-                        let _ = crate::db::library::set_track_loudness(&db_path(), &m.id, *v);
+                        // 量出来了但写库失败 = 这条对用户仍是「没结果」，进 failed 计数而不是无声丢弃 ——
+                        // 要不然设置页的「有响度」数会凭空比实际多（P1-6）。
+                        match crate::db::library::set_track_loudness(&db_path(), &m.id, *v) {
+                            Ok(_) => done += 1,
+                            Err(e) => {
+                                failed += 1;
+                                crate::paths::append_log(&format!("[loudness] {} 响度写库失败：{e}", m.path));
+                            }
+                        }
                     }
                     Outcome::Silent => {
                         silent += 1;
@@ -313,7 +324,7 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
                     }
                 }
                 completed += 1;
-                let _ = emitter.emit(
+                if let Err(e) = emitter.emit(
                     "loudness:progress",
                     serde_json::json!({
                         "completed": completed,
@@ -325,7 +336,10 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
                         "finished": false,
                         "cancelled": false,
                     }),
-                );
+                ) {
+                    // WebView 已关（退出途中）或接收端出错：这一帧丢了，账上记一笔再走
+                    crate::paths::append_log(&format!("[loudness] 进度事件发送失败（{}）：{e}", m.path));
+                }
             }
             (completed, done, silent, failed, skipped)
         });
@@ -356,7 +370,7 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
         let (completed, done, silent, failed, skipped) = consumer.join().unwrap_or((0, 0, 0, 0, 0));
         // 仅当仍是当前任务时才发完成帧，避免旧任务覆盖新任务状态
         if LOUDNESS_GENERATION.load(Ordering::SeqCst) == gen {
-            let _ = app2.emit(
+            if let Err(e) = app2.emit(
                 "loudness:progress",
                 serde_json::json!({
                     "completed": completed,
@@ -368,7 +382,9 @@ pub fn analyze_loudness(app: AppHandle, scope: State<'_, PathScope>, tracks: Vec
                     "finished": true,
                     "cancelled": skipped > 0,
                 }),
-            );
+            ) {
+                crate::paths::append_log(&format!("[loudness] 完成帧发送失败：{e}"));
+            }
         }
         LOUDNESS_RUNNING.store(false, Ordering::SeqCst);
     });
@@ -401,71 +417,81 @@ pub fn cancel_loudness() -> bool {
 }
 
 #[tauri::command]
-pub async fn mark_track_completed(track_id: String, completed: bool) -> bool {
+pub async fn mark_track_completed(track_id: String, completed: bool) -> IpcResult<bool> {
     if track_id.is_empty() {
-        return false;
+        return Err(IpcError::invalid_argument("曲目 ID 不能为空"));
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::db::progress::mark_completed(&db_path(), &track_id, completed);
-    })
-    .await
-    .is_ok()
-}
-
-#[tauri::command]
-pub async fn clear_track_progress(track_id: String) -> bool {
-    if track_id.is_empty() {
-        return false;
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::db::progress::clear_progress(&db_path(), &track_id);
-    })
-    .await
-    .is_ok()
-}
-
-#[tauri::command]
-pub async fn list_bookmarks(track_id: String) -> Vec<Bookmark> {
-    if track_id.is_empty() {
-        return vec![];
-    }
-    tauri::async_runtime::spawn_blocking(move || crate::db::progress::list_bookmarks(&db_path(), &track_id))
+    let db = db_path();
+    tauri::async_runtime::spawn_blocking(move || crate::db::progress::mark_completed(&db, &track_id, completed))
         .await
-        .unwrap_or_default()
+        .map_err(|e| IpcError::join_failed("写完成标记", e))?
+        .map_err(IpcError::db)?;
+    Ok(true)
 }
 
 #[tauri::command]
-pub async fn add_bookmark(track_id: String, at_ms: i64, label: String) -> Option<Bookmark> {
+pub async fn clear_track_progress(track_id: String) -> IpcResult<bool> {
+    if track_id.is_empty() {
+        return Err(IpcError::invalid_argument("曲目 ID 不能为空"));
+    }
+    let db = db_path();
+    tauri::async_runtime::spawn_blocking(move || crate::db::progress::clear_progress(&db, &track_id))
+        .await
+        .map_err(|e| IpcError::join_failed("清播放进度", e))?
+        .map_err(IpcError::db)?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn list_bookmarks(track_id: String) -> IpcResult<Vec<Bookmark>> {
+    if track_id.is_empty() {
+        return Err(IpcError::invalid_argument("曲目 ID 不能为空"));
+    }
+    let db = db_path();
+    let rows = tauri::async_runtime::spawn_blocking(move || crate::db::progress::list_bookmarks(&db, &track_id))
+        .await
+        .map_err(|e| IpcError::join_failed("读书签", e))?
+        .map_err(IpcError::db)?;
+    Ok(rows)
+}
+
+#[tauri::command]
+pub async fn add_bookmark(track_id: String, at_ms: i64, label: String) -> IpcResult<Option<Bookmark>> {
     if track_id.is_empty() || at_ms < 0 {
-        return None;
+        return Err(IpcError::invalid_argument("曲目 ID 不能为空，时间点不能为负"));
     }
-    tauri::async_runtime::spawn_blocking(move || crate::db::progress::add_bookmark(&db_path(), &track_id, at_ms, &label))
+    let db = db_path();
+    let created = tauri::async_runtime::spawn_blocking(move || crate::db::progress::add_bookmark(&db, &track_id, at_ms, &label))
         .await
-        .unwrap_or(None)
+        .map_err(|e| IpcError::join_failed("写书签", e))?
+        .map_err(IpcError::db)?;
+    Ok(created)
 }
 
 #[tauri::command]
-pub async fn rename_bookmark(id: String, label: String) -> bool {
+pub async fn rename_bookmark(id: String, label: String) -> IpcResult<bool> {
     if id.is_empty() {
-        return false;
+        return Err(IpcError::invalid_argument("书签 ID 不能为空"));
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::db::progress::rename_bookmark(&db_path(), &id, &label);
-    })
-    .await
-    .is_ok()
+    let db = db_path();
+    tauri::async_runtime::spawn_blocking(move || crate::db::progress::rename_bookmark(&db, &id, &label))
+        .await
+        .map_err(|e| IpcError::join_failed("改书签名", e))?
+        .map_err(IpcError::db)?;
+    Ok(true)
 }
 
 #[tauri::command]
-pub async fn remove_bookmark(id: String) -> bool {
+pub async fn remove_bookmark(id: String) -> IpcResult<bool> {
     if id.is_empty() {
-        return false;
+        return Err(IpcError::invalid_argument("书签 ID 不能为空"));
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::db::progress::remove_bookmark(&db_path(), &id);
-    })
-    .await
-    .is_ok()
+    let db = db_path();
+    tauri::async_runtime::spawn_blocking(move || crate::db::progress::remove_bookmark(&db, &id))
+        .await
+        .map_err(|e| IpcError::join_failed("删书签", e))?
+        .map_err(IpcError::db)?;
+    Ok(true)
 }
 
 #[tauri::command]

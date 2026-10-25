@@ -487,8 +487,8 @@ mod tests {
             Ok(())
         })
         .expect("装配旧库");
-        crate::db::progress::set_progress(&db, legacy, 4321, Some(false), None);
-        crate::db::progress::add_bookmark(&db, legacy, 1000, "标记");
+        crate::db::progress::set_progress(&db, legacy, 4321, Some(false), None).expect("写进度");
+        crate::db::progress::add_bookmark(&db, legacy, 1000, "标记").expect("写书签");
         std::fs::write(
             &settings,
             format!(r#"{{"recents":["{legacy}"],"favs":[{{"id":"fav-default","trackIds":["{legacy}"]}}],"pls":[{{"id":"l1","trackIds":["{legacy}","ghost"]}}],"vol":0.5}}"#),
