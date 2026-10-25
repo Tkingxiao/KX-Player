@@ -13,7 +13,7 @@ import { errText } from '@/contracts/result'
 import { translateSubtitleFiles, type AiTranslateJob } from '@/services/aiTranslate'
 import { jobOpts } from './useAiAccess'
 import {
-  STATUS_LABEL, isTodo, filterEntries, summarize, retranslatable, fmtTranslatedAt,
+  STATUS_LABEL, filterEntries, summarize, retranslatable, sameParentPath, summarizeBatch, fmtTranslatedAt,
   type TranslatedFilter,
 } from './translated'
 import type { AiTranslatedEntry } from '@/contracts/api'
@@ -26,7 +26,7 @@ const ui = useUiStore()
 const entries = ref<AiTranslatedEntry[]>([])
 const loading = ref(false)
 const query = ref('')
-const filter = ref<TranslatedFilter>('all')
+const filter = ref<TranslatedFilter>('todo')
 const selected = ref<Set<string>>(new Set())
 const cleanupBusy = ref(false)
 /** 危险操作的二次确认：第一次点变成「确认？」，3 秒不点就还原 */
@@ -36,6 +36,7 @@ const summary = computed(() => summarize(entries.value))
 const visible = computed(() => filterEntries(entries.value, query.value, filter.value))
 const allSelected = computed(() => visible.value.length > 0 && visible.value.every((r) => selected.value.has(r.sourcePath)))
 const selectedRows = computed(() => entries.value.filter((r) => selected.value.has(r.sourcePath)))
+const batchSummary = computed(() => summarizeBatch(selectedRows.value))
 
 // ── 重新翻译：直接带 force 发任务，进度就地显示 ──
 const run = ref<{ total: number; done: number; failed: number; current: string } | null>(null)
@@ -211,23 +212,28 @@ async function openOut(entry: AiTranslatedEntry): Promise<void> {
     <!-- 批量操作条 -->
     <div v-if="selected.size" class="tr-batch">
       <span class="tnum">已选 {{ selected.size }}</span>
-      <button class="btn-ghost" :disabled="!!run" title="对源还在的选中条目强制重译" @click="retranslate(selectedRows)">重新翻译</button>
+      <span class="tr-batch-impact" aria-live="polite">
+        可重译 {{ batchSummary.retranslatable }} · 有译文 {{ batchSummary.outputPresent }} · 可删原文 {{ batchSummary.sourceDeletable }}
+      </span>
+      <button class="btn-ghost" :disabled="!!run || !batchSummary.retranslatable" :title="batchSummary.retranslatable ? `强制重译 ${batchSummary.retranslatable} 个源文件` : '选中的源文件都已删除'" @click="retranslate(selectedRows)">重译 {{ batchSummary.retranslatable }}</button>
       <button
         class="btn-ghost danger-ghost"
-        :disabled="!!run"
+        :disabled="!!run || !batchSummary.outputPresent"
+        :title="batchSummary.outputPresent ? `删除 ${batchSummary.outputPresent} 个译文文件并清账` : '选中条目没有现存译文文件'"
         @click="arm('batch-remove', () => removeTranslated(selectedRows))"
-      >{{ armed === 'batch-remove' ? '确认删除？' : '删除译文' }}</button>
+      >{{ armed === 'batch-remove' ? '确认删除？' : `删除译文 ${batchSummary.outputPresent}` }}</button>
       <button
         class="btn-ghost"
         :disabled="!!run"
+        :title="`清除 ${batchSummary.total} 条翻译记录，文件不动`"
         @click="arm('batch-clear', () => clearLedger(selectedRows))"
-      >{{ armed === 'batch-clear' ? '确认清账？' : '清账（留文件）' }}</button>
+      >{{ armed === 'batch-clear' ? '确认清账？' : `清账 ${batchSummary.total}` }}</button>
       <button
         class="btn-ghost danger-ghost"
-        :disabled="!!run || !sourceDeletable.length"
-        :title="sourceDeletable.length ? `删除 ${sourceDeletable.length} 个选中条目的原文文件（译文与记录保留）` : '选中的条目源文件都不在了'"
+        :disabled="!!run || !batchSummary.sourceDeletable"
+        :title="batchSummary.sourceDeletable ? `删除 ${batchSummary.sourceDeletable} 个选中条目的原文文件（译文与记录保留）` : '选中的条目源文件都不在了'"
         @click="arm('batch-remove-source', () => removeSource())"
-      >{{ armed === 'batch-remove-source' ? '确认删除原文？' : '删除原文' }}</button>
+      >{{ armed === 'batch-remove-source' ? '确认删除原文？' : `删除原文 ${batchSummary.sourceDeletable}` }}</button>
       <button class="btn-ghost" @click="selected = new Set()">取消选择</button>
     </div>
 
@@ -258,7 +264,9 @@ async function openOut(entry: AiTranslatedEntry): Promise<void> {
         <span class="tr-status" :title="STATUS_LABEL[r.status]">{{ STATUS_LABEL[r.status] }}</span>
         <span class="tr-name" :title="r.sourcePath">
           <span class="tr-name-text">{{ r.sourceName }}</span>
-          <span v-if="r.outExists" class="tr-out" :title="r.outPath">→ {{ r.outPath.split(/[\\/]/).pop() }}</span>
+           <span v-if="r.outExists" class="tr-out" :title="r.outPath">
+             → {{ r.outPath.split(/[\\/]/).pop() }}<span v-if="!sameParentPath(r.sourcePath, r.outPath)" class="tr-path-note">译文在另一个目录</span>
+           </span>
           <span v-else class="tr-out tr-out-gone">译文文件已不在</span>
         </span>
         <span class="tr-time tnum">{{ fmtTranslatedAt(r.translatedAt) }}</span>
@@ -278,7 +286,9 @@ async function openOut(entry: AiTranslatedEntry): Promise<void> {
         </span>
       </div>
       <div v-if="!visible.length" class="tr-empty">
-        {{ entries.length ? '没有匹配的条目' : '还没有翻译记录：去「字幕翻译」跑一批，或点「刷新」' }}
+        {{ entries.length
+          ? filter === 'todo' && !summary.todo ? '没有待处理项，当前译文都正常' : '没有匹配的条目'
+          : '还没有翻译记录：去「字幕翻译」跑一批，或点「刷新」' }}
       </div>
     </div>
     <p class="tr-note">清账只删除翻译记录、保留译文文件；删除译文会连 .zh 文件一起删；删除原文只删源文件本身（须精确命中翻译账），译文与记录保留、条目转为「源已删」。重译会把新译文写回同一位置并更新这里的记录。</p>
@@ -321,6 +331,7 @@ async function openOut(entry: AiTranslatedEntry): Promise<void> {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
   padding: 6px 10px;
   border: 1px solid rgb(var(--accent-rgb) / 0.4);
   border-radius: var(--radius-sm);
@@ -328,6 +339,7 @@ async function openOut(entry: AiTranslatedEntry): Promise<void> {
   font-size: 11.5px;
   color: var(--text-sub);
 }
+.tr-batch-impact { color: var(--text-muted); font-size: 10.5px; }
 
 .tr-table { display: flex; flex-direction: column; min-width: 0; }
 .tr-row {
@@ -367,6 +379,7 @@ async function openOut(entry: AiTranslatedEntry): Promise<void> {
   font-size: 11px;
   color: var(--success);
 }
+.tr-path-note { margin-left: 5px; color: var(--warning); }
 .tr-out-gone { color: var(--text-muted); }
 .tr-time { font-size: 11px; color: var(--text-muted); }
 .tr-ops { display: flex; gap: 4px; justify-content: flex-end; }

@@ -54,6 +54,35 @@ export function retranslatable(rows: readonly AiTranslatedEntry[]): string[] {
   return rows.filter((r) => r.status !== 'source_gone').map((r) => r.sourcePath)
 }
 
+/** Windows 路径下判断源文件和译文是否落在同一目录；只用于界面提示，不参与后端授权。 */
+export function sameParentPath(sourcePath: string, outPath: string): boolean {
+  const parent = (p: string): string => {
+    const normalized = p.replace(/\\/g, '/')
+    const index = normalized.lastIndexOf('/')
+    return (index < 0 ? '' : normalized.slice(0, index)).toLowerCase()
+  }
+  return parent(sourcePath) === parent(outPath)
+}
+
+export interface TranslatedBatchSummary {
+  total: number
+  todo: number
+  retranslatable: number
+  outputPresent: number
+  sourceDeletable: number
+}
+
+/** 批量操作条的影响预览：把可执行数量说清楚，再让用户确认危险动作。 */
+export function summarizeBatch(rows: readonly AiTranslatedEntry[]): TranslatedBatchSummary {
+  return {
+    total: rows.length,
+    todo: rows.filter((r) => isTodo(r.status)).length,
+    retranslatable: rows.filter((r) => r.status !== 'source_gone').length,
+    outputPresent: rows.filter((r) => r.outExists).length,
+    sourceDeletable: rows.filter((r) => r.status !== 'source_gone').length,
+  }
+}
+
 /** 翻译时刻的短格式（同年省年份）：MM-DD HH:mm / YYYY-MM-DD HH:mm */
 export function fmtTranslatedAt(ms: number): string {
   const d = new Date(ms)

@@ -12,10 +12,31 @@
 /** 与 AiTranslateView.vue 的 FileState 同一口径。`exempt` = 已翻译可豁免（扫描默认跳过，可手动重译） */
 export type QueueRowState = 'pending' | 'running' | 'done' | 'failed' | 'skipped' | 'exempt'
 
+/** 翻译启动范围：默认全部待翻译，也可以明确只跑失败项或当前勾选项。 */
+export type TranslateQueueScope = 'all' | 'failed' | 'selected'
+
 export interface QueueStatRow {
   state: QueueRowState
   /** file-done 带回的「回退原文」行数：done 行也可能没翻干净（部分未翻） */
   fallback?: number
+}
+
+/** 可再次送入翻译任务的行态。exempt/done 必须通过行内「重译」显式放回。 */
+export function isRetryableState(state: QueueRowState): boolean {
+  return state === 'pending' || state === 'failed' || state === 'skipped'
+}
+
+/** 按用户明确选择的范围取本次翻译队列，保持原数组顺序。 */
+export function selectTranslateRows<T extends QueueStatRow & { path: string }>(
+  rows: readonly T[],
+  scope: TranslateQueueScope,
+  selected: ReadonlySet<string> = new Set(),
+): T[] {
+  return rows.filter((row) => {
+    if (scope === 'failed') return row.state === 'failed'
+    if (scope === 'selected') return selected.has(row.path) && isRetryableState(row.state)
+    return isRetryableState(row.state)
+  })
 }
 
 export interface QueueStat {

@@ -34,6 +34,10 @@ async function testConnection(): Promise<void> {
     testResult.value = (r.ok ? '✓ ' : '✗ ') + r.message + (facts.length ? `（${facts.join(' · ')}）` : '')
     // 被拦的地址失败后立刻体检，把「放行」按钮递到用户眼前，不用等他再动一下输入框
     if (!r.ok) void refreshPolicy()
+  } catch (e) {
+    testResult.value = `✗ ${errText(e)}`
+    // reject 也要收口体检：端点策略提示不能因为连接命令失败而消失
+    await refreshPolicy()
   } finally {
     testing.value = false
   }
@@ -269,7 +273,7 @@ function clampMerge(): void {
       <button class="btn-ghost" :disabled="testing || !settings.aiModel" :title="!settings.aiModel ? '先填模型名，或点「获取模型」选择' : ''" @click="testConnection">
         {{ testing ? '测试中…' : '测试连接' }}
       </button>
-      <span class="ai-test-result" :class="{ ok: testResult.startsWith('✓') }">{{ testResult }}</span>
+      <span class="ai-test-result" :class="{ ok: testResult.startsWith('✓'), fail: testResult.startsWith('✗') }">{{ testResult }}</span>
     </div>
   </section>
 </template>
@@ -346,6 +350,7 @@ function clampMerge(): void {
   white-space: nowrap;
 }
 .ai-test-result.ok { color: var(--success); }
+.ai-test-result.fail { color: var(--danger); }
 
 /* ── 显式放行（P0-3 的唯一例外）：原因 + 确认按钮 + 已放行名单 ── */
 .ai-allow {

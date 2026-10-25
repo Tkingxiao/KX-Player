@@ -13,7 +13,7 @@ import {
 } from '@/services/aiTranslate'
 import { normDir } from '@/utils/format'
 import { errText } from '@/contracts/result'
-import { queueStats, resetFailed, resetOne, reenableOne, summarizeRun } from './queueStats'
+import { isRetryableState, queueStats, resetOne, reenableOne, selectTranslateRows, summarizeRun, type TranslateQueueScope } from './queueStats'
 import JobTable from './JobTable.vue'
 import ActionRail from './ActionRail.vue'
 import ProgressBand from './ProgressBand.vue'
@@ -22,6 +22,8 @@ import AiRenamePanel from './AiRenamePanel.vue'
 import AiApiPane from './AiApiPane.vue'
 import AiFolderNamePanel from './AiFolderNamePanel.vue'
 import AiTranslatedPanel from './AiTranslatedPanel.vue'
+import AiWorkflowBar from './AiWorkflowBar.vue'
+import type { WorkflowStep } from './AiWorkflowBar.vue'
 import { jobOpts } from './useAiAccess'
 import type { AiProgress, SubtitleScanItem } from '@/contracts/api'
 
@@ -46,6 +48,8 @@ type FileRow = SubtitleScanItem & {
 
 const files = ref<FileRow[]>([])
 const scanning = ref(false)
+/** 本次扫描发现的字幕总数，包含已存在译文的文件。 */
+const scanTotal = ref<number | null>(null)
 const running = ref(false)
 // ── 选择性翻译 ──
 // 勾哪些就翻哪些（与「全翻」按钮并存）；选中状态由这里持有，JobTable 只回事件。
@@ -64,7 +68,11 @@ function toggleAll(on: boolean): void {
 }
 
 /** 选中且这轮真能跑的行：等待 / 失败 / 已跳过（已翻译豁免的行内用「重译」，不进这批） */
-const selectedRetryable = computed(() => files.value.filter((f) => selected.value.has(f.path) && isRetryable(f)))
+const selectedRetryable = computed(() => selectTranslateRows(files.value, 'selected', selected.value))
+const queueScope = ref<TranslateQueueScope>('all')
+const retryableRows = computed(() => selectTranslateRows(files.value, 'all'))
+const failedRows = computed(() => selectTranslateRows(files.value, 'failed'))
+const activeQueue = computed(() => selectTranslateRows(files.value, queueScope.value, selected.value))
 /**
  * 本次运行的范围快照：进度与收尾统计只认它。
  * 旧实现用 files 全量过滤/累加，历史完成的行会混进本次成功率（audit B3），
@@ -105,15 +113,91 @@ const workKinds = computed(() => [
 const rangeLabel = computed(() => {
   if (!targetDir.value) return '未选择文件夹'
   const tail = targetDir.value.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? targetDir.value
-  return `${tail} · ${files.value.length} 个文件`
+  const scannedLabel = scanTotal.value == null ? '未扫描' : `扫描 ${scanTotal.value}`
+  const pendingCount = files.value.filter((f) => f.state === 'pending' || f.state === 'failed' || f.state === 'skipped').length
+  return `${tail} · 待翻译 ${pendingCount} · ${scannedLabel}`
 })
+
+type EmptyState = 'no-folder' | 'scanning' | 'unscanned' | 'no-subtitles' | 'all-translated' | 'ready'
+const emptyState = computed<EmptyState>(() => {
+  if (!targetDir.value) return 'no-folder'
+  if (scanning.value) return 'scanning'
+  if (scanTotal.value == null) return 'unscanned'
+  if (scanTotal.value === 0) return 'no-subtitles'
+  if (!files.value.length) return 'all-translated'
+  return 'ready'
+})
+
+const emptyStateTitle = computed(() => {
+  switch (emptyState.value) {
+    case 'no-folder': return '还没有选择目标文件夹'
+    case 'scanning': return '正在扫描字幕'
+    case 'unscanned': return '还没有扫描这个文件夹'
+    case 'no-subtitles': return '没有找到字幕文件'
+    case 'all-translated': return '字幕已有译文'
+    default: return ''
+  }
+})
+
+const emptyStateMessage = computed(() => {
+  switch (emptyState.value) {
+    case 'no-folder': return '选择一个文件夹后，才能扫描 .lrc / .srt / .vtt 文件。'
+    case 'scanning': return '请稍候，扫描完成后会显示待翻译文件。'
+    case 'unscanned': return '点击重新扫描，查看这个文件夹里的字幕总数。'
+    case 'no-subtitles': return '这个文件夹里没有可识别的 .lrc / .srt / .vtt 文件。'
+    case 'all-translated': return `本次扫描发现 ${scanTotal.value} 个字幕文件，均已有译文。`
+    default: return ''
+  }
+})
+
+const hasRetryable = computed(() => retryableRows.value.length > 0)
 
 // ── 工序轨道与进度带（第 4 期，DESIGN.md「AI 工作台」§3.1/§4）──
 const hasScope = computed(() => !!targetDir.value)
-const scanned = computed(() => files.value.length > 0)
+const scanned = computed(() => scanTotal.value != null)
 /** 接入可用 = 已选模型（Provider 的连通以「测试连接」回显为准，不阻塞阶段推导） */
 const providerReady = computed(() => !!settings.aiModel)
 const finished = computed(() => stat.value.finished)
+/** 队列是否收过尾：running 结束后才算，避免翻译前误亮「核对结果」 */
+const runSettled = ref(false)
+
+const workflowSteps = computed<WorkflowStep[]>(() => [
+  {
+    key: 'scope',
+    label: '选择范围',
+    state: hasScope.value ? 'done' : 'active',
+    note: hasScope.value ? '已选择' : '待选择',
+  },
+  {
+    key: 'access',
+    label: '配置接入',
+    state: providerReady.value ? 'done' : hasScope.value ? 'active' : 'pending',
+    note: providerReady.value ? settings.aiModel : '待配置',
+  },
+  {
+    key: 'scan-subtitles',
+    label: '扫描字幕',
+    state: scanning.value ? 'active' : scanned.value ? 'done' : hasScope.value ? 'active' : 'pending',
+    note: scanning.value ? '扫描中' : scanTotal.value == null ? '' : `${scanTotal.value} 个`,
+  },
+  {
+    key: 'translate',
+    label: '执行翻译',
+    state: running.value ? 'active' : runSettled.value || stat.value.done > 0 || stat.value.failed > 0 ? 'done' : 'pending',
+    note: running.value ? `${runFinishedCount.value}/${runStat.value.total}` : hasRetryable.value ? `${files.value.filter(isRetryable).length} 个待翻译` : '',
+  },
+])
+
+const workflowSuggestion = computed(() => {
+  if (!hasScope.value) return '先选择目标文件夹'
+  if (!providerReady.value) return '配置模型服务后即可执行翻译'
+  if (scanning.value) return '正在扫描字幕，请稍候'
+  if (emptyState.value === 'no-subtitles') return '选择包含字幕的文件夹，或重新扫描'
+  if (emptyState.value === 'all-translated') return '打开译文管理查看已翻译文件'
+  if (running.value) return '翻译进行中，请等待当前队列完成'
+  if (hasRetryable.value) return `可以开始翻译 ${files.value.filter(isRetryable).length} 个文件`
+  return '可打开译文管理查看结果'
+})
 
 const phases = computed(() => [
   { key: 'scope', label: '选择范围', state: hasScope.value ? 'done' : 'active', note: '' },
@@ -143,9 +227,6 @@ const phases = computed(() => [
   },
 ] as const)
 
-/** 队列是否收过尾：running 结束后才算，避免翻译前误亮「核对结果」 */
-const runSettled = ref(false)
-
 // 运行计时：条目每分的前端现算（不依赖新契约，设计包 §5.1）
 const runStart = ref(0)
 const elapsedSec = ref(0)
@@ -173,6 +254,7 @@ const liveSummary = computed(() => {
 })
 
 async function pickFolder(): Promise<void> {
+  if (scanning.value) return
   const picked = await api.openFolder()
   if (picked && picked.length) {
     ui.aiFolder = normDir(picked[0])
@@ -181,15 +263,18 @@ async function pickFolder(): Promise<void> {
 }
 
 async function useLibraryFolder(path: string): Promise<void> {
+  if (scanning.value) return
   ui.aiFolder = normDir(path)
   await rescan()
 }
 
 async function rescan(): Promise<void> {
-  if (!ui.aiFolder) return
+  if (!ui.aiFolder || scanning.value) return
   scanning.value = true
+  scanTotal.value = null
   try {
     const found = await scanSubtitleFiles(ui.aiFolder)
+    scanTotal.value = found.length
     // 已翻译（账命中 + 译文还在）的不进队列：它们的家在「译文管理」标签，
     // 重译 / 删除译文 / 清账都在那边处置 —— 队列只留真正要翻的源文件
     files.value = found
@@ -200,6 +285,7 @@ async function rescan(): Promise<void> {
   } catch (e) {
     // 递归扫描整体失败要吭声：静默清空会被当成「这个文件夹没有字幕文件」
     files.value = []
+    scanTotal.value = null
     ui.toast(`扫描字幕文件失败：${errText(e)}`, 'error')
   } finally {
     scanning.value = false
@@ -210,15 +296,15 @@ let job: AiTranslateJob | null = null
 
 /** 取消过的行留在队列里，「开始翻译」要能把它们重新排队，否则停止后这个文件夹就再也点不动了。
  * 已翻译豁免（exempt）不在其列 —— AI-15 要求「扫描时默认跳过」，「开始翻译」默认不重翻；要重译单点行内「重译」。 */
-const isRetryable = (f: FileRow): boolean => f.state === 'pending' || f.state === 'failed' || f.state === 'skipped'
+const isRetryable = (f: FileRow): boolean => isRetryableState(f.state)
 
 /**
  * 「全翻」与「只翻选中」共用同一条启动流水：queue 是本次运行的范围快照，
  * 统计 / 进度 / force 点名都只认它（audit B3）。
  */
-async function startTranslate(scope?: 'selected'): Promise<void> {
+async function startTranslate(scope: TranslateQueueScope = queueScope.value): Promise<void> {
   if (running.value) return
-  const pool = scope === 'selected' ? selectedRetryable.value : files.value.filter(isRetryable)
+  const pool = selectTranslateRows(files.value, scope, selected.value)
   if (!pool.length) return
   const queue = pool
   running.value = true
@@ -290,13 +376,6 @@ function onManualApplied(done: { path: string, out: string }[]): void {
     row.out = d.out
     row.error = undefined
   }
-}
-
-/** 只重试失败项：把 failed 行重置回 pending，其余不动（audit B7；顺序不变，见 queueStats.resetFailed） */
-function retryFailed(): void {
-  if (running.value) return
-  const n = resetFailed(files.value)
-  if (n) ui.toast(`已把 ${n} 个失败文件重新排队`, 'info')
 }
 
 /** 行内只重试一项（audit B6）：resetOne 找不到/不是 failed 时静默（按钮本就只在 failed 行出现） */
@@ -371,6 +450,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
       <span class="wb-range" :title="targetDir">{{ rangeLabel }}</span>
     </header>
 
+    <AiWorkflowBar :steps="workflowSteps" :suggestion="workflowSuggestion" />
+
     <div class="wb-body">
       <!-- 左列：范围 + 接入。设置一次、整场不变，所以不随作业区滚动 -->
       <aside class="wb-side" aria-label="范围与接入">
@@ -378,7 +459,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <h3 class="section-title">目标文件夹</h3>
           <div class="ai-target-row">
             <span class="ai-target-path" :title="targetDir">{{ targetDir || '未选择文件夹' }}</span>
-            <button class="btn-ghost" @click="pickFolder">选择文件夹…</button>
+            <button class="btn-ghost" :disabled="scanning" @click="pickFolder">选择文件夹…</button>
             <button class="btn-ghost" :disabled="!targetDir || scanning" :title="!targetDir ? '先选一个文件夹' : ''" @click="rescan">
               {{ scanning ? '扫描中…' : '重新扫描' }}
             </button>
@@ -417,34 +498,43 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             <div class="ai-files-actions">
               <span v-if="running" class="tnum ai-progress">{{ runFinishedCount }}/{{ runStat.total }}</span>
               <span v-if="failedCount" class="tnum ai-failed-count">失败 {{ failedCount }}</span>
-              <button v-if="failedCount && !running" class="btn-ghost" title="把失败文件重新排队，其余不动" @click="retryFailed">重试失败项</button>
-              <button class="btn-ghost" :disabled="!files.length" @click="clearFinished">清除已完成</button>
-              <button v-if="running" class="btn-ghost danger-ghost" @click="stopTranslate">停止</button>
+              <div class="ai-scope" role="group" aria-label="翻译范围">
+                <button class="btn-ghost ai-scope-btn" :class="{ on: queueScope === 'all' }" :disabled="running" @click="queueScope = 'all'">
+                  全部待翻译 <span class="tnum">{{ retryableRows.length }}</span>
+                </button>
+                <button v-if="failedRows.length" class="btn-ghost ai-scope-btn" :class="{ on: queueScope === 'failed' }" :disabled="running" @click="queueScope = 'failed'">
+                  失败项 <span class="tnum">{{ failedRows.length }}</span>
+                </button>
+                <button v-if="selected.size" class="btn-ghost ai-scope-btn" :class="{ on: queueScope === 'selected' }" :disabled="running" @click="queueScope = 'selected'">
+                  已选可翻 <span class="tnum">{{ selectedRetryable.length }}</span>
+                </button>
+              </div>
+              <div class="ai-files-secondary">
+                <button class="btn-ghost" :disabled="!files.length" @click="clearFinished">清除已完成</button>
+                <button v-if="running" class="btn-ghost danger-ghost" @click="stopTranslate">停止</button>
+              </div>
               <button
-                v-if="selected.size && !running"
-                class="btn-primary"
-                :disabled="!selectedRetryable.length || !settings.aiModel"
-                :title="selectedRetryable.length
-                  ? `只翻译选中的 ${selectedRetryable.length} 个文件（选中共 ${selected.size} 个）`
-                  : '选中的文件里没有可翻译的：已翻译的行内用「重译」'
-                "
-                @click="startTranslate('selected')"
-              >
-                {{ `翻译选中（${selectedRetryable.length}）` }}
-              </button>
-              <button
-                class="btn-primary"
-                :disabled="running || !files.filter(isRetryable).length || !settings.aiModel"
-                :title="!settings.aiModel ? '先在左列配置模型服务' : !files.filter(isRetryable).length ? '没有等待中的文件' : ''"
+                class="ai-start-action"
+                :disabled="running || !activeQueue.length || !settings.aiModel"
+                :title="!settings.aiModel ? '先在左列配置模型服务' : !activeQueue.length ? '当前范围没有可翻译文件' : ''"
                 @click="startTranslate()"
               >
-                {{ running ? '翻译中…' : `开始翻译（${files.filter(isRetryable).length}）` }}
+                {{ running ? '翻译中…' : `开始翻译（${activeQueue.length}）` }}
               </button>
             </div>
           </div>
+          <div v-if="emptyState !== 'ready'" class="ai-empty-state" role="status">
+            <h4>{{ emptyStateTitle }}</h4>
+            <p>{{ emptyStateMessage }}</p>
+            <div class="ai-empty-actions">
+              <button v-if="emptyState === 'no-folder' || emptyState === 'no-subtitles' || emptyState === 'all-translated'" class="btn-ghost" :disabled="scanning" @click="pickFolder">选择文件夹</button>
+              <button v-if="emptyState === 'unscanned' || emptyState === 'no-subtitles' || emptyState === 'all-translated'" class="btn-ghost" :disabled="scanning" @click="rescan">{{ scanning ? '扫描中…' : '重新扫描' }}</button>
+              <button v-if="emptyState === 'all-translated'" class="btn-primary" @click="workKind = 'translated'">打开译文管理</button>
+            </div>
+          </div>
           <JobTable
+            v-if="files.length"
             :rows="files"
-            :empty-text="targetDir ? '该文件夹下没有找到 .lrc / .srt / .vtt 文件' : '请先在左列选择目标文件夹'"
             selectable
             :selected="selected"
             @toggle-one="toggleOne"
@@ -622,8 +712,27 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 }
 .ai-files-head .section-title { margin-bottom: 0 !important; }
 .ai-files-actions { display: flex; align-items: center; gap: 10px; }
+.ai-files-secondary { display: flex; align-items: center; gap: 10px; order: 1; }
+.ai-scope { display: flex; align-items: center; gap: 4px; order: 2; }
+.ai-scope-btn { padding: 4px 8px; font-size: 11px; }
+.ai-scope-btn.on { border-color: rgb(var(--accent-rgb)); color: rgb(var(--accent-rgb)); background: var(--bg-selected); }
+.ai-start-action { order: 3; }
 .ai-progress { font-size: 12px; color: rgb(var(--accent-rgb)); }
 .ai-failed-count { font-size: 12px; color: var(--danger); }
 .danger-ghost:hover { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
+
+.ai-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 32px 20px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  text-align: center;
+}
+.ai-empty-state h4 { margin: 0; font-size: 13px; font-weight: 500; }
+.ai-empty-state p { margin: 0; color: var(--text-muted); font-size: 11.5px; }
+.ai-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 4px; }
 
 </style>
