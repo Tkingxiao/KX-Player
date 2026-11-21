@@ -7,7 +7,7 @@
  * 这两层原来只在前端有一份，B3 把逐块循环搬到 Rust 后若留在前端就要每块过一次 IPC ——
  * 等于没搬；若在 Rust 里再抄一份就成了两份。所以是「搬走 + 只留 Rust 那一份」。
  */
-import { api, onEvent } from '@/bridge/ipc'
+import { api, onEventReady } from '@/bridge/ipc'
 import type { AiJobOptions, AiProgress, SubtitleScanItem } from '@/contracts/api'
 
 /** 递归收集 .lrc/.srt/.vtt（深度 4、上限 500 —— 缺省值在 Rust 侧，与旧前端一致） */
@@ -118,22 +118,37 @@ function startJob(launch: () => Promise<number>, onProgress: (p: AiProgress) => 
     }
   }
 
-  unwatch = onEvent<AiProgress>('ai:progress', (p) => {
+  const receive = (p: AiProgress): void => {
     if (settled) return
     if (taskId === 0) {
       early.push(p)
       return
     }
     if (p.taskId === taskId) take(p)
-  })
+  }
 
-  launch().then(
-    (id) => {
-      taskId = id
-      const buffered = early
-      early = []
-      if (stopWanted) void api.aiTaskCancel(id)
-      for (const p of buffered) if (!settled && p.taskId === id) take(p)
+  // `onEvent` 的旧同步返回值只代表「开始注册」，不代表监听器已经安装。
+  // 等 ready 后才 launch，才能保证后端第一条事件不会跑在监听器前面。
+  void onEventReady<AiProgress>('ai:progress', receive).then(
+    (unlisten) => {
+      if (settled) {
+        unlisten()
+        return
+      }
+      unwatch = unlisten
+      void launch().then(
+        (id) => {
+          taskId = id
+          const buffered = early
+          early = []
+          if (stopWanted) void api.aiTaskCancel(id)
+          for (const p of buffered) if (!settled && p.taskId === id) take(p)
+        },
+        (e) => {
+          close()
+          rejectDone(e)
+        },
+      )
     },
     (e) => {
       close()

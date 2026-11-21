@@ -350,3 +350,21 @@ export function onEvent<T>(name: string, cb: (data: T) => void): () => void {
     un = null
   }
 }
+
+/**
+ * 可等待的事件订阅：任务型调用必须等原生监听器真正安装后再启动后端任务，
+ * 否则 Rust 可能在 invoke 返回前发出第一条进度事件，导致首条 file-start/收尾事件丢失。
+ */
+export async function onEventReady<T>(name: string, cb: (data: T) => void): Promise<() => void> {
+  let disposed = false
+  let un: UnlistenFn | null = null
+  const dispose = (): void => {
+    disposed = true
+    if (un) un()
+    un = null
+  }
+  const next = await listen<T>(name, (e) => cb(e.payload))
+  if (disposed) next()
+  else un = next
+  return dispose
+}

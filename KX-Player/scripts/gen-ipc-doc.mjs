@@ -202,12 +202,12 @@ function frontendCalls() {
   return out
 }
 
-/** `onEvent('name'…)` / `listen('name'…)` / `once('name'…)`：泛型可能很长，只认紧跟其后的第一个字面量。 */
+/** `onEvent('name'…)` / `onEventReady('name'…)` / `listen('name'…)` / `once('name'…)`：泛型可能很长，只认紧跟其后的第一个字面量。 */
 function frontendListeners() {
   const map = new Map()
   for (const file of walk(FRONT, /\.(ts|vue)$/)) {
     const src = read(file)
-    for (const m of src.matchAll(/\b(?:listen|once|onEvent)\s*(?:<[\s\S]{0,300}?>)?\s*\(\s*/g)) {
+    for (const m of src.matchAll(/\b(?:listen|once|onEventReady|onEvent)\s*(?:<[\s\S]{0,300}?>)?\s*\(\s*/g)) {
       const q = /(['"])([a-z]+:[A-Za-z][A-Za-z0-9]*)\1/.exec(src.slice(m.index + m[0].length, m.index + m[0].length + 120))
       if (!q) continue
       if (!map.has(q[2])) map.set(q[2], [])
